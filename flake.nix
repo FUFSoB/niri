@@ -21,6 +21,20 @@
     }:
     let
       revision = self.shortRev or self.dirtyShortRev or "unknown";
+      mergedPatches = [
+        {
+          name = "force-render";
+          pr = 2609;
+        }
+        {
+          name = "sticky-windows";
+          pr = 3302;
+        }
+        {
+          name = "cursor-zoom";
+          pr = 3246;
+        }
+      ];
       niri-package =
         {
           lib,
@@ -153,6 +167,10 @@
           };
 
           passthru = {
+            patches = map (patch: patch.name) mergedPatches;
+            patchesWithPr = map (
+              patch: "${patch.name} (PR #${toString patch.pr})"
+            ) mergedPatches;
             providedSessions = [ "niri" ];
           };
 
