@@ -1904,14 +1904,14 @@ impl<W: LayoutElement> Monitor<W> {
 
             // Monitor elements are pushed in top-to-bottom order, so sticky must be pushed before
             // workspace content to stay above fullscreen/tiling windows.
+            let xray_pos = XrayPos::new(geo.loc, zoom);
+
             if !self.sticky.is_empty() {
                 let view_rect = Rectangle::from_size(self.view_size);
                 let sticky_focus_ring = focus_ring && self.active_space == ActiveSpace::Sticky;
                 self.sticky
-                    .render(ctx.renderer, view_rect, target, sticky_focus_ring, push!());
+                    .render(ctx.r(), xray_pos, view_rect, sticky_focus_ring, push!());
             }
-
-            let xray_pos = XrayPos::new(geo.loc, zoom);
 
             ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
 

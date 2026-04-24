@@ -3506,7 +3506,12 @@ impl<W: LayoutElement> Layout<W> {
 
         self.update_render_elements_time = self.clock.now();
 
-        let zoom = self.overview_zoom();
+        let zoom = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) => self
+                .monitor_for_output(&move_.output)
+                .map_or_else(|| self.overview_zoom(), Monitor::overview_zoom),
+            _ => self.overview_zoom(),
+        };
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if output.is_none_or(|output| move_.output == *output) {
                 let pos_within_output = move_.tile_render_location(zoom);
@@ -4720,15 +4725,15 @@ impl<W: LayoutElement> Layout<W> {
         timestamp: Duration,
         is_touchpad: bool,
     ) -> Option<Option<Output>> {
-        let zoom = self.overview_zoom();
-        let delta_x = delta_x / zoom;
-
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
             MonitorSet::NoOutputs { .. } => return None,
         };
 
         for monitor in monitors {
+            let zoom = monitor.overview_zoom();
+            let delta_x = delta_x / zoom;
+
             for ws in &mut monitor.workspaces {
                 if let Some(refresh) =
                     ws.view_offset_gesture_update(delta_x, timestamp, is_touchpad)
@@ -5254,7 +5259,9 @@ impl<W: LayoutElement> Layout<W> {
                     return false;
                 }
 
-                let overview_zoom = self.overview_zoom();
+                let overview_zoom = self
+                    .monitor_for_output(&output)
+                    .map_or_else(|| self.overview_zoom(), Monitor::overview_zoom);
                 let delta = delta.downscale(overview_zoom);
 
                 pointer_delta += delta;
@@ -5689,7 +5696,7 @@ impl<W: LayoutElement> Layout<W> {
                     };
 
                 let win_id = move_.tile.window().id().clone();
-                let tile_render_loc = move_.tile_render_location(overview_zoom);
+                let tile_render_loc = move_.tile_render_location(zoom);
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -5738,7 +5745,7 @@ impl<W: LayoutElement> Layout<W> {
                         );
                     }
                     InsertPosition::Floating => {
-                        let tile_render_loc = move_.tile_render_location(overview_zoom);
+                        let tile_render_loc = move_.tile_render_location(zoom);
 
                         let mut tile = move_.tile;
                         tile.floating_pos = None;
@@ -5746,7 +5753,7 @@ impl<W: LayoutElement> Layout<W> {
                         match insert_ws {
                             InsertWorkspace::Existing(_) => {
                                 if let Some(offset) = offset {
-                                    let pos = (tile_render_loc - offset).downscale(overview_zoom);
+                                    let pos = (tile_render_loc - offset).downscale(zoom);
                                     let pos =
                                         mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
                                     tile.floating_pos = Some(pos);
@@ -5794,11 +5801,9 @@ impl<W: LayoutElement> Layout<W> {
                             .map(|(tile, tile_offset)| (tile, tile_offset, geo))
                     })
                     .unwrap();
-                let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(overview_zoom);
+                let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(zoom);
 
-                tile.animate_move_from(
-                    (tile_render_loc - new_tile_render_loc).downscale(overview_zoom),
-                );
+                tile.animate_move_from((tile_render_loc - new_tile_render_loc).downscale(zoom));
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 if workspaces.is_empty() {
@@ -6158,7 +6163,12 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
-        let overview_zoom = self.overview_zoom();
+        let overview_zoom = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) if move_.tile.window().id() == window => self
+                .monitor_for_output(&move_.output)
+                .map_or_else(|| self.overview_zoom(), Monitor::overview_zoom),
+            _ => self.overview_zoom(),
+        };
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -6183,8 +6193,20 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    let zoom = mon.overview_zoom();
+
                     if mon.sticky.has_window(window) {
-                        mon.sticky.store_unmap_snapshot_if_empty(renderer, window);
+                        let geo = mon
+                            .workspaces_render_geo()
+                            .nth(mon.active_workspace_idx())
+                            .unwrap_or_else(|| Rectangle::from_size(mon.view_size()));
+                        mon.sticky.store_unmap_snapshot_if_empty(
+                            renderer,
+                            xray,
+                            xray_has_blocked_out_layers,
+                            XrayPos::new(geo.loc, zoom),
+                            window,
+                        );
                         return;
                     }
 
@@ -6194,7 +6216,7 @@ impl<W: LayoutElement> Layout<W> {
                                 renderer,
                                 xray,
                                 xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, overview_zoom),
+                                XrayPos::new(geo.loc, zoom),
                                 window,
                             );
                             return;
@@ -6262,7 +6284,12 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
 
-        let overview_zoom = self.overview_zoom();
+        let overview_zoom = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) if move_.tile.window().id() == window => self
+                .monitor_for_output(&move_.output)
+                .map_or_else(|| self.overview_zoom(), Monitor::overview_zoom),
+            _ => self.overview_zoom(),
+        };
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -6340,7 +6367,9 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
-        let overview_zoom = self.overview_zoom();
+        let overview_zoom = self
+            .monitor_for_output(output)
+            .map_or_else(|| self.overview_zoom(), Monitor::overview_zoom);
         let pos_in_backdrop = move_.tile_render_location(overview_zoom);
         let xray_pos = XrayPos::new(pos_in_backdrop, overview_zoom);
 

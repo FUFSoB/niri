@@ -18,7 +18,7 @@ use super::{
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::xray::XrayPos;
+use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::transaction::TransactionBlocker;
 use crate::utils::{
@@ -542,9 +542,21 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.remove_tile_by_idx(idx)
     }
 
-    pub fn store_unmap_snapshot_if_empty(&mut self, renderer: &mut GlesRenderer, id: &W::Id) {
+    pub fn store_unmap_snapshot_if_empty(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+        id: &W::Id,
+    ) {
         if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.window().id() == id) {
-            tile.store_unmap_snapshot_if_empty(renderer);
+            tile.store_unmap_snapshot_if_empty(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+            );
         }
     }
 
