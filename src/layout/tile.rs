@@ -1069,6 +1069,7 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos = xray_pos.offset(window_loc);
 
         let rules = self.window.rules();
+        let window_blocked_out = ctx.target.should_block_out(rules.block_out_from);
 
         // Clip to geometry including during the fullscreen animation to help with buggy clients
         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
@@ -1242,7 +1243,7 @@ impl<W: LayoutElement> Tile<W> {
                 });
         }
 
-        if fullscreen_progress > 0. {
+        if !window_blocked_out && fullscreen_progress > 0. {
             let alpha = fullscreen_progress as f32;
 
             // During the un/fullscreen animation, render a border element in order to use the
@@ -1283,24 +1284,26 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        if let Some(width) = self.visual_border_width() {
-            self.border.render(
-                ctx.renderer,
-                location + Point::from((width, width)),
-                &mut |elem| push(elem.into()),
-            );
+        if !window_blocked_out {
+            if let Some(width) = self.visual_border_width() {
+                self.border.render(
+                    ctx.renderer,
+                    location + Point::from((width, width)),
+                    &mut |elem| push(elem.into()),
+                );
+            }
         }
 
         // Hide the focus ring when maximized/fullscreened. It's not normally visible anyway due to
         // being outside the monitor or obscured by a solid colored bar, but it is visible under
         // semitransparent bars in maximized state (which is a bit weird) and in the overview (also
         // a bit weird).
-        if focus_ring && expanded_progress < 1. {
+        if !window_blocked_out && focus_ring && expanded_progress < 1. {
             self.focus_ring
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }
 
-        if expanded_progress < 1. {
+        if !window_blocked_out && expanded_progress < 1. {
             self.shadow
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }

@@ -294,7 +294,7 @@ impl Mapped {
             is_sticky: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
-            block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
+            block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: config.blur,
             animate_next_configure: false,
             animate_serials: Vec::new(),
@@ -756,6 +756,10 @@ impl LayoutElement for Mapped {
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
+        if should_block_out {
+            return;
+        }
+
         background_effect::render_for_tile(
             ctx,
             None,

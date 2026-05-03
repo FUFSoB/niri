@@ -84,7 +84,7 @@ impl MappedLayer {
             pre_commit_hook,
             rules,
             recompute_rules_on_commit: false,
-            block_out_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
+            block_out_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.]),
             view_size,
             scale,
             shadow: Shadow::new(shadow_config),
@@ -214,20 +214,21 @@ impl MappedLayer {
                 Kind::Unspecified,
             );
             push(elem.into());
-        } else {
-            // Layer surfaces don't have extra geometry like windows.
-            let buf_pos = location;
-
-            push_elements_from_surface_tree(
-                ctx.renderer,
-                surface,
-                buf_pos.to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
-            );
+            return;
         }
+
+        // Layer surfaces don't have extra geometry like windows.
+        let buf_pos = location;
+
+        push_elements_from_surface_tree(
+            ctx.renderer,
+            surface,
+            buf_pos.to_physical_precise_round(scale),
+            scale,
+            alpha,
+            Kind::ScanoutCandidate,
+            &mut |elem| push(elem.into()),
+        );
 
         let location = location.to_physical_precise_round(scale).to_logical(scale);
         self.shadow
@@ -249,7 +250,7 @@ impl MappedLayer {
             self.blur_config,
             radius,
             self.rules.background_effect,
-            should_block_out,
+            false,
             xray_pos,
             &mut |elem| push(elem.into()),
         );

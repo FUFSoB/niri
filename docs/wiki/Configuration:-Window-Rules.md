@@ -571,7 +571,7 @@ These properties apply continuously to open windows.
 #### `block-out-from`
 
 You can block out windows from xdg-desktop-portal screencasts.
-They will be replaced with solid black rectangles.
+They will be replaced with transparent holes that show what is underneath.
 
 This can be useful for password managers or messenger windows, etc.
 For layer-shell notification pop-ups and the like, you can use a [`block-out-from` layer rule](./Configuration:-Layer-Rules.md#block-out-from).

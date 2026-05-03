@@ -14,7 +14,7 @@ Let's take a look!
 
 ### Block out windows
 
-You can block out specific windows from screencasts, replacing them with solid black rectangles.
+You can block out specific windows from screencasts, replacing them with transparent holes that show what is underneath.
 This can be useful for password managers or messenger windows, etc.
 
 ![Screenshot showing a window visible normally, but blocked out on OBS.](./img/block-out-from-screencast.png)

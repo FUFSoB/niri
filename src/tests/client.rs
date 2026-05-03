@@ -322,6 +322,12 @@ impl State {
 }
 
 impl Window {
+    pub fn attach_rgba_buffer(&self, rgba: [u32; 4]) {
+        let [r, g, b, a] = rgba;
+        let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+    }
+
     pub fn commit(&self) {
         self.surface.commit();
     }
@@ -337,8 +343,7 @@ impl Window {
     }
 
     pub fn attach_new_buffer(&self) {
-        let buffer = self.spbm.create_u32_rgba_buffer(0, 0, 0, 0, &self.qh, ());
-        self.surface.attach(Some(&buffer), 0, 0);
+        self.attach_rgba_buffer([0, 0, 0, 0]);
     }
 
     pub fn attach_null(&self) {
@@ -392,6 +397,12 @@ impl Window {
 }
 
 impl LayerSurface {
+    pub fn attach_rgba_buffer(&self, rgba: [u32; 4]) {
+        let [r, g, b, a] = rgba;
+        let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+    }
+
     pub fn commit(&self) {
         self.surface.commit();
     }
@@ -442,8 +453,7 @@ impl LayerSurface {
     }
 
     pub fn attach_new_buffer(&self) {
-        let buffer = self.spbm.create_u32_rgba_buffer(0, 0, 0, 0, &self.qh, ());
-        self.surface.attach(Some(&buffer), 0, 0);
+        self.attach_rgba_buffer([0, 0, 0, 0]);
     }
 
     pub fn attach_null(&self) {

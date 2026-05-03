@@ -112,7 +112,7 @@ These properties apply continuously to open layer-shell surfaces.
 #### `block-out-from`
 
 You can block out surfaces from xdg-desktop-portal screencasts or all screen captures.
-They will be replaced with solid black rectangles.
+They will be replaced with transparent holes that show what is underneath.
 
 This can be useful for notifications.
 

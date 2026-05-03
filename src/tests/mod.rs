@@ -5,6 +5,7 @@ mod fixture;
 mod server;
 
 mod animations;
+mod capture_block_out;
 mod floating;
 mod fullscreen;
 mod layer_shell;
