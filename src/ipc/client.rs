@@ -714,6 +714,10 @@ fn print_window(window: &Window) {
         "  Is sticky: {}",
         if window.is_sticky { "yes" } else { "no" }
     );
+    println!(
+        "  Is blocked out: {}",
+        if window.is_block_out { "yes" } else { "no" }
+    );
 
     if let Some(pid) = window.pid {
         println!("  PID: {pid}");

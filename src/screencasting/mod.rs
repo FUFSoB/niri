@@ -226,9 +226,12 @@ impl State {
                 }
 
                 let main_start = elements.len();
-                mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
-                    elements.push(CastRenderElement::from(elem))
-                });
+                mapped.render_for_screen_cast(
+                    renderer,
+                    scale,
+                    self.niri.block_out_enabled,
+                    &mut |elem| elements.push(CastRenderElement::from(elem)),
+                );
 
                 let cursor_data =
                     CursorData::compute(&elements, main_start, pointer_location, scale);
@@ -596,6 +599,7 @@ impl Niri {
                 let ctx = RenderCtx {
                     renderer,
                     target: RenderTarget::Screencast,
+                    block_out_enabled: self.block_out_enabled,
                     xray: None,
                 };
                 self.render(ctx, output, false, &mut |elem| {
@@ -694,7 +698,7 @@ impl Niri {
             }
 
             let main_start = elements.len();
-            mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
+            mapped.render_for_screen_cast(renderer, scale, self.block_out_enabled, &mut |elem| {
                 elements.push(CastRenderElement::from(elem))
             });
 

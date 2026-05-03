@@ -201,7 +201,7 @@ impl MappedLayer {
 
         let surface = self.surface.wl_surface();
 
-        let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
+        let should_block_out = ctx.should_block_out(self.rules.block_out_from);
         if should_block_out {
             // Round to physical pixels.
             let location = location.to_physical_precise_round(scale).to_logical(scale);
@@ -264,7 +264,7 @@ impl MappedLayer {
         xray_pos: XrayPos,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
-        if ctx.target.should_block_out(self.rules.block_out_from) {
+        if ctx.should_block_out(self.rules.block_out_from) {
             return;
         }
 

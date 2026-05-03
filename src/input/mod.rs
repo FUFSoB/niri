@@ -2270,6 +2270,32 @@ impl State {
                     }
                 }
             }
+            Action::ToggleBlockOutWindow => {
+                let active_window = self
+                    .niri
+                    .layout
+                    .active_workspace_mut()
+                    .and_then(|ws| ws.active_window_mut());
+                if let Some(window) = active_window {
+                    window.toggle_block_out_window_rule();
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleBlockOutWindowById(id) => {
+                let window = self
+                    .niri
+                    .layout
+                    .workspaces_mut()
+                    .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
+                if let Some(window) = window {
+                    window.toggle_block_out_window_rule();
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleBlockOut => {
+                self.niri.block_out_enabled = !self.niri.block_out_enabled;
+                self.niri.queue_redraw_all();
+            }
             Action::SetDynamicCastWindow => {
                 let id = self
                     .niri

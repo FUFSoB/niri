@@ -355,6 +355,10 @@ pub enum Action {
     ToggleWindowRuleOpacity,
     #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
+    ToggleBlockOutWindow,
+    #[knuffel(skip)]
+    ToggleBlockOutWindowById(u64),
+    ToggleBlockOut,
     SetDynamicCastWindow,
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
@@ -697,6 +701,11 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleWindowRuleOpacity { id: Some(id) } => {
                 Self::ToggleWindowRuleOpacityById(id)
             }
+            niri_ipc::Action::ToggleBlockOutWindow { id: None } => Self::ToggleBlockOutWindow,
+            niri_ipc::Action::ToggleBlockOutWindow { id: Some(id) } => {
+                Self::ToggleBlockOutWindowById(id)
+            }
+            niri_ipc::Action::ToggleBlockOut {} => Self::ToggleBlockOut,
             niri_ipc::Action::SetDynamicCastWindow { id: None } => Self::SetDynamicCastWindow,
             niri_ipc::Action::SetDynamicCastWindow { id: Some(id) } => {
                 Self::SetDynamicCastWindowById(id)

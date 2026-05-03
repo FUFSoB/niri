@@ -112,6 +112,11 @@ impl IpcServer {
         })
     }
 
+    #[cfg(test)]
+    pub fn test_event_stream_state(&self) -> std::cell::Ref<'_, EventStreamState> {
+        self.event_stream_state.borrow()
+    }
+
     fn send_event(&self, event: Event) {
         let mut streams = self.event_streams.borrow_mut();
         let mut to_remove = Vec::new();
@@ -551,6 +556,7 @@ fn make_ipc_window(
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
         is_sticky: mapped.is_sticky(),
+        is_block_out: mapped.is_block_out(),
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
@@ -746,7 +752,8 @@ impl State {
             let workspace_id = ws_id.map(|id| id.get());
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
-                || ipc_win.is_sticky != mapped.is_sticky();
+                || ipc_win.is_sticky != mapped.is_sticky()
+                || ipc_win.is_block_out != mapped.is_block_out();
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

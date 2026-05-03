@@ -1,7 +1,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
-use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_config::{BlockOutFrom, Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -104,6 +104,9 @@ pub struct Mapped {
 
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
+
+    /// Whether this window should invert its configured block-out state.
+    invert_block_out_window_rule: bool,
 
     /// Buffer to draw instead of the window when it should be blocked out.
     block_out_buffer: RefCell<SolidColorBuffer>,
@@ -294,6 +297,7 @@ impl Mapped {
             is_sticky: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
+            invert_block_out_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: config.blur,
             animate_next_configure: false,
@@ -394,6 +398,26 @@ impl Mapped {
         self.ignore_opacity_window_rule = !self.ignore_opacity_window_rule;
     }
 
+    pub fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
+        let block_out_from = self.rules.block_out_from;
+        if !self.invert_block_out_window_rule {
+            return block_out_from;
+        }
+
+        match block_out_from {
+            Some(_) => None,
+            None => Some(BlockOutFrom::Screencast),
+        }
+    }
+
+    pub fn is_block_out(&self) -> bool {
+        self.effective_block_out_from().is_some()
+    }
+
+    pub fn toggle_block_out_window_rule(&mut self) {
+        self.invert_block_out_window_rule = !self.invert_block_out_window_rule;
+    }
+
     pub fn set_is_focused(&mut self, is_focused: bool) {
         if self.is_focused == is_focused {
             return;
@@ -439,7 +463,7 @@ impl Mapped {
             contents,
             contents_with_blocked_out_bg: None,
             blocked_out_contents,
-            block_out_from: self.rules().block_out_from,
+            block_out_from: self.effective_block_out_from(),
             size,
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),
@@ -506,6 +530,7 @@ impl Mapped {
         &self,
         renderer: &mut R,
         scale: Scale<f64>,
+        block_out_enabled: bool,
         push: &mut dyn FnMut(WindowCastRenderElements<R>),
     ) {
         let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
@@ -554,6 +579,7 @@ impl Mapped {
             RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
+                block_out_enabled,
                 xray: None,
             },
             location,
@@ -658,7 +684,7 @@ impl LayoutElement for Mapped {
         alpha: f32,
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
-        if ctx.target.should_block_out(self.rules.block_out_from) {
+        if ctx.should_block_out(self.effective_block_out_from()) {
             let mut buffer = self.block_out_buffer.borrow_mut();
             buffer.resize(self.window.geometry().size.to_f64());
             let elem =
@@ -689,7 +715,7 @@ impl LayoutElement for Mapped {
         xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
-        if ctx.target.should_block_out(self.rules.block_out_from) {
+        if ctx.should_block_out(self.effective_block_out_from()) {
             return;
         }
 
@@ -755,7 +781,7 @@ impl LayoutElement for Mapped {
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
-        let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
+        let should_block_out = ctx.should_block_out(self.effective_block_out_from());
         if should_block_out {
             return;
         }
@@ -1233,6 +1259,10 @@ impl LayoutElement for Mapped {
 
     fn is_ignoring_opacity_window_rule(&self) -> bool {
         self.ignore_opacity_window_rule
+    }
+
+    fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
+        Mapped::effective_block_out_from(self)
     }
 
     fn requested_size(&self) -> Option<Size<i32, Logical>> {

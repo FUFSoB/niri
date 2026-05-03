@@ -39,8 +39,8 @@ use std::time::Duration;
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
-    ZoomMovementMode,
+    BlockOutFrom, Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig,
+    WorkspaceReference, ZoomMovementMode,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
@@ -254,6 +254,9 @@ pub trait LayoutElement {
     fn set_sticky(&mut self, sticky: bool);
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
+    fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
+        self.rules().block_out_from
+    }
 
     fn is_urgent(&self) -> bool;
 

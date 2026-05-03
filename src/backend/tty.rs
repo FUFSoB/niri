@@ -1900,6 +1900,7 @@ impl Tty {
         let ctx = RenderCtx {
             renderer: &mut renderer,
             target: RenderTarget::Output,
+            block_out_enabled: true,
             xray: None,
         };
         let mut elements = niri.render_to_vec(ctx, output, true);

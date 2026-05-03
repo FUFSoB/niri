@@ -198,7 +198,7 @@ You can find the title and the app ID of a window by running `niri msg pick-wind
 
 > [!TIP]
 > Another way to find the window title and app ID is to configure the `wlr/taskbar` module in [Waybar](https://github.com/Alexays/Waybar) to include them in the tooltip:
-> 
+>
 > ```json
 > "wlr/taskbar": {
 >     "tooltip-format": "{title} | {app_id}",
@@ -608,6 +608,17 @@ window-rule {
     block-out-from "screen-capture"
 }
 ```
+
+<sup>Since: own-patches</sup>
+
+You can temporarily override the per-window block-out state at runtime with the
+[`toggle-block-out-window`](./Configuration:-Key-Bindings.md#toggle-block-out-window) action.
+If a window is already blocked out by configuration, the action turns block-out off for it.
+Otherwise, it turns on `screencast` block-out for that window.
+
+You can also disable or re-enable block-out rendering globally with the
+[`toggle-block-out`](./Configuration:-Key-Bindings.md#toggle-block-out) action.
+This global toggle does not change the window's own `is_block_out` state reported by IPC.
 
 > [!WARNING]
 > Be careful when blocking out windows based on a dynamically changing window title.

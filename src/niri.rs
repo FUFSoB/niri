@@ -264,6 +264,9 @@ pub struct Niri {
 
     pub output_state: HashMap<Output, OutputState>,
 
+    /// Whether block-out rendering is globally enabled.
+    pub block_out_enabled: bool,
+
     // When false, we're idling with monitors powered off.
     pub monitors_active: bool,
 
@@ -2129,6 +2132,7 @@ impl State {
                 let mut ctx = RenderCtx {
                     target: RenderTarget::Output,
                     renderer,
+                    block_out_enabled: self.niri.block_out_enabled,
                     xray: None,
                 };
 
@@ -2586,6 +2590,7 @@ impl Niri {
             dmabuf_pre_commit_hook: HashMap::new(),
             blocker_cleared_tx,
             blocker_cleared_rx,
+            block_out_enabled: true,
             monitors_active: true,
             is_lid_closed: false,
 
@@ -4799,6 +4804,10 @@ impl Niri {
 
     /// Checks if any background layer surface has `block_out_from` set.
     pub fn has_blocked_out_background_layers(&self, output: &Output) -> bool {
+        if !self.block_out_enabled {
+            return false;
+        }
+
         let layer_map = layer_map_for_output(output);
         for for_backdrop in [false, true] {
             for (mapped, _geo) in
@@ -5697,6 +5706,7 @@ impl Niri {
                     let ctx = RenderCtx {
                         renderer,
                         target: RenderTarget::ScreenCapture,
+                        block_out_enabled: self.block_out_enabled,
                         xray: None,
                     };
                     let offset = screencopy.region_loc().upscale(-1);
@@ -5775,6 +5785,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            block_out_enabled: self.block_out_enabled,
             xray: None,
         };
         let offset = screencopy.region_loc().upscale(-1);
@@ -5900,6 +5911,7 @@ impl Niri {
                 let ctx = RenderCtx {
                     renderer,
                     target,
+                    block_out_enabled: self.block_out_enabled,
                     xray: None,
                 };
                 let mut elements = Vec::new();
@@ -5986,6 +5998,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            block_out_enabled: self.block_out_enabled,
             xray: None,
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
@@ -6041,6 +6054,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            block_out_enabled: self.block_out_enabled,
             xray: None,
         };
         mapped.render(
@@ -6207,6 +6221,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            block_out_enabled: self.block_out_enabled,
             xray: None,
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
@@ -6685,6 +6700,7 @@ impl Niri {
                     let ctx = RenderCtx {
                         renderer,
                         target,
+                        block_out_enabled: self.block_out_enabled,
                         xray: None,
                     };
                     let elements = self.render_to_vec(ctx, &output, false);

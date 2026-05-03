@@ -71,6 +71,7 @@ impl PickColorGrab {
                     renderer,
                     // This is an interactive operation so we can render without blocking out.
                     target: RenderTarget::Output,
+                    block_out_enabled: data.niri.block_out_enabled,
                     xray: None,
                 };
                 data.niri.render(ctx, &output, false, &mut |elem| {

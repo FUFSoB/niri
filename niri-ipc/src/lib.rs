@@ -884,6 +884,20 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Toggle whether a window is blocked out from screen capture.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Toggle block-out for the focused window")
+    )]
+    ToggleBlockOutWindow {
+        /// Id of the window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Toggle block-out globally.
+    ToggleBlockOut {},
     /// Set the dynamic cast target to a window.
     #[cfg_attr(
         feature = "clap",
@@ -1351,6 +1365,11 @@ pub struct Window {
     pub is_floating: bool,
     /// Whether this window is sticky across all workspaces on its output.
     pub is_sticky: bool,
+    /// Whether this window is currently configured to be blocked out from screen capture.
+    ///
+    /// This reflects the effective per-window block-out state, including runtime per-window
+    /// toggles, but not the global block-out toggle.
+    pub is_block_out: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.

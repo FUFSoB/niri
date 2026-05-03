@@ -182,7 +182,7 @@ impl ClosingWindow {
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
     ) -> ClosingWindowRenderElement {
-        let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
+        let (buffer, offset) = if ctx.should_block_out(self.block_out_from) {
             (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
         } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
             (

@@ -42,6 +42,13 @@ layer-rule {
 }
 ```
 
+<sup>Since: own-patches</sup>
+
+You can also toggle block-out at runtime:
+
+- `toggle-block-out-window` flips block-out for one window relative to its configured rule.
+- `toggle-block-out` disables or re-enables all block-out rendering globally.
+
 Check [the corresponding wiki section](./Configuration:-Window-Rules.md#block-out-from) for more details and examples.
 
 ### Dynamic screencast target

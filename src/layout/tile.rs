@@ -1069,7 +1069,7 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos = xray_pos.offset(window_loc);
 
         let rules = self.window.rules();
-        let window_blocked_out = ctx.target.should_block_out(rules.block_out_from);
+        let window_blocked_out = ctx.should_block_out(self.window.effective_block_out_from());
 
         // Clip to geometry including during the fullscreen animation to help with buggy clients
         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
@@ -1113,14 +1113,13 @@ impl<W: LayoutElement> Tile<W> {
 
                     // Clip blocked-out resizes unconditionally because they use solid color render
                     // elements.
-                    let clip_to_geometry =
-                        if ctx.target.should_block_out(resize.snapshot.block_out_from)
-                            && ctx.target.should_block_out(rules.block_out_from)
-                        {
-                            true
-                        } else {
-                            clip_to_geometry
-                        };
+                    let clip_to_geometry = if ctx.should_block_out(resize.snapshot.block_out_from)
+                        && ctx.should_block_out(self.window.effective_block_out_from())
+                    {
+                        true
+                    } else {
+                        clip_to_geometry
+                    };
 
                     if let Some((elem_current, _sync_point, mut data)) = current {
                         let texture_current = elem_current.texture().clone();
@@ -1427,6 +1426,7 @@ impl<W: LayoutElement> Tile<W> {
             RenderCtx {
                 target: RenderTarget::Output,
                 renderer,
+                block_out_enabled: true,
                 xray: xray.as_deref(),
             },
             Point::from((0., 0.)),
@@ -1478,6 +1478,7 @@ impl<W: LayoutElement> Tile<W> {
                     RenderCtx {
                         target: RenderTarget::Output,
                         renderer,
+                        block_out_enabled: true,
                         xray: Some(xray),
                     },
                     Point::from((0., 0.)),
@@ -1498,6 +1499,7 @@ impl<W: LayoutElement> Tile<W> {
             RenderCtx {
                 target: RenderTarget::Screencast,
                 renderer,
+                block_out_enabled: true,
                 xray: xray.as_deref(),
             },
             Point::from((0., 0.)),
@@ -1521,7 +1523,7 @@ impl<W: LayoutElement> Tile<W> {
             contents,
             contents_with_blocked_out_bg,
             blocked_out_contents,
-            block_out_from: self.window.rules().block_out_from,
+            block_out_from: self.window.effective_block_out_from(),
             size: self.animated_tile_size(),
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),

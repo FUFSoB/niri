@@ -3,7 +3,7 @@ use std::str::FromStr;
 use niri_config::layer_rule::{LayerRule, Match as LayerMatch};
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
-use niri_config::{BlockOutFrom, Config};
+use niri_config::{Action, BlockOutFrom, Config};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::output::Output;
@@ -102,6 +102,7 @@ fn render_output_pixels(
             let ctx = RenderCtx {
                 renderer,
                 target,
+                block_out_enabled: niri.block_out_enabled,
                 xray: None,
             };
             let elements = niri.render_to_vec(ctx, &output, false);
@@ -133,7 +134,9 @@ fn render_window_cast_pixels(f: &mut Fixture, output: &Output) -> (Size<i32, Phy
             let mapped = niri.layout.windows_for_output(&output).next().unwrap();
 
             let mut elements = Vec::new();
-            mapped.render_for_screen_cast(renderer, scale, &mut |elem| elements.push(elem));
+            mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
+                elements.push(elem)
+            });
 
             let geo = encompassing_geo(scale, elements.iter());
             let elements = elements.iter().rev().map(|elem| {
@@ -162,6 +165,21 @@ fn sample_pixel(size: Size<i32, Physical>, pixels: &[u8], x: i32, y: i32) -> [u8
         pixels[idx + 2],
         pixels[idx + 3],
     ]
+}
+
+fn focused_window_is_block_out(f: &mut Fixture) -> bool {
+    let state = f.niri_state();
+    state.ipc_refresh_layout();
+
+    let server = state.niri.ipc_server.as_ref().unwrap();
+    let state = server.test_event_stream_state();
+    state
+        .windows
+        .windows
+        .values()
+        .find(|window| window.is_focused)
+        .unwrap()
+        .is_block_out
 }
 
 #[test]
@@ -242,6 +260,194 @@ fn blocked_window_cast_is_fully_transparent() {
     let output = f.niri_output(1);
     let (size, pixels) = render_window_cast_pixels(&mut f, &output);
 
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn toggle_block_out_window_enables_and_disables_ruleless_window() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 30), GREEN);
+
+    assert!(!focused_window_is_block_out(&mut f));
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(focused_window_is_block_out(&mut f));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 0, 0, 0]
+    );
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(!focused_window_is_block_out(&mut f));
+
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 255, 0, 255]
+    );
+}
+
+#[test]
+fn toggle_block_out_window_disables_and_restores_configured_rule() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 30), GREEN);
+
+    assert!(focused_window_is_block_out(&mut f));
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(!focused_window_is_block_out(&mut f));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 255, 0, 255]
+    );
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(focused_window_is_block_out(&mut f));
+
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn toggle_block_out_globally_disables_layer_block_out() {
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    config.layer_rules.push(LayerRule {
+        matches: vec![LayerMatch {
+            namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    let output = f.client(id).output("headless-1");
+
+    create_layer(
+        &mut f,
+        id,
+        &output,
+        Layer::Background,
+        "background",
+        LayerConfigureProps {
+            anchor: Some(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right),
+            size: Some((0, 0)),
+            ..Default::default()
+        },
+        (100, 100),
+        RED,
+    );
+    create_layer(
+        &mut f,
+        id,
+        &output,
+        Layer::Top,
+        "blocked",
+        LayerConfigureProps {
+            anchor: Some(Anchor::Top | Anchor::Left),
+            size: Some((40, 40)),
+            ..Default::default()
+        },
+        (40, 40),
+        GREEN,
+    );
+
+    let output = f.niri_output(1);
+
+    let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
+    assert_eq!(sample_pixel(size, &pixels, 10, 10), [255, 0, 0, 255]);
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+
+    let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
+    assert_eq!(sample_pixel(size, &pixels, 10, 10), [0, 255, 0, 255]);
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+
+    let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
+    assert_eq!(sample_pixel(size, &pixels, 10, 10), [255, 0, 0, 255]);
+}
+
+#[test]
+fn toggle_block_out_globally_disables_window_rendering_but_not_window_state() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::Screencast),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 30), GREEN);
+
+    let output = f.niri_output(1);
+
+    assert!(focused_window_is_block_out(&mut f));
+
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 0, 0, 0]
+    );
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    assert!(focused_window_is_block_out(&mut f));
+
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 255, 0, 255]
+    );
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    assert!(focused_window_is_block_out(&mut f));
+
+    let (size, pixels) = render_window_cast_pixels(&mut f, &output);
     assert_eq!(
         sample_pixel(size, &pixels, size.w / 2, size.h / 2),
         [0, 0, 0, 0]

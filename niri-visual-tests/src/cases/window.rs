@@ -56,6 +56,7 @@ impl TestCase for Window {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::Output,
+            block_out_enabled: true,
             xray: None,
         };
         self.window

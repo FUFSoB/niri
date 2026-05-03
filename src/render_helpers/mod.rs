@@ -57,6 +57,7 @@ pub mod xray;
 pub struct RenderCtx<'a, R> {
     pub renderer: &'a mut R,
     pub target: RenderTarget,
+    pub block_out_enabled: bool,
     pub xray: Option<&'a Xray>,
 }
 
@@ -67,8 +68,13 @@ impl<'a, R> RenderCtx<'a, R> {
         RenderCtx {
             renderer: self.renderer,
             target: self.target,
+            block_out_enabled: self.block_out_enabled,
             xray: self.xray,
         }
+    }
+
+    pub fn should_block_out(&self, block_out_from: Option<BlockOutFrom>) -> bool {
+        self.block_out_enabled && self.target.should_block_out(block_out_from)
     }
 }
 
@@ -77,6 +83,7 @@ impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
         RenderCtx {
             renderer: self.renderer.as_gles_renderer(),
             target: self.target,
+            block_out_enabled: self.block_out_enabled,
             xray: self.xray,
         }
     }

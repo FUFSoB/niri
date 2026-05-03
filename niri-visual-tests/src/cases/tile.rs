@@ -125,6 +125,7 @@ impl TestCase for Tile {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::Output,
+            block_out_enabled: true,
             xray: None,
         };
         let xray_pos = XrayPos::new(location, 1.);

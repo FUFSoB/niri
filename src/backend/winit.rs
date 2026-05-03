@@ -241,6 +241,7 @@ impl Winit {
         let ctx = RenderCtx {
             renderer: self.backend.renderer(),
             target: RenderTarget::Output,
+            block_out_enabled: true,
             xray: None,
         };
         let mut elements = niri.render_to_vec(ctx, output, true);

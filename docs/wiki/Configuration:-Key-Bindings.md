@@ -362,6 +362,34 @@ binds {
 }
 ```
 
+#### `toggle-block-out-window`
+
+<sup>Since: own-patches</sup>
+
+Toggle block-out for the focused window.
+If the window is already blocked out by configuration, this temporarily disables block-out for it.
+If it is not blocked out, this temporarily enables `screencast` block-out for it.
+
+```kdl
+binds {
+    Mod+B { toggle-block-out-window; }
+}
+```
+
+#### `toggle-block-out`
+
+<sup>Since: own-patches</sup>
+
+Toggle block-out globally.
+This disables or re-enables block-out rendering for both windows and layer surfaces without
+changing individual window `is-block-out` state.
+
+```kdl
+binds {
+    Mod+Shift+B { toggle-block-out; }
+}
+```
+
 #### `screenshot`, `screenshot-screen`, `screenshot-window`
 
 Actions for taking screenshots.
