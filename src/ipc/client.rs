@@ -7,8 +7,9 @@ use anyhow::{anyhow, bail, Context};
 use niri_config::OutputName;
 use niri_ipc::socket::Socket;
 use niri_ipc::{
-    Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout, Zoom,
+    Action, BlockOutFrom, BlockOutState, Cast, CastKind, CastTarget, Event, KeyboardLayouts,
+    LogicalOutput, Mode, Output, OutputConfigChanged, Overview, Request, Response, Transform,
+    Window, WindowLayout, Zoom,
 };
 use serde_json::json;
 
@@ -50,6 +51,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
         Msg::ZoomState => Request::ZoomState,
+        Msg::BlockOutState => Request::BlockOutState,
     };
 
     let mut socket = Socket::connect().context("error connecting to the niri socket")?;
@@ -570,9 +572,86 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!();
             }
         }
+        Msg::BlockOutState => {
+            let Response::BlockOutState(block_out_state) = response else {
+                bail!("unexpected response: expected BlockOutState, got {response:?}");
+            };
+
+            if json {
+                let block_out_state =
+                    serde_json::to_string(&block_out_state).context("error formatting response")?;
+                println!("{block_out_state}");
+                return Ok(());
+            }
+
+            print_block_out_state(block_out_state);
+        }
     }
 
     Ok(())
+}
+
+fn print_block_out_state(block_out_state: BlockOutState) {
+    println!(
+        "Global block-out enabled: {}",
+        if block_out_state.is_enabled {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!();
+
+    println!("Blocked windows:");
+    if block_out_state.windows.is_empty() {
+        println!("  none");
+    } else {
+        for window in block_out_state.windows {
+            let title = window.title.as_deref().unwrap_or("(unset)");
+            let app_id = window.app_id.as_deref().unwrap_or("(unset)");
+            let workspace = window
+                .workspace_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| String::from("none"));
+            println!(
+                "  {}: title={title:?} app-id={app_id:?} workspace={workspace} from={}",
+                window.id,
+                fmt_block_out_from(window.block_out_from)
+            );
+        }
+    }
+    println!();
+
+    println!("Blocked layers:");
+    if block_out_state.layers.is_empty() {
+        println!("  none");
+    } else {
+        for layer in block_out_state.layers {
+            println!(
+                "  output={:?} layer={} namespace={:?} from={}",
+                layer.output,
+                fmt_layer(layer.layer),
+                layer.namespace,
+                fmt_block_out_from(layer.block_out_from)
+            );
+        }
+    }
+}
+
+fn fmt_block_out_from(block_out_from: BlockOutFrom) -> &'static str {
+    match block_out_from {
+        BlockOutFrom::Screencast => "screencast",
+        BlockOutFrom::ScreenCapture => "screen-capture",
+    }
+}
+
+fn fmt_layer(layer: niri_ipc::Layer) -> &'static str {
+    match layer {
+        niri_ipc::Layer::Background => "background",
+        niri_ipc::Layer::Bottom => "bottom",
+        niri_ipc::Layer::Top => "top",
+        niri_ipc::Layer::Overlay => "overlay",
+    }
 }
 
 fn print_output(output: Output) -> anyhow::Result<()> {

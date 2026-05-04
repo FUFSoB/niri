@@ -485,6 +485,16 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let zooms = result.map_err(|_| String::from("error getting zoom states"))?;
             Response::ZoomState(zooms)
         }
+        Request::BlockOutState => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(state.niri.block_out_state());
+            });
+            let result = rx.recv().await;
+            let block_out_state =
+                result.map_err(|_| String::from("error getting block-out state"))?;
+            Response::BlockOutState(block_out_state)
+        }
     };
 
     Ok(response)

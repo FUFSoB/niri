@@ -4,6 +4,7 @@ use niri_config::layer_rule::{LayerRule, Match as LayerMatch};
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
 use niri_config::{Action, BlockOutFrom, Config};
+use niri_ipc::{BlockOutFrom as IpcBlockOutFrom, Layer as IpcLayer};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::output::Output;
@@ -180,6 +181,10 @@ fn focused_window_is_block_out(f: &mut Fixture) -> bool {
         .find(|window| window.is_focused)
         .unwrap()
         .is_block_out
+}
+
+fn block_out_state(f: &mut Fixture) -> niri_ipc::BlockOutState {
+    f.niri().block_out_state()
 }
 
 #[test]
@@ -452,4 +457,121 @@ fn toggle_block_out_globally_disables_window_rendering_but_not_window_state() {
         sample_pixel(size, &pixels, size.w / 2, size.h / 2),
         [0, 0, 0, 0]
     );
+}
+
+#[test]
+fn block_out_state_reports_window_scope_and_global_toggle() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 30), GREEN);
+
+    let state = block_out_state(&mut f);
+    assert!(state.is_enabled);
+    assert_eq!(state.windows.len(), 1);
+    assert_eq!(state.layers.len(), 0);
+    assert!(state.windows[0].id > 0);
+    assert_eq!(state.windows[0].title.as_deref(), Some("blocked"));
+    assert_eq!(
+        state.windows[0].block_out_from,
+        IpcBlockOutFrom::ScreenCapture
+    );
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+
+    let state = block_out_state(&mut f);
+    assert!(!state.is_enabled);
+    assert_eq!(state.windows.len(), 1);
+    assert_eq!(
+        state.windows[0].block_out_from,
+        IpcBlockOutFrom::ScreenCapture
+    );
+}
+
+#[test]
+fn block_out_state_reports_runtime_window_toggle_scope() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 30), GREEN);
+
+    let state = block_out_state(&mut f);
+    assert!(state.windows.is_empty());
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+
+    let state = block_out_state(&mut f);
+    assert_eq!(state.windows.len(), 1);
+    assert_eq!(state.windows[0].block_out_from, IpcBlockOutFrom::Screencast);
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+
+    let state = block_out_state(&mut f);
+    assert!(state.windows.is_empty());
+}
+
+#[test]
+fn block_out_state_reports_layer_scope_and_global_toggle() {
+    let mut config = Config::default();
+    config.layer_rules.push(LayerRule {
+        matches: vec![LayerMatch {
+            namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::Screencast),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    let output = f.client(id).output("headless-1");
+
+    create_layer(
+        &mut f,
+        id,
+        &output,
+        Layer::Top,
+        "blocked",
+        LayerConfigureProps {
+            anchor: Some(Anchor::Top | Anchor::Left),
+            size: Some((40, 40)),
+            ..Default::default()
+        },
+        (40, 40),
+        GREEN,
+    );
+
+    let state = block_out_state(&mut f);
+    assert!(state.is_enabled);
+    assert!(state.windows.is_empty());
+    assert_eq!(state.layers.len(), 1);
+    assert_eq!(state.layers[0].namespace, "blocked");
+    assert_eq!(state.layers[0].output, "headless-1");
+    assert_eq!(state.layers[0].layer, IpcLayer::Top);
+    assert_eq!(state.layers[0].block_out_from, IpcBlockOutFrom::Screencast);
+
+    f.niri_state().do_action(Action::ToggleBlockOut, false);
+
+    let state = block_out_state(&mut f);
+    assert!(!state.is_enabled);
+    assert_eq!(state.layers.len(), 1);
+    assert_eq!(state.layers[0].block_out_from, IpcBlockOutFrom::Screencast);
 }

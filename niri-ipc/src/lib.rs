@@ -121,6 +121,8 @@ pub enum Request {
     Casts,
     /// Request information about zoom state.
     ZoomState,
+    /// Request information about block-out state.
+    BlockOutState,
 }
 
 /// Reply from niri to client.
@@ -169,6 +171,8 @@ pub enum Response {
     Casts(Vec<Cast>),
     /// Map from output name to zoom state.
     ZoomState(HashMap<String, Zoom>),
+    /// Information about block-out state.
+    BlockOutState(BlockOutState),
 }
 
 /// Overview information.
@@ -1539,6 +1543,58 @@ pub struct LayerSurface {
     pub layer: Layer,
     /// The surface's keyboard interactivity mode.
     pub keyboard_interactivity: LayerSurfaceKeyboardInteractivity,
+}
+
+/// A read-only snapshot of block-out state.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct BlockOutState {
+    /// Whether block-out rendering is globally enabled.
+    pub is_enabled: bool,
+    /// Windows currently configured to be blocked out.
+    pub windows: Vec<BlockedWindow>,
+    /// Layer-shell surfaces currently configured to be blocked out.
+    pub layers: Vec<BlockedLayerSurface>,
+}
+
+/// Render targets that a surface can be blocked out from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum BlockOutFrom {
+    /// Block out from screencasts.
+    Screencast,
+    /// Block out from all screen captures.
+    ScreenCapture,
+}
+
+/// A blocked-out window.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct BlockedWindow {
+    /// Unique id of this window.
+    pub id: u64,
+    /// Title, if set.
+    pub title: Option<String>,
+    /// Application ID, if set.
+    pub app_id: Option<String>,
+    /// Id of the workspace this window is on, if any.
+    pub workspace_id: Option<u64>,
+    /// Which render targets this window is blocked out from.
+    pub block_out_from: BlockOutFrom,
+}
+
+/// A blocked-out layer-shell surface.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct BlockedLayerSurface {
+    /// Namespace provided by the layer-shell client.
+    pub namespace: String,
+    /// Name of the output the surface is on.
+    pub output: String,
+    /// Layer that the surface is on.
+    pub layer: Layer,
+    /// Which render targets this layer surface is blocked out from.
+    pub block_out_from: BlockOutFrom,
 }
 
 /// A screencast.

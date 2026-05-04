@@ -15,8 +15,8 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
-    WorkspaceReference, Xkb,
+    BlockOutFrom, Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout,
+    WarpMouseToFocusMode, WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
@@ -182,7 +182,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    send_scale_transform, with_toplevel_role, write_png_rgba8, xwayland,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -2714,6 +2714,73 @@ impl Niri {
         niri.reset_pointer_inactivity_timer();
 
         niri
+    }
+
+    pub fn block_out_state(&self) -> niri_ipc::BlockOutState {
+        fn ipc_block_out_from(block_out_from: BlockOutFrom) -> niri_ipc::BlockOutFrom {
+            match block_out_from {
+                BlockOutFrom::Screencast => niri_ipc::BlockOutFrom::Screencast,
+                BlockOutFrom::ScreenCapture => niri_ipc::BlockOutFrom::ScreenCapture,
+            }
+        }
+
+        fn ipc_layer(layer: Layer) -> niri_ipc::Layer {
+            match layer {
+                Layer::Background => niri_ipc::Layer::Background,
+                Layer::Bottom => niri_ipc::Layer::Bottom,
+                Layer::Top => niri_ipc::Layer::Top,
+                Layer::Overlay => niri_ipc::Layer::Overlay,
+            }
+        }
+
+        let mut windows = Vec::new();
+        self.layout.with_windows(|mapped, _, ws_id, _| {
+            let Some(block_out_from) = mapped.effective_block_out_from() else {
+                return;
+            };
+
+            windows.push(with_toplevel_role(mapped.toplevel(), |role| {
+                niri_ipc::BlockedWindow {
+                    id: mapped.id().get(),
+                    title: role.title.clone(),
+                    app_id: role.app_id.clone(),
+                    workspace_id: ws_id.map(|id| id.get()),
+                    block_out_from: ipc_block_out_from(block_out_from),
+                }
+            }));
+        });
+        windows.sort_unstable_by_key(|window| window.id);
+
+        let mut layers = Vec::new();
+        for output in self.global_space.outputs() {
+            let output_name = output.name().clone();
+            for surface in layer_map_for_output(output).layers() {
+                let Some(mapped) = self.mapped_layer_surfaces.get(surface) else {
+                    continue;
+                };
+                let Some(block_out_from) = mapped.rules().block_out_from else {
+                    continue;
+                };
+
+                layers.push(niri_ipc::BlockedLayerSurface {
+                    namespace: surface.namespace().to_owned(),
+                    output: output_name.clone(),
+                    layer: ipc_layer(surface.layer()),
+                    block_out_from: ipc_block_out_from(block_out_from),
+                });
+            }
+        }
+        layers.sort_unstable_by(|a, b| {
+            Ord::cmp(&a.output, &b.output)
+                .then_with(|| Ord::cmp(&a.layer, &b.layer))
+                .then_with(|| Ord::cmp(&a.namespace, &b.namespace))
+        });
+
+        niri_ipc::BlockOutState {
+            is_enabled: self.block_out_enabled,
+            windows,
+            layers,
+        }
     }
 
     pub fn insert_client(&mut self, client: NewClient) {

@@ -111,6 +111,8 @@ pub enum Msg {
     Casts,
     /// List zoom state of outputs.
     ZoomState,
+    /// Show block-out state.
+    BlockOutState,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
