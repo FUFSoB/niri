@@ -500,11 +500,29 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                         let description = parts.join(" and ");
                         println!("Screenshot captured: {description}");
                     }
+                    Event::BlockOutStateChanged { block_out_state } => {
+                        println!("Block-out state changed: {block_out_state:?}");
+                    }
+                    Event::BlockOutWindowAddedOrChanged { window } => {
+                        println!("Blocked-out window added or changed: {window:?}");
+                    }
+                    Event::BlockOutWindowRemoved { id } => {
+                        println!("Blocked-out window removed: {id}");
+                    }
+                    Event::BlockOutEnabledChanged { is_enabled } => {
+                        println!("Global block-out enabled changed: {is_enabled}");
+                    }
                     Event::CastsChanged { casts } => {
                         println!("Casts changed: {casts:?}");
                     }
                     Event::CastStartedOrChanged { cast } => {
                         println!("Cast started or changed: {cast:?}");
+                    }
+                    Event::CastRecordingStarted { cast } => {
+                        println!("Cast recording started: {cast:?}");
+                    }
+                    Event::CastRecordingStopped { cast } => {
+                        println!("Cast recording stopped: {cast:?}");
                     }
                     Event::CastStopped { stream_id } => {
                         println!("Cast stopped: stream id {stream_id}");

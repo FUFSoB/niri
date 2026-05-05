@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, BlockOutState, BlockedWindow, Cast, Event, KeyboardLayouts, OutputConfigChanged,
+    Overview, Reply, Request, Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -573,6 +573,94 @@ fn make_ipc_window(
     })
 }
 
+fn diff_block_out_events(
+    previous: Option<&BlockOutState>,
+    new_state: &BlockOutState,
+) -> Vec<Event> {
+    if previous == Some(new_state) {
+        return vec![];
+    }
+
+    let mut events = vec![Event::BlockOutStateChanged {
+        block_out_state: new_state.clone(),
+    }];
+
+    let previous_windows = previous
+        .map(|state| {
+            state
+                .windows
+                .iter()
+                .cloned()
+                .map(|window| (window.id, window))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let new_windows = new_state
+        .windows
+        .iter()
+        .cloned()
+        .map(|window| (window.id, window))
+        .collect::<HashMap<_, _>>();
+
+    for window in &new_state.windows {
+        if previous_windows.get(&window.id) != Some(window) {
+            events.push(Event::BlockOutWindowAddedOrChanged {
+                window: window.clone(),
+            });
+        }
+    }
+
+    for id in previous_windows.keys() {
+        if !new_windows.contains_key(id) {
+            events.push(Event::BlockOutWindowRemoved { id: *id });
+        }
+    }
+
+    if previous.is_none_or(|state| state.is_enabled != new_state.is_enabled) {
+        events.push(Event::BlockOutEnabledChanged {
+            is_enabled: new_state.is_enabled,
+        });
+    }
+
+    events
+}
+
+fn diff_cast_events(previous: &HashMap<u64, Cast>, casts: Vec<Cast>) -> Vec<Event> {
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cast in casts {
+        let stream_id = cast.stream_id;
+        let existing = previous.get(&stream_id);
+        seen.insert(stream_id);
+
+        if existing != Some(&cast) {
+            events.push(Event::CastStartedOrChanged { cast: cast.clone() });
+        }
+
+        if cast.is_active && existing.is_none_or(|existing| !existing.is_active) {
+            events.push(Event::CastRecordingStarted { cast });
+        } else if !cast.is_active && existing.is_some_and(|existing| existing.is_active) {
+            events.push(Event::CastRecordingStopped { cast });
+        }
+    }
+
+    for (stream_id, cast) in previous {
+        if seen.contains(stream_id) {
+            continue;
+        }
+
+        if cast.is_active {
+            events.push(Event::CastRecordingStopped { cast: cast.clone() });
+        }
+        events.push(Event::CastStopped {
+            stream_id: *stream_id,
+        });
+    }
+
+    events
+}
+
 impl State {
     pub fn ipc_keyboard_layouts_changed(&mut self) {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
@@ -626,6 +714,25 @@ impl State {
         self.ipc_refresh_workspaces();
         self.ipc_refresh_windows();
         self.ipc_refresh_overview();
+    }
+
+    pub fn ipc_refresh_block_out(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let _span = tracy_client::span!("State::ipc_refresh_block_out");
+
+        let new_state = self.niri.block_out_state();
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let state = &mut state.block_out;
+        let events = diff_block_out_events(state.block_out_state.as_ref(), &new_state);
+
+        for event in events {
+            state.apply(event.clone());
+            server.send_event(event);
+        }
     }
 
     fn ipc_refresh_workspaces(&mut self) {
@@ -860,58 +967,37 @@ impl State {
         let mut state = server.event_stream_state.borrow_mut();
         let state = &mut state.casts;
 
-        let mut events = Vec::new();
-        let mut seen = HashSet::new();
+        let mut casts = Vec::new();
 
         // Check PipeWire screencasts.
         #[cfg(feature = "xdp-gnome-screencast")]
         {
             // Check pending dynamic casts.
             for pending in &self.niri.casting.pending_dynamic_casts {
-                let stream_id = pending.stream_id.get();
-                seen.insert(stream_id);
-
-                // Pending dynamic casts don't change any properties, so we only need to check if
-                // it's missing from the state.
-                if !state.casts.contains_key(&stream_id) {
-                    let cast = niri_ipc::Cast {
-                        session_id: pending.session_id.get(),
-                        stream_id,
-                        kind: niri_ipc::CastKind::PipeWire,
-                        target: niri_ipc::CastTarget::Nothing {},
-                        is_dynamic_target: true,
-                        is_active: false,
-                        pid: None,
-                        pw_node_id: None,
-                    };
-                    events.push(Event::CastStartedOrChanged { cast });
-                }
+                casts.push(niri_ipc::Cast {
+                    session_id: pending.session_id.get(),
+                    stream_id: pending.stream_id.get(),
+                    kind: niri_ipc::CastKind::PipeWire,
+                    target: niri_ipc::CastTarget::Nothing {},
+                    is_dynamic_target: true,
+                    is_active: false,
+                    pid: None,
+                    pw_node_id: None,
+                });
             }
 
             // Check active casts.
             for cast in &self.niri.casting.casts {
-                let stream_id = cast.stream_id.get();
-                seen.insert(stream_id);
-
-                let pw_node_id = cast.node_id();
-                if state.casts.get(&stream_id).is_none_or(|existing| {
-                    // Only these properties can change.
-                    existing.is_active != cast.is_active()
-                        || !cast.target.matches(&existing.target)
-                        || existing.pw_node_id != pw_node_id
-                }) {
-                    let cast = niri_ipc::Cast {
-                        session_id: cast.session_id.get(),
-                        stream_id,
-                        kind: niri_ipc::CastKind::PipeWire,
-                        target: cast.target.make_ipc(),
-                        is_dynamic_target: cast.dynamic_target,
-                        is_active: cast.is_active(),
-                        pid: None,
-                        pw_node_id,
-                    };
-                    events.push(Event::CastStartedOrChanged { cast });
-                }
+                casts.push(niri_ipc::Cast {
+                    session_id: cast.session_id.get(),
+                    stream_id: cast.stream_id.get(),
+                    kind: niri_ipc::CastKind::PipeWire,
+                    target: cast.target.make_ipc(),
+                    is_dynamic_target: cast.dynamic_target,
+                    is_active: cast.is_active(),
+                    pid: None,
+                    pw_node_id: cast.node_id(),
+                });
             }
         }
 
@@ -923,41 +1009,22 @@ impl State {
 
         for queue in self.niri.screencopy_state.queues() {
             if let Some(cast_info) = queue.cast() {
-                let stream_id = cast_info.stream_id.get();
-                seen.insert(stream_id);
-
-                if state.casts.get(&stream_id).is_none_or(|existing| {
-                    // Only this property can change.
-                    match &existing.target {
-                        niri_ipc::CastTarget::Output { name } => *name != cast_info.output_name,
-                        _ => true,
-                    }
-                }) {
-                    let cast = niri_ipc::Cast {
-                        session_id: cast_info.session_id.get(),
-                        stream_id,
-                        kind: niri_ipc::CastKind::WlrScreencopy,
-                        target: niri_ipc::CastTarget::Output {
-                            name: cast_info.output_name.clone(),
-                        },
-                        is_dynamic_target: false,
-                        is_active: true,
-                        pid: queue.credentials().map(|creds| creds.pid),
-                        pw_node_id: None,
-                    };
-                    events.push(Event::CastStartedOrChanged { cast });
-                }
-            }
-        }
-
-        // Check for stopped casts.
-        for stream_id in state.casts.keys() {
-            if !seen.contains(stream_id) {
-                events.push(Event::CastStopped {
-                    stream_id: *stream_id,
+                casts.push(niri_ipc::Cast {
+                    session_id: cast_info.session_id.get(),
+                    stream_id: cast_info.stream_id.get(),
+                    kind: niri_ipc::CastKind::WlrScreencopy,
+                    target: niri_ipc::CastTarget::Output {
+                        name: cast_info.output_name.clone(),
+                    },
+                    is_dynamic_target: false,
+                    is_active: true,
+                    pid: queue.credentials().map(|creds| creds.pid),
+                    pw_node_id: None,
                 });
             }
         }
+
+        let events = diff_cast_events(&state.casts, casts);
 
         for event in events {
             state.apply(event.clone());
@@ -985,5 +1052,130 @@ impl State {
         let event = Event::ScreenshotCaptured { path };
         state.apply(event.clone());
         server.send_event(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cast(
+        stream_id: u64,
+        target: niri_ipc::CastTarget,
+        is_active: bool,
+        is_dynamic_target: bool,
+    ) -> Cast {
+        Cast {
+            stream_id,
+            session_id: stream_id + 100,
+            kind: niri_ipc::CastKind::PipeWire,
+            target,
+            is_dynamic_target,
+            is_active,
+            pid: None,
+            pw_node_id: Some(stream_id as u32 + 1000),
+        }
+    }
+
+    #[test]
+    fn diff_cast_events_emits_recording_start_for_new_active_cast() {
+        let events = diff_cast_events(
+            &HashMap::new(),
+            vec![make_cast(
+                1,
+                niri_ipc::CastTarget::Output {
+                    name: String::from("headless-1"),
+                },
+                true,
+                false,
+            )],
+        );
+
+        assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
+        assert!(matches!(events[1], Event::CastRecordingStarted { .. }));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn diff_cast_events_emits_recording_stop_without_cast_removal() {
+        let existing = make_cast(
+            1,
+            niri_ipc::CastTarget::Output {
+                name: String::from("headless-1"),
+            },
+            true,
+            false,
+        );
+        let mut previous = HashMap::new();
+        previous.insert(existing.stream_id, existing);
+
+        let events = diff_cast_events(
+            &previous,
+            vec![make_cast(
+                1,
+                niri_ipc::CastTarget::Output {
+                    name: String::from("headless-1"),
+                },
+                false,
+                false,
+            )],
+        );
+
+        assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
+        assert!(matches!(events[1], Event::CastRecordingStopped { .. }));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn diff_cast_events_emits_recording_stop_before_cast_stopped() {
+        let existing = make_cast(5, niri_ipc::CastTarget::Window { id: 77 }, true, false);
+        let mut previous = HashMap::new();
+        previous.insert(existing.stream_id, existing);
+
+        let events = diff_cast_events(&previous, vec![]);
+
+        assert!(matches!(events[0], Event::CastRecordingStopped { .. }));
+        assert!(matches!(events[1], Event::CastStopped { stream_id: 5 }));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn diff_cast_events_waits_for_dynamic_target_recording_to_become_active() {
+        let pending = make_cast(9, niri_ipc::CastTarget::Nothing {}, false, true);
+        let mut previous = HashMap::new();
+
+        let events = diff_cast_events(&previous, vec![pending.clone()]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
+
+        previous.insert(pending.stream_id, pending);
+        let events = diff_cast_events(
+            &previous,
+            vec![make_cast(
+                9,
+                niri_ipc::CastTarget::Window { id: 123 },
+                false,
+                true,
+            )],
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
+
+        previous.insert(
+            9,
+            make_cast(9, niri_ipc::CastTarget::Window { id: 123 }, false, true),
+        );
+        let events = diff_cast_events(
+            &previous,
+            vec![make_cast(
+                9,
+                niri_ipc::CastTarget::Window { id: 123 },
+                true,
+                true,
+            )],
+        );
+        assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
+        assert!(matches!(events[1], Event::CastRecordingStarted { .. }));
+        assert_eq!(events.len(), 2);
     }
 }

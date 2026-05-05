@@ -9,7 +9,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use crate::{Cast, Event, KeyboardLayouts, Window, Workspace};
+use crate::{BlockOutState, BlockedWindow, Cast, Event, KeyboardLayouts, Window, Workspace};
 
 /// Part of the state communicated via the event stream.
 pub trait EventStreamStatePart {
@@ -46,6 +46,9 @@ pub struct EventStreamState {
 
     /// State of the config.
     pub config: ConfigState,
+
+    /// State of block-out.
+    pub block_out: BlockOutStateState,
 
     /// State of screencasts.
     pub casts: CastsState,
@@ -86,6 +89,13 @@ pub struct ConfigState {
     pub failed: bool,
 }
 
+/// The block-out state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct BlockOutStateState {
+    /// Current block-out state snapshot.
+    pub block_out_state: Option<BlockOutState>,
+}
+
 /// The casts state communicated over the event stream.
 #[derive(Debug, Default)]
 pub struct CastsState {
@@ -101,6 +111,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.keyboard_layouts.replicate());
         events.extend(self.overview.replicate());
         events.extend(self.config.replicate());
+        events.extend(self.block_out.replicate());
         events.extend(self.casts.replicate());
         events
     }
@@ -111,6 +122,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.keyboard_layouts.apply(event)?;
         let event = self.overview.apply(event)?;
         let event = self.config.apply(event)?;
+        let event = self.block_out.apply(event)?;
         let event = self.casts.apply(event)?;
         Some(event)
     }
@@ -298,6 +310,55 @@ impl EventStreamStatePart for ConfigState {
     }
 }
 
+impl EventStreamStatePart for BlockOutStateState {
+    fn replicate(&self) -> Vec<Event> {
+        let Some(block_out_state) = self.block_out_state.clone() else {
+            return vec![];
+        };
+
+        vec![Event::BlockOutStateChanged { block_out_state }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::BlockOutStateChanged { block_out_state } => {
+                self.block_out_state = Some(block_out_state);
+            }
+            Event::BlockOutWindowAddedOrChanged { window } => {
+                let block_out_state = self
+                    .block_out_state
+                    .get_or_insert_with(|| BlockOutState {
+                        is_enabled: false,
+                        windows: vec![],
+                        layers: vec![],
+                    });
+
+                upsert_blocked_window(&mut block_out_state.windows, window);
+            }
+            Event::BlockOutWindowRemoved { id } => {
+                let Some(block_out_state) = self.block_out_state.as_mut() else {
+                    return None;
+                };
+
+                block_out_state.windows.retain(|window| window.id != id);
+            }
+            Event::BlockOutEnabledChanged { is_enabled } => {
+                let block_out_state = self
+                    .block_out_state
+                    .get_or_insert_with(|| BlockOutState {
+                        is_enabled,
+                        windows: vec![],
+                        layers: vec![],
+                    });
+                block_out_state.is_enabled = is_enabled;
+            }
+            event => return Some(event),
+        }
+
+        None
+    }
+}
+
 impl EventStreamStatePart for CastsState {
     fn replicate(&self) -> Vec<Event> {
         let casts = self.casts.values().cloned().collect();
@@ -319,5 +380,108 @@ impl EventStreamStatePart for CastsState {
             event => return Some(event),
         }
         None
+    }
+}
+
+fn upsert_blocked_window(windows: &mut Vec<BlockedWindow>, window: BlockedWindow) {
+    if let Some(existing) = windows.iter_mut().find(|existing| existing.id == window.id) {
+        *existing = window;
+    } else {
+        windows.push(window);
+        windows.sort_unstable_by_key(|window| window.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BlockOutFrom, Layer};
+
+    #[test]
+    fn block_out_state_replicates_and_applies_full_snapshot() {
+        let block_out_state = BlockOutState {
+            is_enabled: true,
+            windows: vec![BlockedWindow {
+                id: 1,
+                title: Some(String::from("blocked")),
+                app_id: Some(String::from("app")),
+                workspace_id: Some(2),
+                block_out_from: BlockOutFrom::Screencast,
+            }],
+            layers: vec![crate::BlockedLayerSurface {
+                namespace: String::from("layer"),
+                output: String::from("headless-1"),
+                layer: Layer::Top,
+                block_out_from: BlockOutFrom::ScreenCapture,
+            }],
+        };
+
+        let mut state = BlockOutStateState::default();
+        assert!(
+            state
+                .apply(Event::BlockOutStateChanged {
+                    block_out_state: block_out_state.clone(),
+                })
+                .is_none()
+        );
+        assert_eq!(state.block_out_state, Some(block_out_state.clone()));
+
+        let events = state.replicate();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::BlockOutStateChanged {
+                block_out_state: got,
+            } => assert_eq!(got, &block_out_state),
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[test]
+    fn block_out_state_patches_windows_and_enabled_flag() {
+        let mut state = BlockOutStateState {
+            block_out_state: Some(BlockOutState {
+                is_enabled: true,
+                windows: vec![BlockedWindow {
+                    id: 2,
+                    title: Some(String::from("second")),
+                    app_id: None,
+                    workspace_id: Some(9),
+                    block_out_from: BlockOutFrom::ScreenCapture,
+                }],
+                layers: vec![],
+            }),
+        };
+
+        state.apply(Event::BlockOutWindowAddedOrChanged {
+            window: BlockedWindow {
+                id: 1,
+                title: Some(String::from("first")),
+                app_id: Some(String::from("app")),
+                workspace_id: Some(3),
+                block_out_from: BlockOutFrom::Screencast,
+            },
+        });
+        state.apply(Event::BlockOutWindowAddedOrChanged {
+            window: BlockedWindow {
+                id: 2,
+                title: Some(String::from("updated")),
+                app_id: None,
+                workspace_id: Some(10),
+                block_out_from: BlockOutFrom::Screencast,
+            },
+        });
+        state.apply(Event::BlockOutEnabledChanged { is_enabled: false });
+        state.apply(Event::BlockOutWindowRemoved { id: 1 });
+
+        let block_out_state = state.block_out_state.unwrap();
+        assert!(!block_out_state.is_enabled);
+        assert_eq!(block_out_state.windows.len(), 1);
+        assert_eq!(block_out_state.windows[0].id, 2);
+        assert_eq!(block_out_state.windows[0].title.as_deref(), Some("updated"));
+        assert_eq!(block_out_state.windows[0].workspace_id, Some(10));
+        assert_eq!(
+            block_out_state.windows[0].block_out_from,
+            BlockOutFrom::Screencast
+        );
     }
 }

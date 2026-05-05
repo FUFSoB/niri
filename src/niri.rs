@@ -855,6 +855,7 @@ impl State {
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
         self.ipc_refresh_layout();
+        self.ipc_refresh_block_out();
         self.ipc_refresh_keyboard_layout_index();
 
         // Needs to be called after updating the keyboard focus.

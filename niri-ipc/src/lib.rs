@@ -1801,6 +1801,26 @@ pub enum Event {
         /// be converted to a `String` (e.g. contained invalid UTF-8 bytes).
         path: Option<String>,
     },
+    /// The block-out state has changed.
+    BlockOutStateChanged {
+        /// The new block-out state snapshot.
+        block_out_state: BlockOutState,
+    },
+    /// A blocked-out window was added or changed.
+    BlockOutWindowAddedOrChanged {
+        /// The blocked-out window that was added or changed.
+        window: BlockedWindow,
+    },
+    /// A blocked-out window was removed.
+    BlockOutWindowRemoved {
+        /// Id of the no-longer blocked-out window.
+        id: u64,
+    },
+    /// Global block-out was enabled or disabled.
+    BlockOutEnabledChanged {
+        /// Whether block-out is now globally enabled.
+        is_enabled: bool,
+    },
     /// The screencasts have changed.
     CastsChanged {
         /// The new screencast information.
@@ -1812,6 +1832,16 @@ pub enum Event {
     /// A screencast started, or an existing cast changed.
     CastStartedOrChanged {
         /// The cast that started or changed.
+        cast: Cast,
+    },
+    /// A cast started actively streaming frames.
+    CastRecordingStarted {
+        /// The cast that started recording.
+        cast: Cast,
+    },
+    /// A cast stopped actively streaming frames.
+    CastRecordingStopped {
+        /// The cast that stopped recording.
         cast: Cast,
     },
     /// A screencast stopped.
