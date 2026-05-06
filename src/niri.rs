@@ -610,6 +610,10 @@ pub enum CastTarget {
         /// Cached name of the output.
         name: String,
     },
+    Workspace {
+        id: WorkspaceId,
+        output: Option<WeakOutput>,
+    },
     Window {
         id: u64,
     },
@@ -623,8 +627,24 @@ impl CastTarget {
         }
     }
 
+    pub fn workspace(id: WorkspaceId, output: Option<&Output>) -> Self {
+        Self::Workspace {
+            id,
+            output: output.map(Output::downgrade),
+        }
+    }
+
     pub fn matches_output(&self, weak: &WeakOutput) -> bool {
-        matches!(self, CastTarget::Output { output, .. } if output == weak)
+        matches!(
+            self,
+            CastTarget::Output { output, .. } if output == weak
+        ) || matches!(
+            self,
+            CastTarget::Workspace {
+                output: Some(output),
+                ..
+            } if output == weak
+        )
     }
 
     pub fn matches(&self, ipc: &niri_ipc::CastTarget) -> bool {
@@ -633,6 +653,9 @@ impl CastTarget {
             (Nothing, niri_ipc::CastTarget::Nothing {}) => true,
             (Output { name, .. }, niri_ipc::CastTarget::Output { name: ipc_name }) => {
                 name == ipc_name
+            }
+            (Workspace { id, .. }, niri_ipc::CastTarget::Workspace { id: ipc_id }) => {
+                id.get() == *ipc_id
             }
             (Window { id }, niri_ipc::CastTarget::Window { id: ipc_id }) => id == ipc_id,
             _ => false,
@@ -644,6 +667,7 @@ impl CastTarget {
         match self {
             Nothing => niri_ipc::CastTarget::Nothing {},
             Output { name, .. } => niri_ipc::CastTarget::Output { name: name.clone() },
+            Workspace { id, .. } => niri_ipc::CastTarget::Workspace { id: id.get() },
             Window { id } => niri_ipc::CastTarget::Window { id: *id },
         }
     }
@@ -846,6 +870,8 @@ impl State {
 
         #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_mapped_cast_outputs();
+        #[cfg(feature = "xdp-gnome-screencast")]
+        self.niri.refresh_workspace_cast_targets();
         // Should happen before refresh_window_rules(), but after anything that can start or stop
         // screencasts.
         #[cfg(feature = "xdp-gnome-screencast")]
@@ -2241,6 +2267,11 @@ impl State {
         let _span = tracy_client::span!("GetWindows");
 
         let mut windows = HashMap::new();
+        #[cfg(feature = "xdp-gnome-screencast")]
+        let mut workspace_windows = HashMap::new();
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        self.niri.refresh_portal_cast_sources();
 
         #[cfg(feature = "xdp-gnome-screencast")]
         windows.insert(
@@ -2269,6 +2300,55 @@ impl State {
 
             windows.insert(id, props);
         });
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        self.niri.layout.with_windows(|mapped, _, workspace_id, _| {
+            let Some(workspace_id) = workspace_id else {
+                return;
+            };
+
+            let id = mapped.id().get();
+            let summary = with_toplevel_role(mapped.toplevel(), |role| {
+                gnome_shell_introspect::WorkspaceWindow {
+                    id,
+                    title: role.title.clone(),
+                    app_id: role.app_id.clone(),
+                }
+            });
+            workspace_windows
+                .entry(workspace_id)
+                .or_insert_with(Vec::new)
+                .push(summary);
+        });
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        for (_, workspace_idx, workspace) in self.niri.layout.workspaces() {
+            if workspace.current_output().is_none() {
+                continue;
+            }
+
+            let Some(portal_id) = self.niri.portal_workspace_cast_id(workspace.id()) else {
+                continue;
+            };
+
+            let title = gnome_shell_introspect::workspace_cast_title(
+                u8::try_from(workspace_idx + 1).unwrap_or(u8::MAX),
+                workspace.name().map(String::as_str),
+                workspace.active_window().map(|window| window.id().get()),
+                workspace_windows
+                    .get(&workspace.id())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            );
+
+            windows.insert(
+                portal_id.get(),
+                gnome_shell_introspect::WindowProperties {
+                    title,
+                    app_id: String::from("rs.bxt.niri.desktop"),
+                },
+            );
+        }
 
         let msg = NiriToIntrospect::Windows(windows);
         if let Err(err) = to_introspect.send_blocking(msg) {
@@ -4550,6 +4630,131 @@ impl Niri {
         ctx.xray = Some(&state.xray);
 
         self.render_inner(ctx, output, include_pointer, push);
+
+        self.clear_xray_elements(output);
+    }
+
+    pub fn render_workspace_for_screen_cast<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        workspace: &Workspace<Mapped>,
+        push: &mut dyn FnMut(OutputRenderElements<R>),
+    ) {
+        self.fill_xray_elements(ctx.as_gles(), output);
+
+        let mut ctx = ctx.r();
+        let state = self.output_state.get(output).unwrap();
+        ctx.xray = Some(&state.xray);
+
+        let output_scale = Scale::from(output.current_scale().fractional_scale());
+        let backdrop = SolidColorRenderElement::from_buffer(
+            &state.backdrop_buffer,
+            (0., 0.),
+            1.,
+            Kind::Unspecified,
+        )
+        .into();
+
+        let layer_map = layer_map_for_output(output);
+        let mon = self.layout.monitor_for_output(output).unwrap();
+        let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
+        let ns = Some(workspace.id().get() as usize);
+        let xray_pos = XrayPos::default();
+        let ws_geo = Rectangle::from_size(output_size(output).to_f64());
+
+        macro_rules! process {
+            () => {{
+                &mut |elem| {
+                    if let Some(elem) = scale_relocate_crop(elem, output_scale, 1., ws_geo) {
+                        push(elem.into());
+                    }
+                }
+            }};
+        }
+
+        macro_rules! push_popups_from_layer {
+            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
+                self.render_layer_popups(
+                    ctx.r(),
+                    $ns,
+                    &layer_map,
+                    $layer,
+                    $xray_pos,
+                    $backdrop,
+                    $push,
+                );
+            }};
+            ($layer:expr, true) => {{
+                push_popups_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| push(
+                    elem.into()
+                ));
+            }};
+            ($layer:expr) => {{
+                push_popups_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| push(
+                    elem.into()
+                ));
+            }};
+        }
+
+        macro_rules! push_normal_from_layer {
+            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
+                self.render_layer_normal(
+                    ctx.r(),
+                    $ns,
+                    &layer_map,
+                    $layer,
+                    $xray_pos,
+                    $backdrop,
+                    $push,
+                );
+            }};
+            ($layer:expr, true) => {{
+                push_normal_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| {
+                    push(elem.into())
+                });
+            }};
+            ($layer:expr) => {{
+                push_normal_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| {
+                    push(elem.into())
+                });
+            }};
+        }
+
+        push_popups_from_layer!(Layer::Overlay);
+        push_normal_from_layer!(Layer::Overlay);
+
+        if workspace.render_above_top_layer() {
+            mon.render_workspace_at_origin(ctx.r(), workspace, focus_ring, &mut |elem| {
+                push(elem.into())
+            });
+
+            push_popups_from_layer!(Layer::Top);
+            push_normal_from_layer!(Layer::Top);
+
+            push_popups_from_layer!(Layer::Bottom, ns, xray_pos, false, process!());
+            push_popups_from_layer!(Layer::Background, ns, xray_pos, false, process!());
+        } else {
+            push_popups_from_layer!(Layer::Top);
+            push_normal_from_layer!(Layer::Top);
+
+            push_popups_from_layer!(Layer::Bottom, ns, xray_pos, false, process!());
+            push_popups_from_layer!(Layer::Background, ns, xray_pos, false, process!());
+
+            mon.render_workspace_at_origin(ctx.r(), workspace, focus_ring, &mut |elem| {
+                push(elem.into())
+            });
+        }
+
+        push_normal_from_layer!(Layer::Bottom, ns, xray_pos, false, process!());
+        push_normal_from_layer!(Layer::Background, ns, xray_pos, false, process!());
+
+        process!()(workspace.render_background());
+
+        push_popups_from_layer!(Layer::Background, true);
+        push_normal_from_layer!(Layer::Background, true);
+
+        push(backdrop);
 
         self.clear_xray_elements(output);
     }

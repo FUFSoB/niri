@@ -325,13 +325,11 @@ impl EventStreamStatePart for BlockOutStateState {
                 self.block_out_state = Some(block_out_state);
             }
             Event::BlockOutWindowAddedOrChanged { window } => {
-                let block_out_state = self
-                    .block_out_state
-                    .get_or_insert_with(|| BlockOutState {
-                        is_enabled: false,
-                        windows: vec![],
-                        layers: vec![],
-                    });
+                let block_out_state = self.block_out_state.get_or_insert_with(|| BlockOutState {
+                    is_enabled: false,
+                    windows: vec![],
+                    layers: vec![],
+                });
 
                 upsert_blocked_window(&mut block_out_state.windows, window);
             }
@@ -343,13 +341,11 @@ impl EventStreamStatePart for BlockOutStateState {
                 block_out_state.windows.retain(|window| window.id != id);
             }
             Event::BlockOutEnabledChanged { is_enabled } => {
-                let block_out_state = self
-                    .block_out_state
-                    .get_or_insert_with(|| BlockOutState {
-                        is_enabled,
-                        windows: vec![],
-                        layers: vec![],
-                    });
+                let block_out_state = self.block_out_state.get_or_insert_with(|| BlockOutState {
+                    is_enabled,
+                    windows: vec![],
+                    layers: vec![],
+                });
                 block_out_state.is_enabled = is_enabled;
             }
             event => return Some(event),
@@ -417,13 +413,11 @@ mod tests {
         };
 
         let mut state = BlockOutStateState::default();
-        assert!(
-            state
-                .apply(Event::BlockOutStateChanged {
-                    block_out_state: block_out_state.clone(),
-                })
-                .is_none()
-        );
+        assert!(state
+            .apply(Event::BlockOutStateChanged {
+                block_out_state: block_out_state.clone(),
+            })
+            .is_none());
         assert_eq!(state.block_out_state, Some(block_out_state.clone()));
 
         let events = state.replicate();

@@ -20,6 +20,13 @@ pub enum NiriToIntrospect {
     Windows(HashMap<u64, WindowProperties>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceWindow {
+    pub id: u64,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+}
+
 #[derive(Debug, SerializeDict, Type, Value)]
 #[zvariant(signature = "dict")]
 pub struct WindowProperties {
@@ -32,6 +39,75 @@ pub struct WindowProperties {
     /// xdg-desktop-portal-gnome's window list is missing icons.
     #[zvariant(rename = "app-id")]
     pub app_id: String,
+}
+
+pub fn workspace_cast_title(
+    idx: u8,
+    name: Option<&str>,
+    active_window_id: Option<u64>,
+    windows: &[WorkspaceWindow],
+) -> String {
+    let base = match name.filter(|name| !name.is_empty()) {
+        Some(name) => format!("Workspace {idx} ({name})"),
+        None => format!("Workspace {idx}"),
+    };
+
+    let mut windows = windows.iter().collect::<Vec<_>>();
+    if let Some(active_window_id) = active_window_id {
+        if let Some(index) = windows
+            .iter()
+            .position(|window| window.id == active_window_id)
+        {
+            let active = windows.remove(index);
+            windows.insert(0, active);
+        }
+    }
+
+    let mut summary = windows
+        .iter()
+        .take(3)
+        .map(|window| workspace_window_label(window))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if summary.is_empty() {
+        summary = String::from("empty");
+    } else if windows.len() > 3 {
+        summary.push_str(", ...");
+    }
+
+    format!("{base} - {summary}")
+}
+
+fn workspace_window_label(window: &WorkspaceWindow) -> String {
+    if let Some(title) = window
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_string();
+    }
+
+    if let Some(app_id) = window
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|app_id| !app_id.is_empty())
+    {
+        return workspace_window_app_id_stem(app_id).to_string();
+    }
+
+    format!("window {}", window.id)
+}
+
+fn workspace_window_app_id_stem(app_id: &str) -> &str {
+    let app_id = app_id.strip_suffix(".desktop").unwrap_or(app_id);
+    app_id
+        .rsplit_once('.')
+        .map(|(_, tail)| tail)
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(app_id)
 }
 
 #[interface(name = "org.gnome.Shell.Introspect")]
@@ -78,5 +154,93 @@ impl Start for Introspect {
         conn.request_name_with_flags("org.gnome.Shell.Introspect", flags)?;
 
         Ok(conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_cast_title_includes_name_and_active_window_first() {
+        let title = workspace_cast_title(
+            2,
+            Some("web"),
+            Some(9),
+            &[
+                WorkspaceWindow {
+                    id: 1,
+                    title: Some(String::from("Terminal")),
+                    app_id: Some(String::from("org.wezfurlong.wezterm")),
+                },
+                WorkspaceWindow {
+                    id: 9,
+                    title: Some(String::from("Firefox")),
+                    app_id: Some(String::from("firefox")),
+                },
+                WorkspaceWindow {
+                    id: 4,
+                    title: Some(String::from("Slack")),
+                    app_id: Some(String::from("com.slack.Slack")),
+                },
+            ],
+        );
+
+        assert_eq!(title, "Workspace 2 (web) - Firefox, Terminal, Slack");
+    }
+
+    #[test]
+    fn workspace_cast_title_handles_empty_workspaces() {
+        let title = workspace_cast_title(3, None, None, &[]);
+        assert_eq!(title, "Workspace 3 - empty");
+    }
+
+    #[test]
+    fn workspace_cast_title_limits_the_summary() {
+        let title = workspace_cast_title(
+            5,
+            None,
+            None,
+            &[
+                WorkspaceWindow {
+                    id: 1,
+                    title: Some(String::from("Firefox")),
+                    app_id: None,
+                },
+                WorkspaceWindow {
+                    id: 2,
+                    title: Some(String::from("Slack")),
+                    app_id: None,
+                },
+                WorkspaceWindow {
+                    id: 3,
+                    title: Some(String::from("Terminal")),
+                    app_id: None,
+                },
+                WorkspaceWindow {
+                    id: 4,
+                    title: Some(String::from("Docs")),
+                    app_id: None,
+                },
+            ],
+        );
+
+        assert_eq!(title, "Workspace 5 - Firefox, Slack, Terminal, ...");
+    }
+
+    #[test]
+    fn workspace_cast_title_falls_back_to_app_id_stem() {
+        let title = workspace_cast_title(
+            1,
+            None,
+            None,
+            &[WorkspaceWindow {
+                id: 7,
+                title: Some(String::from("  ")),
+                app_id: Some(String::from("org.keepassxc.KeePassXC.desktop")),
+            }],
+        );
+
+        assert_eq!(title, "Workspace 1 - KeePassXC");
     }
 }

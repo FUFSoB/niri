@@ -363,6 +363,7 @@ pub enum Action {
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
     SetDynamicCastMonitor(#[knuffel(argument)] Option<String>),
+    SetDynamicCastWorkspace(#[knuffel(argument)] Option<WorkspaceReference>),
     ClearDynamicCastTarget,
     #[knuffel(skip)]
     StopCast(u64),
@@ -712,6 +713,9 @@ impl From<niri_ipc::Action> for Action {
             }
             niri_ipc::Action::SetDynamicCastMonitor { output } => {
                 Self::SetDynamicCastMonitor(output)
+            }
+            niri_ipc::Action::SetDynamicCastWorkspace { reference } => {
+                Self::SetDynamicCastWorkspace(reference.map(WorkspaceReference::from))
             }
             niri_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             niri_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
@@ -1121,6 +1125,21 @@ mod tests {
                 trigger: Trigger::Keysym(Keysym::a),
                 modifiers: Modifiers::ISO_LEVEL5_SHIFT
             },
+        );
+    }
+
+    #[test]
+    fn from_ipc_action_maps_dynamic_workspace_cast() {
+        assert_eq!(
+            Action::from(niri_ipc::Action::SetDynamicCastWorkspace {
+                reference: Some(WorkspaceReferenceArg::Id(42)),
+            }),
+            Action::SetDynamicCastWorkspace(Some(WorkspaceReference::Id(42))),
+        );
+
+        assert_eq!(
+            Action::from(niri_ipc::Action::SetDynamicCastWorkspace { reference: None }),
+            Action::SetDynamicCastWorkspace(None),
         );
     }
 }

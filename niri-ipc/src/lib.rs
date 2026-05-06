@@ -926,6 +926,18 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg())]
         output: Option<String>,
     },
+    /// Set the dynamic cast target to a workspace.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Set the dynamic cast target to the focused workspace")
+    )]
+    SetDynamicCastWorkspace {
+        /// Reference (id, index or name) of the workspace to target.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg())]
+        reference: Option<WorkspaceReferenceArg>,
+    },
     /// Clear the dynamic cast target, making it show nothing.
     ClearDynamicCastTarget {},
     /// Stop a PipeWire screencast.
@@ -1671,6 +1683,11 @@ pub enum CastTarget {
     Output {
         /// Name of the screencasted output.
         name: String,
+    },
+    /// Casting a workspace.
+    Workspace {
+        /// ID of the screencasted workspace.
+        id: u64,
     },
     /// Casting a window.
     Window {

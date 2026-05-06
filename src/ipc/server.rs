@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, BlockOutState, BlockedWindow, Cast, Event, KeyboardLayouts, OutputConfigChanged,
-    Overview, Reply, Request, Response, Timestamp, WindowLayout, Workspace,
+    Action, BlockOutState, Cast, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply,
+    Request, Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -1177,5 +1177,28 @@ mod tests {
         assert!(matches!(events[0], Event::CastStartedOrChanged { .. }));
         assert!(matches!(events[1], Event::CastRecordingStarted { .. }));
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn diff_cast_events_detects_workspace_target_changes() {
+        let existing = make_cast(12, niri_ipc::CastTarget::Workspace { id: 3 }, false, false);
+        let mut previous = HashMap::new();
+        previous.insert(existing.stream_id, existing);
+
+        let events = diff_cast_events(
+            &previous,
+            vec![make_cast(
+                12,
+                niri_ipc::CastTarget::Workspace { id: 4 },
+                false,
+                false,
+            )],
+        );
+
+        assert_eq!(events.len(), 1);
+        let Event::CastStartedOrChanged { cast } = &events[0] else {
+            panic!("expected cast change event");
+        };
+        assert_eq!(cast.target, niri_ipc::CastTarget::Workspace { id: 4 });
     }
 }

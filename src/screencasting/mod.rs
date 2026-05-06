@@ -17,6 +17,7 @@ use smithay::utils::{Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
+use crate::layout::workspace::WorkspaceId;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -40,6 +41,9 @@ pub struct Screencasting {
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     pub dynamic_cast_id_for_portal: MappedId,
 
+    /// Synthetic "window" IDs for workspace entries in the xdp-gnome picker.
+    pub workspace_cast_ids_for_portal: HashMap<WorkspaceId, MappedId>,
+
     // Drop PipeWire last, and specifically after casts, to prevent a double-free (yay).
     pub pipewire: Option<PipeWire>,
 }
@@ -50,6 +54,12 @@ pub struct PendingCast {
     pub stream_id: CastStreamId,
     pub cursor_mode: CursorMode,
     pub signal_ctx: SignalEmitter<'static>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalCastTarget {
+    DynamicTarget,
+    Workspace(WorkspaceId),
 }
 
 impl Screencasting {
@@ -71,8 +81,21 @@ impl Screencasting {
             pw_to_niri,
             mapped_cast_output: HashMap::new(),
             dynamic_cast_id_for_portal: MappedId::next(),
+            workspace_cast_ids_for_portal: HashMap::new(),
             pipewire: None,
         }
+    }
+
+    pub fn portal_cast_target(&self, id: u64) -> Option<PortalCastTarget> {
+        if self.dynamic_cast_id_for_portal.get() == id {
+            return Some(PortalCastTarget::DynamicTarget);
+        }
+
+        self.workspace_cast_ids_for_portal
+            .iter()
+            .find_map(|(workspace_id, portal_id)| {
+                (portal_id.get() == id).then_some(PortalCastTarget::Workspace(*workspace_id))
+            })
     }
 }
 
@@ -159,6 +182,18 @@ impl State {
             CastTarget::Output { output, .. } => {
                 if let Some(output) = output.upgrade() {
                     self.niri.queue_redraw(&output);
+                }
+                return;
+            }
+            CastTarget::Workspace { output, .. } => {
+                if let Some(output) = output.as_ref().and_then(|output| output.upgrade()) {
+                    self.niri.queue_redraw(&output);
+                } else {
+                    self.backend.with_primary_renderer(|renderer| {
+                        if cast.dequeue_buffer_and_clear(renderer) {
+                            cast.last_frame_time = get_monotonic_time();
+                        }
+                    });
                 }
                 return;
             }
@@ -270,6 +305,11 @@ impl State {
                     refresh = Some(output.current_mode().unwrap().refresh as u32);
                 }
             }
+            CastTarget::Workspace { id, .. } => {
+                if let Some((_, _, workspace_refresh)) = self.niri.cast_params_for_workspace(*id) {
+                    refresh = Some(workspace_refresh);
+                }
+            }
             CastTarget::Window { id } => {
                 let mut windows = self.niri.layout.windows();
                 if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
@@ -326,6 +366,12 @@ impl State {
                     return;
                 };
                 cast_params_for_output(&output)
+            }
+            CastTarget::Workspace { id, .. } => {
+                let Some((_, size, refresh)) = self.niri.cast_params_for_workspace(*id) else {
+                    return;
+                };
+                (size, refresh)
             }
             CastTarget::Window { id } => {
                 let Some((size, refresh)) = self.niri.cast_params_for_window(*id) else {
@@ -411,25 +457,45 @@ impl State {
                         let (size, refresh) = cast_params_for_output(output);
                         (CastTarget::output(output), size, refresh, false)
                     }
-                    StreamTargetId::Window { id }
-                        if id == self.niri.casting.dynamic_cast_id_for_portal.get() =>
-                    {
-                        debug!("delaying dynamic cast until target is set");
-                        self.niri.casting.pending_dynamic_casts.push(PendingCast {
-                            session_id,
-                            stream_id,
-                            cursor_mode,
-                            signal_ctx,
-                        });
-                        return;
-                    }
                     StreamTargetId::Window { id } => {
-                        let Some((size, refresh)) = self.niri.cast_params_for_window(id) else {
-                            warn!("error starting screencast: requested window is missing");
-                            self.niri.stop_cast(session_id);
-                            return;
-                        };
-                        (CastTarget::Window { id }, size, refresh, true)
+                        match self.niri.casting.portal_cast_target(id) {
+                            Some(PortalCastTarget::DynamicTarget) => {
+                                debug!("delaying dynamic cast until target is set");
+                                self.niri.casting.pending_dynamic_casts.push(PendingCast {
+                                    session_id,
+                                    stream_id,
+                                    cursor_mode,
+                                    signal_ctx,
+                                });
+                                return;
+                            }
+                            Some(PortalCastTarget::Workspace(workspace_id)) => {
+                                let Some((output, size, refresh)) =
+                                    self.niri.cast_params_for_workspace(workspace_id)
+                                else {
+                                    warn!(
+                                        "error starting screencast: requested workspace is missing"
+                                    );
+                                    self.niri.stop_cast(session_id);
+                                    return;
+                                };
+                                (
+                                    CastTarget::workspace(workspace_id, Some(&output)),
+                                    size,
+                                    refresh,
+                                    false,
+                                )
+                            }
+                            None => {
+                                let Some((size, refresh)) = self.niri.cast_params_for_window(id)
+                                else {
+                                    warn!("error starting screencast: requested window is missing");
+                                    self.niri.stop_cast(session_id);
+                                    return;
+                                };
+                                (CastTarget::Window { id }, size, refresh, true)
+                            }
+                        }
                     }
                 };
 
@@ -535,6 +601,79 @@ impl Niri {
         }
     }
 
+    pub fn refresh_portal_cast_sources(&mut self) {
+        let mut seen = HashSet::new();
+
+        for (_, _, workspace) in self.layout.workspaces() {
+            if workspace.current_output().is_none() {
+                continue;
+            }
+
+            let id = workspace.id();
+            seen.insert(id);
+            self.casting
+                .workspace_cast_ids_for_portal
+                .entry(id)
+                .or_insert_with(MappedId::next);
+        }
+
+        self.casting
+            .workspace_cast_ids_for_portal
+            .retain(|workspace_id, _| seen.contains(workspace_id));
+    }
+
+    pub fn portal_workspace_cast_id(&self, workspace_id: WorkspaceId) -> Option<MappedId> {
+        self.casting
+            .workspace_cast_ids_for_portal
+            .get(&workspace_id)
+            .copied()
+    }
+
+    pub fn refresh_workspace_cast_targets(&mut self) {
+        self.refresh_portal_cast_sources();
+
+        let mut casts = mem::take(&mut self.casting.casts);
+        let mut to_stop = HashSet::new();
+        let mut clear_dynamic = false;
+
+        for cast in &mut casts {
+            let CastTarget::Workspace { id, output } = &mut cast.target else {
+                continue;
+            };
+
+            let Some((current_output, _, refresh)) = self.cast_params_for_workspace(*id) else {
+                if cast.dynamic_target {
+                    clear_dynamic = true;
+                } else {
+                    to_stop.insert(cast.session_id);
+                }
+                continue;
+            };
+
+            *output = Some(current_output.downgrade());
+
+            if let Err(err) = cast.set_refresh(refresh) {
+                warn!("error changing cast FPS: {err:?}");
+                if cast.dynamic_target {
+                    clear_dynamic = true;
+                } else {
+                    to_stop.insert(cast.session_id);
+                }
+            }
+        }
+
+        self.casting.casts = casts;
+
+        for session_id in to_stop {
+            self.stop_cast(session_id);
+        }
+
+        if clear_dynamic {
+            self.event_loop
+                .insert_idle(|state| state.set_dynamic_cast_target(CastTarget::Nothing));
+        }
+    }
+
     pub fn render_for_screen_cast(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -558,6 +697,77 @@ impl Niri {
         let mut casts = mem::take(&mut self.casting.casts);
         for cast in &mut casts {
             if !cast.is_active() {
+                continue;
+            }
+
+            let workspace_id = match &cast.target {
+                CastTarget::Workspace { id, .. } => Some(*id),
+                _ => None,
+            };
+            if let Some(workspace_id) = workspace_id {
+                if !cast.target.matches_output(&weak) {
+                    continue;
+                }
+
+                match cast.ensure_size(size) {
+                    Ok(CastSizeChange::Ready) => (),
+                    Ok(CastSizeChange::Pending) => continue,
+                    Err(err) => {
+                        warn!("error updating stream size, stopping screencast: {err:?}");
+                        casts_to_stop.push(cast.session_id);
+                        continue;
+                    }
+                }
+
+                if cast.check_time_and_schedule(output, target_presentation_time) {
+                    continue;
+                }
+
+                let Some((_, workspace)) = self.layout.find_workspace_by_id(workspace_id) else {
+                    continue;
+                };
+
+                let mut elements = Vec::new();
+                let mut pointer_pos = Point::default();
+                if self.pointer_visibility.is_visible() {
+                    let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+                    let pointer_loc = self
+                        .tablet_cursor_location
+                        .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+                    let pointer_workspace_matches = self
+                        .output_under(pointer_loc)
+                        .and_then(|(pointer_output, pos_within_output)| {
+                            self.layout
+                                .workspace_under(false, pointer_output, pos_within_output)
+                        })
+                        .is_some_and(|pointer_workspace| pointer_workspace.id() == workspace.id());
+
+                    if pointer_workspace_matches && output_geo.contains(pointer_loc) {
+                        pointer_pos = pointer_loc - output_geo.loc;
+                        self.render_pointer(renderer, output, &mut |elem| {
+                            elements.push(elem.into())
+                        });
+                    }
+                }
+
+                let main_start = elements.len();
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::Screencast,
+                    block_out_enabled: self.block_out_enabled,
+                    xray: None,
+                };
+                self.render_workspace_for_screen_cast(ctx, output, workspace, &mut |elem| {
+                    let elem = self.zoomed_element(elem, output);
+                    elements.push(elem.into())
+                });
+
+                let cursor_data = CursorData::compute(&elements, main_start, pointer_pos, scale);
+
+                if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, size, scale) {
+                    cast.last_frame_time = target_presentation_time;
+                }
+
                 continue;
             }
 
@@ -793,6 +1003,16 @@ impl Niri {
             .to_physical_precise_up(scale);
         let refresh = output.current_mode().unwrap().refresh as u32;
         Some((bbox.size, refresh))
+    }
+
+    fn cast_params_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Option<(Output, Size<i32, Physical>, u32)> {
+        let (_, workspace) = self.layout.find_workspace_by_id(workspace_id)?;
+        let output = workspace.current_output()?.clone();
+        let (size, refresh) = cast_params_for_output(&output);
+        Some((output, size, refresh))
     }
 }
 

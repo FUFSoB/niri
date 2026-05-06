@@ -84,6 +84,14 @@ If the cast target disappears (e.g. the target window closes), the stream goes b
 
 All dynamic casts share the same target, but new ones start out empty until the next time you change it (to avoid surprises and sharing something sensitive by mistake).
 
+<sup>Since: own-patches</sup>
+The screencast window dialog also lists individual workspaces, with a short summary of the windows
+on each one.
+
+Additional bind is available:
+
+- `set-dynamic-cast-workspace` to cast the focused workspace.
+
 ### Indicate screencasted windows
 
 <sup>Since: 25.02</sup>

@@ -2322,6 +2322,18 @@ impl State {
                     self.set_dynamic_cast_target(CastTarget::output(output));
                 }
             }
+            Action::SetDynamicCastWorkspace(reference) => {
+                let target = if let Some(reference) = reference {
+                    self.niri.layout.find_workspace_by_ref(reference)
+                } else {
+                    self.niri.layout.active_workspace_mut()
+                }
+                .map(|workspace| CastTarget::workspace(workspace.id(), workspace.current_output()));
+
+                if let Some(target) = target {
+                    self.set_dynamic_cast_target(target);
+                }
+            }
             Action::ClearDynamicCastTarget => {
                 self.set_dynamic_cast_target(CastTarget::Nothing);
             }

@@ -1926,6 +1926,55 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    pub fn render_workspace_at_origin<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        workspace: &Workspace<W>,
+        focus_ring: bool,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let scale = self.scale.fractional_scale();
+        let crop_bounds = Rectangle::new(
+            Point::from((-i32::MAX / 2, -i32::MAX / 2)),
+            Size::from((i32::MAX, i32::MAX)),
+        );
+
+        let wrap = |elem| {
+            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), 1.);
+            RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative)
+        };
+
+        let xray_pos = XrayPos::default();
+        if !self.sticky.is_empty() {
+            let view_rect = Rectangle::from_size(self.view_size);
+            let sticky_focus_ring = focus_ring && self.active_space == ActiveSpace::Sticky;
+            {
+                let mut push_sticky = |elem| {
+                    let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                    if let Some(elem) = elem {
+                        push(wrap(MonitorInnerRenderElement::Floating(elem)));
+                    }
+                };
+                self.sticky.render(
+                    ctx.r(),
+                    xray_pos,
+                    view_rect,
+                    sticky_focus_ring,
+                    &mut push_sticky,
+                );
+            }
+        }
+
+        let mut push_workspace = |elem| {
+            let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+            if let Some(elem) = elem {
+                push(wrap(MonitorInnerRenderElement::Workspace(elem)));
+            }
+        };
+        workspace.render_floating(ctx.r(), xray_pos, focus_ring, &mut push_workspace);
+        workspace.render_scrolling(ctx.r(), xray_pos, focus_ring, &mut push_workspace);
+    }
+
     pub fn render_workspace_shadows<R: NiriRenderer>(
         &self,
         renderer: &mut R,

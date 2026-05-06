@@ -881,6 +881,9 @@ fn print_cast(cast: &Cast) {
         CastTarget::Output { name } => {
             println!("  Target: output \"{name}\"");
         }
+        CastTarget::Workspace { id } => {
+            println!("  Target: workspace {id}");
+        }
         CastTarget::Window { id } => {
             println!("  Target: window {id}");
         }
