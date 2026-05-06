@@ -522,6 +522,14 @@ fn validate_action(action: &Action) -> Result<(), String> {
         }
     }
 
+    if let Action::SetDynamicCastWorkspace { id, idx, name } = action {
+        let set_count =
+            usize::from(id.is_some()) + usize::from(idx.is_some()) + usize::from(name.is_some());
+        if set_count > 1 {
+            return Err("only one of --id, --idx or --name may be provided".to_string());
+        }
+    }
+
     Ok(())
 }
 
@@ -1200,5 +1208,27 @@ mod tests {
             panic!("expected cast change event");
         };
         assert_eq!(cast.target, niri_ipc::CastTarget::Workspace { id: 4 });
+    }
+
+    #[test]
+    fn validate_action_rejects_ambiguous_dynamic_workspace_target() {
+        let action = Action::SetDynamicCastWorkspace {
+            id: Some(1),
+            idx: Some(2),
+            name: None,
+        };
+
+        assert!(validate_action(&action).is_err());
+    }
+
+    #[test]
+    fn validate_action_accepts_single_dynamic_workspace_selector() {
+        let action = Action::SetDynamicCastWorkspace {
+            id: None,
+            idx: None,
+            name: Some(String::from("work")),
+        };
+
+        assert!(validate_action(&action).is_ok());
     }
 }

@@ -714,8 +714,12 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SetDynamicCastMonitor { output } => {
                 Self::SetDynamicCastMonitor(output)
             }
-            niri_ipc::Action::SetDynamicCastWorkspace { reference } => {
-                Self::SetDynamicCastWorkspace(reference.map(WorkspaceReference::from))
+            niri_ipc::Action::SetDynamicCastWorkspace { id, idx, name } => {
+                let reference = id
+                    .map(WorkspaceReference::Id)
+                    .or_else(|| idx.map(WorkspaceReference::Index))
+                    .or_else(|| name.map(WorkspaceReference::Name));
+                Self::SetDynamicCastWorkspace(reference)
             }
             niri_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             niri_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
@@ -1132,13 +1136,37 @@ mod tests {
     fn from_ipc_action_maps_dynamic_workspace_cast() {
         assert_eq!(
             Action::from(niri_ipc::Action::SetDynamicCastWorkspace {
-                reference: Some(WorkspaceReferenceArg::Id(42)),
+                id: Some(42),
+                idx: None,
+                name: None,
             }),
             Action::SetDynamicCastWorkspace(Some(WorkspaceReference::Id(42))),
         );
 
         assert_eq!(
-            Action::from(niri_ipc::Action::SetDynamicCastWorkspace { reference: None }),
+            Action::from(niri_ipc::Action::SetDynamicCastWorkspace {
+                id: None,
+                idx: Some(7),
+                name: None,
+            }),
+            Action::SetDynamicCastWorkspace(Some(WorkspaceReference::Index(7))),
+        );
+
+        assert_eq!(
+            Action::from(niri_ipc::Action::SetDynamicCastWorkspace {
+                id: None,
+                idx: None,
+                name: Some("ws".to_string()),
+            }),
+            Action::SetDynamicCastWorkspace(Some(WorkspaceReference::Name("ws".to_string()))),
+        );
+
+        assert_eq!(
+            Action::from(niri_ipc::Action::SetDynamicCastWorkspace {
+                id: None,
+                idx: None,
+                name: None,
+            }),
             Action::SetDynamicCastWorkspace(None),
         );
     }

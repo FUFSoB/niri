@@ -932,11 +932,23 @@ pub enum Action {
         clap(about = "Set the dynamic cast target to the focused workspace")
     )]
     SetDynamicCastWorkspace {
-        /// Reference (id, index or name) of the workspace to target.
+        /// Id of the workspace to target.
         ///
         /// If `None`, uses the focused workspace.
-        #[cfg_attr(feature = "clap", arg())]
-        reference: Option<WorkspaceReferenceArg>,
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        id: Option<u64>,
+
+        /// Index of the workspace to target.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        idx: Option<u8>,
+
+        /// Name of the workspace to target.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        name: Option<String>,
     },
     /// Clear the dynamic cast target, making it show nothing.
     ClearDynamicCastTarget {},

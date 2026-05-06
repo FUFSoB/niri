@@ -92,6 +92,19 @@ Additional bind is available:
 
 - `set-dynamic-cast-workspace` to cast the focused workspace.
 
+From CLI, you can also explicitly choose a workspace target:
+
+```sh
+# by workspace id
+niri msg action set-dynamic-cast-workspace --id 42
+
+# by workspace index
+niri msg action set-dynamic-cast-workspace --idx 2
+
+# by workspace name
+niri msg action set-dynamic-cast-workspace --name coding
+```
+
 ### Indicate screencasted windows
 
 <sup>Since: 25.02</sup>
