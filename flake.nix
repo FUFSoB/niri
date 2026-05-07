@@ -87,9 +87,13 @@
           '';
 
           cargoLock = {
-            # NOTE: This is only used for Git dependencies
-            allowBuiltinFetchGit = true;
             lockFile = ./Cargo.lock;
+            # Both crates come from the same pinned Smithay repo revision, so
+            # they share the same fetchgit fixed-output hash.
+            outputHashes = {
+              "smithay-0.7.0" = "sha256-TV/GTfSvgfVwIFUGoASU7xm38opIBLjLMf1HeNTW07U=";
+              "smithay-drm-extras-0.1.0" = "sha256-TV/GTfSvgfVwIFUGoASU7xm38opIBLjLMf1HeNTW07U=";
+            };
           };
 
           strictDeps = true;
