@@ -473,6 +473,8 @@ fn action_name(action: &Action) -> String {
         Action::MoveWindowToWorkspaceUp(_) => String::from("Move Window to Workspace Up"),
         Action::SwitchPresetColumnWidth => String::from("Switch Preset Column Widths"),
         Action::MaximizeColumn => String::from("Maximize Column"),
+        Action::MoveView(_) => String::from("Move View"),
+        Action::ToggleWorkspaceViewFocusMode => String::from("Toggle Workspace View Focus Mode"),
         Action::ConsumeOrExpelWindowLeft => String::from("Consume or Expel Window Left"),
         Action::ConsumeOrExpelWindowRight => String::from("Consume or Expel Window Right"),
         Action::ToggleWindowFloating => String::from("Move Window Between Floating and Tiling"),

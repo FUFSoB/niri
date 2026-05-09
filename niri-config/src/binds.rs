@@ -322,6 +322,8 @@ pub enum Action {
     #[knuffel(skip)]
     MaximizeWindowToEdgesById(u64),
     SetColumnWidth(#[knuffel(argument, str)] SizeChange),
+    MoveView(#[knuffel(argument, str)] PositionChange),
+    ToggleWorkspaceViewFocusMode,
     ExpandColumnToAvailableWidth,
     SwitchLayout(#[knuffel(argument, str)] LayoutSwitchTarget),
     ShowHotkeyOverlay,
@@ -638,6 +640,8 @@ impl From<niri_ipc::Action> for Action {
                 Self::MaximizeWindowToEdgesById(id)
             }
             niri_ipc::Action::SetColumnWidth { change } => Self::SetColumnWidth(change),
+            niri_ipc::Action::MoveView { change } => Self::MoveView(change),
+            niri_ipc::Action::ToggleWorkspaceViewFocusMode {} => Self::ToggleWorkspaceViewFocusMode,
             niri_ipc::Action::ExpandColumnToAvailableWidth {} => Self::ExpandColumnToAvailableWidth,
             niri_ipc::Action::SwitchLayout { layout } => Self::SwitchLayout(layout),
             niri_ipc::Action::ShowHotkeyOverlay {} => Self::ShowHotkeyOverlay,

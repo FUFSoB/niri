@@ -114,7 +114,7 @@ impl MoveGrab {
             }
             GestureState::Move => layout.interactive_move_end(&self.window),
             GestureState::ViewOffset => {
-                layout.view_offset_gesture_end(Some(false));
+                layout.pointer_view_offset_gesture_end();
             }
         }
 
@@ -173,7 +173,7 @@ impl MoveGrab {
             return false;
         };
 
-        layout.view_offset_gesture_begin(&self.start_output, Some(ws_idx), false);
+        layout.pointer_view_offset_gesture_begin(&self.start_output, Some(ws_idx));
 
         self.gesture = GestureState::ViewOffset;
 
@@ -258,11 +258,10 @@ impl MoveGrab {
                 }
             }
             GestureState::ViewOffset => {
-                let res = data.niri.layout.view_offset_gesture_update(
-                    -relative_delta.x,
-                    timestamp,
-                    false,
-                );
+                let res = data
+                    .niri
+                    .layout
+                    .pointer_view_offset_gesture_update(-relative_delta.x, timestamp);
                 if let Some(output) = res {
                     if let Some(output) = output {
                         data.niri.queue_redraw(&output);

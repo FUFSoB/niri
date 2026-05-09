@@ -775,6 +775,7 @@ impl State {
             if ipc_ws.idx != u8::try_from(ws_idx + 1).unwrap_or(u8::MAX)
                 || ipc_ws.name.as_ref() != ws.name()
                 || ipc_ws.output.as_ref() != output_name
+                || ipc_ws.view_focus_mode != ws.view_focus_mode()
             {
                 need_workspaces_changed = true;
                 break;
@@ -829,6 +830,7 @@ impl State {
                         is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
                         is_focused: Some(id) == focused_ws_id,
                         active_window_id: ws.active_window().map(|win| win.id().get()),
+                        view_focus_mode: ws.view_focus_mode(),
                     }
                 })
                 .collect();

@@ -38,6 +38,10 @@
           name = "block-out-enhancements";
           pr = null;
         }
+        {
+          name = "free-windows-pane";
+          pr = null;
+        }
       ];
       niri-package =
         {

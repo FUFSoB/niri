@@ -4259,6 +4259,20 @@ impl<W: LayoutElement> Layout<W> {
         workspace.move_floating_window(id, x, y, animate);
     }
 
+    pub fn move_view(&mut self, change: PositionChange) {
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        workspace.move_view(change);
+    }
+
+    pub fn toggle_workspace_view_focus_mode(&mut self) {
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        workspace.toggle_view_focus_mode();
+    }
+
     pub fn focus_output(&mut self, output: &Output) {
         if let MonitorSet::Normal {
             monitors,
@@ -4722,6 +4736,30 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    pub fn pointer_view_offset_gesture_begin(
+        &mut self,
+        output: &Output,
+        workspace_idx: Option<usize>,
+    ) {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => unreachable!(),
+        };
+
+        for monitor in monitors {
+            for (idx, ws) in monitor.workspaces.iter_mut().enumerate() {
+                if &monitor.output != output
+                    || idx != workspace_idx.unwrap_or(monitor.active_workspace_idx)
+                {
+                    ws.view_offset_gesture_end(None);
+                    continue;
+                }
+
+                ws.pointer_view_offset_gesture_begin();
+            }
+        }
+    }
+
     pub fn view_offset_gesture_update(
         &mut self,
         delta_x: f64,
@@ -4762,6 +4800,51 @@ impl<W: LayoutElement> Layout<W> {
         for monitor in monitors {
             for ws in &mut monitor.workspaces {
                 if ws.view_offset_gesture_end(is_touchpad) {
+                    return Some(monitor.output.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn pointer_view_offset_gesture_update(
+        &mut self,
+        delta_x: f64,
+        timestamp: Duration,
+    ) -> Option<Option<Output>> {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return None,
+        };
+
+        for monitor in monitors {
+            let zoom = monitor.overview_zoom();
+            let delta_x = delta_x / zoom;
+
+            for ws in &mut monitor.workspaces {
+                if let Some(refresh) = ws.pointer_view_offset_gesture_update(delta_x, timestamp) {
+                    if refresh {
+                        return Some(Some(monitor.output.clone()));
+                    } else {
+                        return Some(None);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn pointer_view_offset_gesture_end(&mut self) -> Option<Output> {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return None,
+        };
+
+        for monitor in monitors {
+            for ws in &mut monitor.workspaces {
+                if ws.pointer_view_offset_gesture_end() {
                     return Some(monitor.output.clone());
                 }
             }

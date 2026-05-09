@@ -771,6 +771,14 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
         change: SizeChange,
     },
+    /// Move the tiling view horizontally.
+    MoveView {
+        /// How to change the view position.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        change: PositionChange,
+    },
+    /// Toggle how manual view behaves when focus changes on the current workspace.
+    ToggleWorkspaceViewFocusMode {},
     /// Expand the focused column to space not taken up by other fully visible columns.
     ExpandColumnToAvailableWidth {},
     /// Switch between keyboard layouts.
@@ -1517,6 +1525,18 @@ pub struct Workspace {
     pub is_focused: bool,
     /// Id of the active window on this workspace, if any.
     pub active_window_id: Option<u64>,
+    /// How manual horizontal view behaves when focus changes on this workspace.
+    pub view_focus_mode: WorkspaceViewFocusMode,
+}
+
+/// How manual horizontal view behaves when focus changes on a workspace.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum WorkspaceViewFocusMode {
+    /// Use the original niri behavior and reveal the newly focused target when needed.
+    Window,
+    /// Preserve the custom manual view unless the target is fully out of view.
+    Custom,
 }
 
 /// Configured keyboard layouts.

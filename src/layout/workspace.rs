@@ -6,7 +6,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{
     CenterFocusedColumn, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
 };
-use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
+use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout, WorkspaceViewFocusMode};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
@@ -348,6 +348,10 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn name(&self) -> Option<&String> {
         self.name.as_ref()
+    }
+
+    pub fn view_focus_mode(&self) -> WorkspaceViewFocusMode {
+        self.scrolling.view_focus_mode()
     }
 
     pub fn unname(&mut self) {
@@ -1617,6 +1621,14 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn move_view(&mut self, change: PositionChange) {
+        self.scrolling.move_view(change);
+    }
+
+    pub fn toggle_view_focus_mode(&mut self) {
+        self.scrolling.toggle_view_focus_mode();
+    }
+
     pub fn has_windows(&self) -> bool {
         self.windows().next().is_some()
     }
@@ -1926,6 +1938,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.view_offset_gesture_begin(is_touchpad);
     }
 
+    pub fn pointer_view_offset_gesture_begin(&mut self) {
+        self.scrolling.pointer_view_offset_gesture_begin();
+    }
+
     pub fn view_offset_gesture_update(
         &mut self,
         delta_x: f64,
@@ -1936,8 +1952,21 @@ impl<W: LayoutElement> Workspace<W> {
             .view_offset_gesture_update(delta_x, timestamp, is_touchpad)
     }
 
+    pub fn pointer_view_offset_gesture_update(
+        &mut self,
+        delta_x: f64,
+        timestamp: Duration,
+    ) -> Option<bool> {
+        self.scrolling
+            .pointer_view_offset_gesture_update(delta_x, timestamp)
+    }
+
     pub fn view_offset_gesture_end(&mut self, is_touchpad: Option<bool>) -> bool {
         self.scrolling.view_offset_gesture_end(is_touchpad)
+    }
+
+    pub fn pointer_view_offset_gesture_end(&mut self) -> bool {
+        self.scrolling.pointer_view_offset_gesture_end()
     }
 
     pub fn dnd_scroll_gesture_begin(&mut self) {

@@ -2016,6 +2016,14 @@ impl State {
                     self.niri.layout.set_column_width(change);
                 }
             }
+            Action::MoveView(change) => {
+                self.niri.layout.move_view(change);
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleWorkspaceViewFocusMode => {
+                self.niri.layout.toggle_workspace_view_focus_mode();
+                self.niri.queue_redraw_all();
+            }
             Action::SetWindowWidth(change) => {
                 if self.niri.screenshot_ui.is_open() {
                     self.niri.screenshot_ui.set_width(change);
@@ -3028,7 +3036,7 @@ impl State {
                     };
                     self.niri
                         .layout
-                        .view_offset_gesture_begin(&output, Some(ws_idx), false);
+                        .pointer_view_offset_gesture_begin(&output, Some(ws_idx));
                     let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
                     pointer.set_grab(self, grab, serial, Focus::Clear);
                     self.niri

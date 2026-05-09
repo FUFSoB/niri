@@ -615,6 +615,8 @@ enum Op {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
     },
+    MoveView(#[proptest(strategy = "arbitrary_position_change()")] PositionChange),
+    ToggleWorkspaceViewFocusMode,
     ExpandColumnToAvailableWidth,
     ToggleWindowFloating {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
@@ -666,15 +668,27 @@ enum Op {
         workspace_idx: Option<usize>,
         is_touchpad: bool,
     },
+    PointerViewOffsetGestureBegin {
+        #[proptest(strategy = "1..=5usize")]
+        output_idx: usize,
+        #[proptest(strategy = "proptest::option::of(0..=4usize)")]
+        workspace_idx: Option<usize>,
+    },
     ViewOffsetGestureUpdate {
         #[proptest(strategy = "arbitrary_view_offset_gesture_delta()")]
         delta: f64,
         timestamp: Duration,
         is_touchpad: bool,
     },
+    PointerViewOffsetGestureUpdate {
+        #[proptest(strategy = "arbitrary_view_offset_gesture_delta()")]
+        delta: f64,
+        timestamp: Duration,
+    },
     ViewOffsetGestureEnd {
         is_touchpad: Option<bool>,
     },
+    PointerViewOffsetGestureEnd,
     WorkspaceSwitchGestureBegin {
         #[proptest(strategy = "1..=5usize")]
         output_idx: usize,
@@ -1352,6 +1366,8 @@ impl Op {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.reset_window_height(id.as_ref());
             }
+            Op::MoveView(change) => layout.move_view(change),
+            Op::ToggleWorkspaceViewFocusMode => layout.toggle_workspace_view_focus_mode(),
             Op::ExpandColumnToAvailableWidth => layout.expand_column_to_available_width(),
             Op::ToggleWindowFloating { id } => {
                 let id = id.filter(|id| layout.has_window(id));
@@ -1527,6 +1543,17 @@ impl Op {
 
                 layout.view_offset_gesture_begin(&output, workspace_idx, normalize);
             }
+            Op::PointerViewOffsetGestureBegin {
+                output_idx: id,
+                workspace_idx,
+            } => {
+                let name = format!("output{id}");
+                let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
+                    return;
+                };
+
+                layout.pointer_view_offset_gesture_begin(&output, workspace_idx);
+            }
             Op::ViewOffsetGestureUpdate {
                 delta,
                 timestamp,
@@ -1534,8 +1561,14 @@ impl Op {
             } => {
                 layout.view_offset_gesture_update(delta, timestamp, is_touchpad);
             }
+            Op::PointerViewOffsetGestureUpdate { delta, timestamp } => {
+                layout.pointer_view_offset_gesture_update(delta, timestamp);
+            }
             Op::ViewOffsetGestureEnd { is_touchpad } => {
                 layout.view_offset_gesture_end(is_touchpad);
+            }
+            Op::PointerViewOffsetGestureEnd => {
+                layout.pointer_view_offset_gesture_end();
             }
             Op::WorkspaceSwitchGestureBegin {
                 output_idx: id,
@@ -3821,6 +3854,352 @@ fn workspace_render_geo_at_fractional_scale() {
         geo.loc.y, 0.,
         "active workspace must be at y = 0 exactly, \
          otherwise a pointer against the screen edge at y = 0 won't hit it"
+    );
+}
+
+#[test]
+fn move_view_changes_view_without_changing_focus() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+        Op::ToggleWorkspaceViewFocusMode,
+    ];
+
+    let mut layout = check_ops(ops);
+    let focused_before = *layout
+        .active_workspace()
+        .unwrap()
+        .active_window()
+        .unwrap()
+        .id();
+    let view_pos_before = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MoveView(PositionChange::AdjustFixed(40.)),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    assert_eq!(
+        *layout
+            .active_workspace()
+            .unwrap()
+            .active_window()
+            .unwrap()
+            .id(),
+        focused_before
+    );
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        view_pos_before + 40.
+    );
+}
+
+#[test]
+fn pointer_view_offset_gesture_persists_arbitrary_view() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+        Op::ToggleWorkspaceViewFocusMode,
+    ];
+
+    let mut layout = check_ops(ops);
+    let view_pos_before = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::PointerViewOffsetGestureBegin {
+                output_idx: 1,
+                workspace_idx: None,
+            },
+            Op::PointerViewOffsetGestureUpdate {
+                delta: 300.,
+                timestamp: Duration::from_millis(16),
+            },
+            Op::PointerViewOffsetGestureEnd,
+        ],
+    );
+
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        view_pos_before + 300.
+    );
+}
+
+#[test]
+fn workspace_view_focus_mode_defaults_to_window() {
+    let ops = [Op::AddOutput(1)];
+    let layout = check_ops(ops);
+
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Window
+    );
+}
+
+#[test]
+fn move_view_is_noop_in_window_mode() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    let view_pos_before = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MoveView(PositionChange::AdjustFixed(186.)),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        view_pos_before
+    );
+}
+
+#[test]
+fn focus_partially_visible_column_preserves_manual_view_in_custom_mode() {
+    let mut ops = vec![Op::AddOutput(1)];
+    for id in 1..=12 {
+        ops.push(Op::AddWindow {
+            params: TestWindowParams::new(id),
+        });
+    }
+    ops.push(Op::FocusColumnFirst);
+    ops.push(Op::ToggleWorkspaceViewFocusMode);
+
+    let mut layout = check_ops(ops);
+
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Custom
+    );
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MoveView(PositionChange::AdjustFixed(186.)),
+            Op::CompleteAnimations,
+        ],
+    );
+    let manual_view_pos = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(&mut layout, [Op::FocusColumnRight]);
+
+    assert_eq!(
+        *layout
+            .active_workspace()
+            .unwrap()
+            .active_window()
+            .unwrap()
+            .id(),
+        2
+    );
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        manual_view_pos
+    );
+}
+
+#[test]
+fn workspace_view_focus_mode_is_per_workspace() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindowToNamedWorkspace {
+            params: TestWindowParams::new(2),
+            ws_name: 2,
+        },
+        Op::FocusWorkspaceDown,
+    ];
+    let mut layout = check_ops(ops);
+
+    check_ops_on_layout(&mut layout, [Op::ToggleWorkspaceViewFocusMode]);
+
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Custom
+    );
+
+    check_ops_on_layout(&mut layout, [Op::FocusWorkspaceUp]);
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Window
+    );
+
+    check_ops_on_layout(&mut layout, [Op::FocusWorkspaceDown]);
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Custom
+    );
+}
+
+#[test]
+fn custom_mode_allows_moving_outside_window_bounds() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleWorkspaceViewFocusMode,
+    ];
+
+    let mut layout = check_ops(ops);
+    let view_pos_before = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MoveView(PositionChange::AdjustFixed(200.)),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        view_pos_before + 200.
+    );
+}
+
+#[test]
+fn pointer_view_offset_gesture_snaps_in_window_mode() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    let view_pos_before = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::PointerViewOffsetGestureBegin {
+                output_idx: 1,
+                workspace_idx: None,
+            },
+            Op::PointerViewOffsetGestureUpdate {
+                delta: 300.,
+                timestamp: Duration::from_millis(16),
+            },
+            Op::PointerViewOffsetGestureEnd,
+            Op::CompleteAnimations,
+        ],
+    );
+
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        view_pos_before
+    );
+}
+
+#[test]
+fn switching_back_to_window_mode_clears_manual_view() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+        Op::ToggleWorkspaceViewFocusMode,
+    ];
+
+    let mut layout = check_ops(ops);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::MoveView(PositionChange::AdjustFixed(200.)),
+            Op::CompleteAnimations,
+        ],
+    );
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        200.
+    );
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::ToggleWorkspaceViewFocusMode, Op::CompleteAnimations],
+    );
+
+    assert_eq!(
+        layout.active_workspace().unwrap().view_focus_mode(),
+        niri_ipc::WorkspaceViewFocusMode::Window
+    );
+    assert_eq!(
+        layout.active_workspace().unwrap().scrolling().view_pos(),
+        0.
+    );
+}
+
+#[test]
+fn focus_out_of_view_column_clears_manual_view() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((2000, 200))),
+                ..TestWindowParams::new(1)
+            },
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::FocusColumnLeft,
+        Op::MoveView(PositionChange::AdjustFixed(300.)),
+        Op::CompleteAnimations,
+    ];
+
+    let mut layout = check_ops(ops);
+    let manual_view_pos = layout.active_workspace().unwrap().scrolling().view_pos();
+
+    check_ops_on_layout(&mut layout, [Op::FocusColumnRight, Op::CompleteAnimations]);
+
+    let view_pos_after = layout.active_workspace().unwrap().scrolling().view_pos();
+    assert_eq!(
+        *layout
+            .active_workspace()
+            .unwrap()
+            .active_window()
+            .unwrap()
+            .id(),
+        2
+    );
+    assert!(
+        view_pos_after > manual_view_pos,
+        "view should move to reveal an out-of-view focused column"
     );
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
-use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
+use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout, WorkspaceViewFocusMode};
 use ordered_float::NotNan;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
@@ -51,6 +51,13 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// with this view offset (rather than added as a constant elsewhere in the code). This allows
     /// for natural handling of fullscreen windows, which must ignore work area padding.
     view_offset: ViewOffset,
+
+    /// Whether the stored view offset is relative to the active column or an absolute view
+    /// position chosen by the user.
+    view_offset_mode: ViewOffsetMode,
+
+    /// How manual view behaves when focus changes.
+    view_focus_mode: WorkspaceViewFocusMode,
 
     /// Whether to activate the previous, rather than the next, column upon column removal.
     ///
@@ -119,6 +126,20 @@ pub(super) enum ViewOffset {
     Gesture(ViewGesture),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewOffsetMode {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewOffsetGestureSource {
+    Touchpad,
+    Touch,
+    Pointer,
+    Dnd,
+}
+
 #[derive(Debug)]
 pub(super) struct ViewGesture {
     current_view_offset: f64,
@@ -130,12 +151,10 @@ pub(super) struct ViewGesture {
     delta_from_tracker: f64,
     // The view offset we'll use if needed for activate_prev_column_on_removal.
     stationary_view_offset: f64,
-    /// Whether the gesture is controlled by the touchpad.
-    is_touchpad: bool,
-
     // If this gesture is for drag-and-drop scrolling, this is the last event's unadjusted
     // timestamp.
     dnd_last_event_time: Option<Duration>,
+    source: ViewOffsetGestureSource,
     // Time when the drag-and-drop scroll delta became non-zero, used for debouncing.
     //
     // If `None` then the scroll delta is currently zero.
@@ -298,6 +317,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             active_column_idx: 0,
             interactive_resize: None,
             view_offset: ViewOffset::Static(0.),
+            view_offset_mode: ViewOffsetMode::Auto,
+            view_focus_mode: WorkspaceViewFocusMode::Window,
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
             closing_windows: Vec::new(),
@@ -317,6 +338,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         scale: f64,
         options: Rc<Options>,
     ) {
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let working_area = compute_working_area(parent_area, scale, options.layout.struts);
 
         for (column, data) in zip(&mut self.columns, &mut self.data) {
@@ -332,6 +354,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // Apply always-center and such right away.
         if !self.columns.is_empty() && !self.view_offset.is_gesture() {
+            if manual_view_pos.is_some() {
+                self.restore_manual_view_pos_if_needed(manual_view_pos);
+                return;
+            }
+
             self.animate_view_offset_to_column(None, self.active_column_idx, None);
         }
     }
@@ -781,6 +808,24 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        if self.is_manual_view_active() && !self.columns.is_empty() {
+            let view_pos = self.target_view_pos();
+            if self.focus_preserves_manual_view(idx, view_pos) {
+                if self.active_column_idx != idx {
+                    self.active_column_idx = idx;
+
+                    // A different column was activated; reset the flag.
+                    self.activate_prev_column_on_removal = None;
+                    self.view_offset_to_restore = None;
+                    self.interactive_resize = None;
+                }
+
+                return;
+            }
+
+            self.convert_manual_view_to_auto();
+        }
+
         self.animate_view_offset_to_column_with_config(
             None,
             idx,
@@ -1009,12 +1054,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // view_offset was left over and skip the animation.
             if was_empty {
                 self.view_offset = ViewOffset::Static(0.);
+                self.view_offset_mode = ViewOffsetMode::Auto;
                 self.view_offset =
                     ViewOffset::Static(self.compute_new_view_offset_for_column(None, idx, None));
             }
 
-            let prev_offset = (!was_empty && idx == self.active_column_idx + 1)
-                .then(|| self.view_offset.stationary());
+            let prev_offset =
+                (!self.is_manual_view_active() && !was_empty && idx == self.active_column_idx + 1)
+                    .then(|| self.view_offset.stationary());
 
             let anim_config =
                 anim_config.unwrap_or(self.options.animations.horizontal_view_movement.0);
@@ -1166,6 +1213,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column_idx: usize,
         anim_config: Option<niri_config::Animation>,
     ) -> Column<W> {
+        let manual_view_pos = self.manual_view_pos_to_restore();
         // Animate movement of the other columns.
         let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
         let offset = self.column_x(column_idx + 1) - self.column_x(column_idx);
@@ -1204,6 +1252,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         if self.columns.is_empty() {
+            self.view_offset_mode = ViewOffsetMode::Auto;
             return column;
         }
 
@@ -1244,10 +1293,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             );
         }
 
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
         column
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let (col_idx, column) = self
             .columns
             .iter_mut()
@@ -1348,7 +1399,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
                 // If this is an interactive resize commit of an active window, then we need to
                 // either preserve the view offset or adjust it accordingly.
-                let centered = self.is_centering_focused_column();
+                let centered = self.is_centering_focused_column() && !self.is_manual_view_active();
 
                 let width = self.data[col_idx].width;
                 let offset = if centered {
@@ -1362,13 +1413,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     0.
                 };
 
-                self.view_offset.offset(offset);
+                if !self.is_manual_view_active() {
+                    self.view_offset.offset(offset);
+                }
             }
 
             // When the active column goes fullscreen, store the view offset to restore later.
             let is_normal = self.columns[col_idx].sizing_mode().is_normal();
             if was_normal && !is_normal {
-                self.view_offset_to_restore = Some(self.view_offset.stationary());
+                self.view_offset_to_restore = if self.is_manual_view_active() {
+                    None
+                } else {
+                    Some(self.view_offset.stationary())
+                };
             }
 
             // Upon unfullscreening, restore the view offset.
@@ -1388,7 +1445,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
             // We might need to move the view to ensure the resized window is still visible. But
             // only do it when the view isn't frozen by an interactive resize or a view gesture.
-            if self.interactive_resize.is_none() && !self.view_offset.is_gesture() {
+            if self.interactive_resize.is_none()
+                && !self.view_offset.is_gesture()
+                && !self.is_manual_view_active()
+            {
                 // Synchronize the horizontal view movement with the resize so that it looks nice.
                 // This is especially important for always-centered view.
                 let config = if ongoing_resize_anim {
@@ -1407,6 +1467,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
             }
         }
+
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
     }
 
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
@@ -1684,6 +1746,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let current_col_x = self.column_x(self.active_column_idx);
         let next_col_x = self.column_x(self.active_column_idx + 1);
 
@@ -1695,7 +1758,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // Preserve the camera position when moving to the left.
         let view_offset_delta = -self.column_x(self.active_column_idx) + current_col_x;
-        self.view_offset.offset(view_offset_delta);
+        if !self.is_manual_view_active() {
+            self.view_offset.offset(view_offset_delta);
+        }
 
         // The column we just moved is offset by the difference between its new and old position.
         let new_col_x = self.column_x(new_idx);
@@ -1714,6 +1779,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         self.activate_column_with_anim_config(new_idx, self.options.animations.window_movement.0);
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
     }
 
     pub fn move_left(&mut self) -> bool {
@@ -1818,8 +1884,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 // However, if it was already going to be activated, leave the offset as is. This
                 // improves the workflow that has become common with tabbed columns: open a new
                 // window, then immediately consume it left as a new tab.
-                self.activate_prev_column_on_removal
-                    .get_or_insert(self.view_offset.stationary() + offset.x);
+                if !self.is_manual_view_active() {
+                    self.activate_prev_column_on_removal
+                        .get_or_insert(self.view_offset.stationary() + offset.x);
+                }
             }
 
             offset.x += self.columns[source_col_idx].render_offset().x;
@@ -2178,6 +2246,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let col = &mut self.columns[self.active_column_idx];
         if col.display_mode == display {
             return;
@@ -2196,6 +2265,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.set_fullscreen(&window, false);
             self.set_maximized(&window, false);
         }
+
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
     }
 
     pub fn center_column(&mut self) {
@@ -2203,6 +2274,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        self.convert_manual_view_to_auto();
         self.animate_view_offset_to_column_centered(
             None,
             self.active_column_idx,
@@ -2240,6 +2312,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        self.convert_manual_view_to_auto();
         if self.is_centering_focused_column() {
             return;
         }
@@ -2293,12 +2366,187 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.animate_view_offset_to_column(None, self.active_column_idx, None);
     }
 
+    fn is_manual_view_active(&self) -> bool {
+        self.view_offset_mode == ViewOffsetMode::Manual
+    }
+
+    pub fn view_focus_mode(&self) -> WorkspaceViewFocusMode {
+        self.view_focus_mode
+    }
+
+    pub fn toggle_view_focus_mode(&mut self) {
+        self.view_focus_mode = match self.view_focus_mode {
+            WorkspaceViewFocusMode::Window => WorkspaceViewFocusMode::Custom,
+            WorkspaceViewFocusMode::Custom => {
+                self.view_offset.cancel_gesture();
+                self.convert_manual_view_to_auto();
+                if !self.columns.is_empty() {
+                    self.animate_view_offset_to_column(
+                        None,
+                        self.active_column_idx,
+                        Some(self.active_column_idx),
+                    );
+                }
+                WorkspaceViewFocusMode::Window
+            }
+        };
+    }
+
+    fn convert_manual_view_to_auto(&mut self) {
+        if !self.is_manual_view_active() || self.columns.is_empty() {
+            self.view_offset_mode = ViewOffsetMode::Auto;
+            return;
+        }
+
+        let view_pos = self.view_pos();
+        let relative = view_pos - self.column_x(self.active_column_idx);
+        self.view_offset = ViewOffset::Static(relative);
+        self.view_offset_mode = ViewOffsetMode::Auto;
+    }
+
+    fn auto_view_pos_for_column(&self, idx: usize, prev_idx: Option<usize>) -> f64 {
+        self.column_x(idx) + self.compute_new_view_offset_for_column(None, idx, prev_idx)
+    }
+
+    fn manual_view_pos_span_for_column(&self, idx: usize) -> (f64, f64) {
+        let col = &self.columns[idx];
+        let col_x = self.column_x(idx);
+        let col_width = col.width();
+        let mode = col.sizing_mode();
+
+        let area = if mode.is_maximized() {
+            self.parent_area
+        } else {
+            self.working_area
+        };
+
+        if mode.is_fullscreen() || area.size.w <= col_width {
+            return (col_x, col_x + col_width);
+        }
+
+        let left_strut = area.loc.x;
+        let right_strut = self.view_size.w - area.size.w - area.loc.x;
+        let padding = if mode.is_maximized() {
+            0.
+        } else {
+            ((area.size.w - col_width) / 2.).clamp(0., self.options.layout.gaps)
+        };
+
+        (
+            col_x - padding - left_strut,
+            col_x + col_width + padding + right_strut,
+        )
+    }
+
+    fn manual_view_pos_bounds(&self) -> (f64, f64) {
+        if self.columns.is_empty() {
+            return (0., 0.);
+        }
+
+        let last_col_idx = self.columns.len() - 1;
+        let first = self.manual_view_pos_span_for_column(0).0;
+        let last = self.manual_view_pos_span_for_column(last_col_idx).1 - self.view_size.w;
+        let (min_view_pos, max_view_pos) = if first <= last {
+            (first, last)
+        } else {
+            (last, first)
+        };
+
+        match self.view_focus_mode {
+            WorkspaceViewFocusMode::Window => {
+                let content_width = self.column_x(last_col_idx) + self.data[last_col_idx].width;
+                if content_width <= self.view_size.w {
+                    let auto = self.auto_view_pos_for_column(self.active_column_idx, None);
+                    return (auto, auto);
+                }
+
+                (min_view_pos, max_view_pos)
+            }
+            WorkspaceViewFocusMode::Custom => {
+                let extra = self.working_area.size.w;
+                (min_view_pos - extra, max_view_pos + extra)
+            }
+        }
+    }
+
+    fn clamp_manual_view_pos(&self, view_pos: f64) -> f64 {
+        let (min_view_pos, max_view_pos) = self.manual_view_pos_bounds();
+        view_pos.clamp(min_view_pos, max_view_pos)
+    }
+
+    fn set_manual_view_pos(&mut self, view_pos: f64) {
+        let view_pos = self.clamp_manual_view_pos(view_pos);
+        self.view_offset = ViewOffset::Static(view_pos);
+        self.view_offset_mode = ViewOffsetMode::Manual;
+    }
+
+    fn animate_manual_view_pos(&mut self, view_pos: f64, config: niri_config::Animation) {
+        let view_pos = self.clamp_manual_view_pos(view_pos);
+        let pixel = 1. / self.scale;
+        let current = self.view_pos();
+        self.view_offset_mode = ViewOffsetMode::Manual;
+
+        if (view_pos - self.target_view_pos()).abs() < pixel {
+            self.view_offset = ViewOffset::Static(view_pos);
+            return;
+        }
+
+        self.view_offset = ViewOffset::Animation(Animation::new(
+            self.clock.clone(),
+            current,
+            view_pos,
+            0.,
+            config,
+        ));
+    }
+
+    fn restore_manual_view_pos_if_needed(&mut self, view_pos: Option<f64>) {
+        if let Some(view_pos) = view_pos {
+            self.set_manual_view_pos(view_pos);
+        }
+    }
+
+    fn manual_view_pos_to_restore(&self) -> Option<f64> {
+        (self.is_manual_view_active() && !self.view_offset.is_gesture())
+            .then(|| self.target_view_pos())
+    }
+
+    fn column_intersects_view(&self, idx: usize, view_pos: f64) -> bool {
+        let col_x = self.column_x(idx);
+        let col_width = self.columns[idx].width();
+        let view_right = view_pos + self.view_size.w;
+
+        col_x < view_right && view_pos < col_x + col_width
+    }
+
+    fn focus_preserves_manual_view(&self, idx: usize, view_pos: f64) -> bool {
+        match self.view_focus_mode {
+            WorkspaceViewFocusMode::Custom => self.column_intersects_view(idx, view_pos),
+            WorkspaceViewFocusMode::Window => {
+                let target_view_pos =
+                    self.auto_view_pos_for_column(idx, Some(self.active_column_idx));
+                let pixel = 1. / self.scale;
+                (target_view_pos - view_pos).abs() < pixel
+            }
+        }
+    }
+
     pub fn view_pos(&self) -> f64 {
-        self.column_x(self.active_column_idx) + self.view_offset.current()
+        match self.view_offset_mode {
+            ViewOffsetMode::Auto => {
+                self.column_x(self.active_column_idx) + self.view_offset.current()
+            }
+            ViewOffsetMode::Manual => self.view_offset.current(),
+        }
     }
 
     pub fn target_view_pos(&self) -> f64 {
-        self.column_x(self.active_column_idx) + self.view_offset.target()
+        match self.view_offset_mode {
+            ViewOffsetMode::Auto => {
+                self.column_x(self.active_column_idx) + self.view_offset.target()
+            }
+            ViewOffsetMode::Manual => self.view_offset.target(),
+        }
     }
 
     // HACK: pass a self.data iterator in manually as a workaround for the lack of method partial
@@ -2548,8 +2796,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
         let col = self.columns.get(self.active_column_idx)?;
 
-        let final_view_offset = self.view_offset.target();
-        let view_off = Point::from((-final_view_offset, 0.));
+        let final_view_pos = self.target_view_pos();
+        let view_off = Point::from((-final_view_pos, 0.));
 
         let (tile, tile_off) = col.tiles().nth(col.active_tile_idx).unwrap();
 
@@ -2559,6 +2807,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let view = Rectangle::from_size(self.view_size);
         view.intersection(window_rect)
+    }
+
+    pub fn move_view(&mut self, change: PositionChange) {
+        if self.view_focus_mode == WorkspaceViewFocusMode::Window {
+            return;
+        }
+
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let available_width = self.working_area.size.w.max(1.);
+        let mut view_pos = self.target_view_pos();
+
+        match change {
+            PositionChange::SetFixed(x) => view_pos = x,
+            PositionChange::SetProportion(prop) => {
+                view_pos = available_width * (prop / 100.).clamp(0., 10000.);
+            }
+            PositionChange::AdjustFixed(x) => view_pos += x,
+            PositionChange::AdjustProportion(prop) => view_pos += available_width * prop / 100.,
+        }
+
+        self.animate_manual_view_pos(view_pos, self.options.animations.horizontal_view_movement.0);
     }
 
     pub fn popup_target_rect(&self, id: &W::Id) -> Option<Rectangle<f64, Logical>> {
@@ -2731,6 +3003,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let col = &mut self.columns[self.active_column_idx];
         if !col.pending_sizing_mode().is_normal() || col.is_full_width {
             return;
@@ -2807,6 +3080,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // about to set its width to 100% of the working area. Let's do it via
             // toggle_full_width() as it lets you back out of it more intuitively.
             col.toggle_full_width();
+            self.restore_manual_view_pos_if_needed(manual_view_pos);
             return;
         }
 
@@ -2817,13 +3091,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.update_tile_sizes(true);
 
         // Put the leftmost window into the view.
-        let new_view_x = leftmost_col_x.unwrap() - gap - working_x;
-        self.animate_view_offset(self.active_column_idx, new_view_x - active_col_x.unwrap());
-        // Just in case.
-        self.animate_view_offset_to_column(None, self.active_column_idx, None);
+        if manual_view_pos.is_some() {
+            self.restore_manual_view_pos_if_needed(manual_view_pos);
+        } else {
+            let new_view_x = leftmost_col_x.unwrap() - gap - working_x;
+            self.animate_view_offset(self.active_column_idx, new_view_x - active_col_x.unwrap());
+            // Just in case.
+            self.animate_view_offset_to_column(None, self.active_column_idx, None);
+        }
     }
 
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) -> bool {
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let mut col_idx = self
             .columns
             .iter()
@@ -2850,11 +3129,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
 
         true
     }
 
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) -> bool {
+        let manual_view_pos = self.manual_view_pos_to_restore();
         let mut col_idx = self
             .columns
             .iter()
@@ -2881,6 +3162,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+        self.restore_manual_view_pos_if_needed(manual_view_pos);
 
         true
     }
@@ -3020,17 +3302,52 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        self.convert_manual_view_to_auto();
+
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
             animation: None,
             tracker: SwipeTracker::new(),
             delta_from_tracker: self.view_offset.current(),
             stationary_view_offset: self.view_offset.stationary(),
-            is_touchpad,
+            source: if is_touchpad {
+                ViewOffsetGestureSource::Touchpad
+            } else {
+                ViewOffsetGestureSource::Touch
+            },
             dnd_last_event_time: None,
             dnd_nonzero_start_time: None,
         };
         self.view_offset = ViewOffset::Gesture(gesture);
+    }
+
+    pub fn pointer_view_offset_gesture_begin(&mut self) {
+        if self.view_focus_mode == WorkspaceViewFocusMode::Window {
+            self.view_offset_gesture_begin(false);
+            return;
+        }
+
+        if self.columns.is_empty() {
+            return;
+        }
+
+        if self.interactive_resize.is_some() {
+            return;
+        }
+
+        let view_pos = self.view_pos();
+        let gesture = ViewGesture {
+            current_view_offset: view_pos,
+            animation: None,
+            tracker: SwipeTracker::new(),
+            delta_from_tracker: view_pos,
+            stationary_view_offset: self.target_view_pos(),
+            source: ViewOffsetGestureSource::Pointer,
+            dnd_last_event_time: None,
+            dnd_nonzero_start_time: None,
+        };
+        self.view_offset = ViewOffset::Gesture(gesture);
+        self.view_offset_mode = ViewOffsetMode::Manual;
     }
 
     pub fn dnd_scroll_gesture_begin(&mut self) {
@@ -3043,13 +3360,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        self.convert_manual_view_to_auto();
+
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
             animation: None,
             tracker: SwipeTracker::new(),
             delta_from_tracker: self.view_offset.current(),
             stationary_view_offset: self.view_offset.stationary(),
-            is_touchpad: false,
+            source: ViewOffsetGestureSource::Dnd,
             dnd_last_event_time: Some(self.clock.now_unadjusted()),
             dnd_nonzero_start_time: None,
         };
@@ -3068,13 +3387,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return None;
         };
 
-        if gesture.is_touchpad != is_touchpad || gesture.dnd_last_event_time.is_some() {
+        let source = if is_touchpad {
+            ViewOffsetGestureSource::Touchpad
+        } else {
+            ViewOffsetGestureSource::Touch
+        };
+
+        if gesture.source != source || gesture.dnd_last_event_time.is_some() {
             return None;
         }
 
         gesture.tracker.push(delta_x, timestamp);
 
-        let norm_factor = if gesture.is_touchpad {
+        let norm_factor = if source == ViewOffsetGestureSource::Touchpad {
             self.working_area.size.w / VIEW_GESTURE_WORKING_AREA_MOVEMENT
         } else {
             1.
@@ -3082,6 +3407,33 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let pos = gesture.tracker.pos() * norm_factor;
         let view_offset = pos + gesture.delta_from_tracker;
         gesture.current_view_offset = view_offset;
+
+        Some(true)
+    }
+
+    pub fn pointer_view_offset_gesture_update(
+        &mut self,
+        delta_x: f64,
+        timestamp: Duration,
+    ) -> Option<bool> {
+        if self.view_focus_mode == WorkspaceViewFocusMode::Window {
+            return self.view_offset_gesture_update(delta_x, timestamp, false);
+        }
+
+        let (min_view_pos, max_view_pos) = self.manual_view_pos_bounds();
+        let ViewOffset::Gesture(gesture) = &mut self.view_offset else {
+            return None;
+        };
+
+        if gesture.source != ViewOffsetGestureSource::Pointer
+            || gesture.dnd_last_event_time.is_some()
+        {
+            return None;
+        }
+
+        gesture.tracker.push(delta_x, timestamp);
+        let view_pos = gesture.tracker.pos() + gesture.delta_from_tracker;
+        gesture.current_view_offset = view_pos.clamp(min_view_pos, max_view_pos);
 
         Some(true)
     }
@@ -3161,13 +3513,39 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn view_offset_gesture_end(&mut self, is_touchpad: Option<bool>) -> bool {
+        let source = match &self.view_offset {
+            ViewOffset::Gesture(gesture) => gesture.source,
+            _ => return false,
+        };
+
+        match source {
+            ViewOffsetGestureSource::Touchpad => {
+                if is_touchpad.is_some_and(|x| !x) {
+                    return false;
+                }
+            }
+            ViewOffsetGestureSource::Touch => {
+                if is_touchpad.is_some_and(|x| x) {
+                    return false;
+                }
+            }
+            ViewOffsetGestureSource::Pointer => {
+                if is_touchpad.is_some() {
+                    return false;
+                }
+
+                return self.pointer_view_offset_gesture_end();
+            }
+            ViewOffsetGestureSource::Dnd => {
+                if is_touchpad.is_some() {
+                    return false;
+                }
+            }
+        }
+
         let ViewOffset::Gesture(gesture) = &mut self.view_offset else {
             return false;
         };
-
-        if is_touchpad.is_some_and(|x| gesture.is_touchpad != x) {
-            return false;
-        }
 
         // We do not handle cancelling, just like GNOME Shell doesn't. For this gesture, proper
         // cancelling would require keeping track of the original active column, and then updating
@@ -3178,7 +3556,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let now = self.clock.now_unadjusted();
         gesture.tracker.push(0., now);
 
-        let norm_factor = if gesture.is_touchpad {
+        let norm_factor = if gesture.source == ViewOffsetGestureSource::Touchpad {
             self.working_area.size.w / VIEW_GESTURE_WORKING_AREA_MOVEMENT
         } else {
             1.
@@ -3485,6 +3863,32 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // HACK: deal with things like snapping to the right edge of a larger-than-view window.
         self.animate_view_offset_to_column(None, new_col_idx, None);
 
+        true
+    }
+
+    pub fn pointer_view_offset_gesture_end(&mut self) -> bool {
+        if self.view_focus_mode == WorkspaceViewFocusMode::Window {
+            return self.view_offset_gesture_end(Some(false));
+        }
+
+        let (min_view_pos, max_view_pos) = self.manual_view_pos_bounds();
+        let ViewOffset::Gesture(gesture) = &mut self.view_offset else {
+            return false;
+        };
+
+        if gesture.source != ViewOffsetGestureSource::Pointer
+            || gesture.dnd_last_event_time.is_some()
+        {
+            return false;
+        }
+
+        let now = self.clock.now_unadjusted();
+        gesture.tracker.push(0., now);
+
+        let view_pos =
+            (gesture.tracker.pos() + gesture.delta_from_tracker).clamp(min_view_pos, max_view_pos);
+        self.view_offset = ViewOffset::Static(view_pos);
+        self.view_offset_mode = ViewOffsetMode::Manual;
         true
     }
 

@@ -9,7 +9,7 @@ use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, BlockOutFrom, BlockOutState, Cast, CastKind, CastTarget, Event, KeyboardLayouts,
     LogicalOutput, Mode, Output, OutputConfigChanged, Overview, Request, Response, Transform,
-    Window, WindowLayout, Zoom,
+    Window, WindowLayout, WorkspaceViewFocusMode, Zoom,
 };
 use serde_json::json;
 
@@ -387,7 +387,11 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 } else {
                     String::new()
                 };
-                println!("{is_active}{idx}{name}");
+                let view_focus_mode = match ws.view_focus_mode {
+                    WorkspaceViewFocusMode::Window => "window",
+                    WorkspaceViewFocusMode::Custom => "custom",
+                };
+                println!("{is_active}{idx}{name} [view focus: {view_focus_mode}]");
             }
         }
         Msg::KeyboardLayouts => {
