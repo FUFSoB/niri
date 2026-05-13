@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use smithay::backend::input::ButtonState;
-use smithay::desktop::Window;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
     GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
@@ -14,18 +13,19 @@ use smithay::input::touch::{
 };
 use smithay::input::SeatHandler;
 use smithay::output::Output;
-use smithay::utils::{IsAlive, Logical, Point, Serial, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 
 use crate::input::PointerOrTouchStartData;
 use crate::niri::State;
 use crate::utils::get_monotonic_time;
+use crate::window::mapped::MappedId;
 
 pub struct MoveGrab {
     start_data: PointerOrTouchStartData<State>,
     start_output: Output,
     start_pos_within_output: Point<f64, Logical>,
     last_location: Point<f64, Logical>,
-    window: Window,
+    window: MappedId,
     gesture: GestureState,
     enable_view_offset: bool,
     move_icon: CursorIcon,
@@ -47,7 +47,7 @@ impl MoveGrab {
     pub fn new(
         state: &mut State,
         start_data: PointerOrTouchStartData<State>,
-        window: Window,
+        window: MappedId,
         enable_view_offset: bool,
         move_icon: Option<CursorIcon>,
     ) -> Option<Self> {
@@ -88,7 +88,7 @@ impl MoveGrab {
                 if layout.is_overview_open() {
                     let res = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
                         ws.windows()
-                            .any(|w| w.window == self.window)
+                            .any(|w| w.id() == self.window)
                             .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
                     });
                     let res = res.or_else(|| {
@@ -130,7 +130,7 @@ impl MoveGrab {
 
     fn begin_move(&mut self, data: &mut State) -> bool {
         if !data.niri.layout.interactive_move_begin(
-            self.window.clone(),
+            self.window,
             &self.start_output,
             self.start_pos_within_output,
         ) {
@@ -158,7 +158,7 @@ impl MoveGrab {
         let Some(ws_idx) = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
             let ws_idx = ws
                 .windows()
-                .any(|w| w.window == self.window)
+                .any(|w| w.id() == self.window)
                 .then_some(ws_idx)?;
             let output = mon?.output();
 
@@ -198,7 +198,7 @@ impl MoveGrab {
         // Try to recognize the gesture.
         if self.gesture == GestureState::Recognizing {
             // Check if the window has closed.
-            if !self.window.alive() {
+            if !data.niri.layout.has_window(&self.window) {
                 return false;
             }
 
@@ -211,7 +211,7 @@ impl MoveGrab {
                     .workspaces()
                     .find_map(|(_, _, ws)| {
                         ws.windows()
-                            .any(|w| w.window == self.window)
+                            .any(|w| w.id() == self.window)
                             .then(|| ws.is_floating(&self.window))
                     })
                     .unwrap_or_else(|| data.niri.layout.is_sticky_window(&self.window));

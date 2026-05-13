@@ -198,6 +198,50 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
+#[derive(Clone)]
+struct PrimaryScanoutElementId {
+    id: Id,
+    namespace: Option<usize>,
+}
+
+impl PrimaryScanoutElementId {
+    fn was_presented(&self, render_element_states: &RenderElementStates) -> bool {
+        let id = self
+            .namespace
+            .map(|namespace| self.id.clone().namespaced(namespace))
+            .unwrap_or_else(|| self.id.clone());
+        render_element_states.element_was_presented(id)
+    }
+}
+
+fn primary_scanout_element_id_for_mapped(
+    mapped: &Mapped,
+    surface: &WlSurface,
+) -> PrimaryScanoutElementId {
+    let surface_id = Id::from_wayland_resource(surface);
+    let namespace = mapped.element_namespace();
+    let mut id = surface_id.clone();
+    let mut id_namespace = namespace;
+
+    if let Some(data) = mapped.offscreen_data().as_ref() {
+        // If this surface was presented through the mapped entry's offscreen, use the offscreen
+        // element id. Otherwise keep the original surface element id so separately rendered
+        // surfaces, such as popups during animations, still participate in scanout tracking.
+        let presented_id = namespace
+            .map(|namespace| surface_id.namespaced(namespace))
+            .unwrap_or_else(|| surface_id.clone());
+        if data.states.element_was_presented(presented_id) {
+            id = data.id.clone();
+            id_namespace = None;
+        }
+    }
+
+    PrimaryScanoutElementId {
+        id,
+        namespace: id_namespace,
+    }
+}
+
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
 
@@ -524,9 +568,16 @@ pub struct PopupGrabState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardFocus {
     // Layout is focused by default if there's nothing else to focus.
-    Layout { surface: Option<WlSurface> },
-    LayerShell { surface: WlSurface },
-    LockScreen { surface: Option<WlSurface> },
+    Layout {
+        surface: Option<WlSurface>,
+        id: Option<MappedId>,
+    },
+    LayerShell {
+        surface: WlSurface,
+    },
+    LockScreen {
+        surface: Option<WlSurface>,
+    },
     ScreenshotUi,
     ExitConfirmDialog,
     Overview,
@@ -542,8 +593,8 @@ pub struct PointContents {
     // Can be `None` even when `window` is set, for example when the pointer is over the niri
     // border around the window.
     pub surface: Option<(WlSurface, Point<f64, Logical>)>,
-    // If surface belongs to a window, this is that window.
-    pub window: Option<(Window, HitType)>,
+    // If surface belongs to a window, this is that layout entry.
+    pub window: Option<(MappedId, HitType)>,
     // If surface belongs to a layer surface, this is that layer surface.
     pub layer: Option<LayerSurface>,
     // Pointer is over a hot corner.
@@ -713,7 +764,7 @@ impl Default for SurfaceFrameThrottlingState {
 impl KeyboardFocus {
     pub fn surface(&self) -> Option<&WlSurface> {
         match self {
-            KeyboardFocus::Layout { surface } => surface.as_ref(),
+            KeyboardFocus::Layout { surface, .. } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface.as_ref(),
             KeyboardFocus::ScreenshotUi => None,
@@ -725,13 +776,25 @@ impl KeyboardFocus {
 
     pub fn into_surface(self) -> Option<WlSurface> {
         match self {
-            KeyboardFocus::Layout { surface } => surface,
+            KeyboardFocus::Layout { surface, .. } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface,
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
+        }
+    }
+
+    pub fn layout_id(&self) -> Option<MappedId> {
+        match self {
+            KeyboardFocus::Layout { id, .. } => *id,
+            KeyboardFocus::LayerShell { .. }
+            | KeyboardFocus::LockScreen { .. }
+            | KeyboardFocus::ScreenshotUi
+            | KeyboardFocus::ExitConfirmDialog
+            | KeyboardFocus::Overview
+            | KeyboardFocus::Mru => None,
         }
     }
 
@@ -1026,9 +1089,19 @@ impl State {
     /// Focus a specific window, taking care of a potential active output change and cursor
     /// warp.
     pub fn focus_window(&mut self, window: &Window) {
+        let Some(id) = self.niri.find_mapped_id_by_window(window) else {
+            return;
+        };
+
+        self.focus_mapped(id);
+    }
+
+    /// Focus a specific layout entry, taking care of a potential active output change and cursor
+    /// warp.
+    pub fn focus_mapped(&mut self, id: MappedId) {
         let active_output = self.niri.layout.active_output().cloned();
 
-        self.niri.layout.activate_window(window);
+        self.niri.layout.activate_window(&id);
 
         let new_active = self.niri.layout.active_output().cloned();
         if new_active != active_output {
@@ -1044,8 +1117,8 @@ impl State {
     }
 
     pub fn confirm_mru(&mut self) {
-        if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
-            self.focus_window(&window);
+        if let Some(id) = self.niri.close_mru(MruCloseRequest::Confirm) {
+            self.focus_mapped(id);
         }
     }
 
@@ -1216,13 +1289,10 @@ impl State {
             };
 
             let layout_focus = || {
-                self.niri
-                    .layout
-                    .focus()
-                    .map(|win| win.toplevel().wl_surface().clone())
-                    .map(|surface| KeyboardFocus::Layout {
-                        surface: Some(surface),
-                    })
+                self.niri.layout.focus().map(|win| KeyboardFocus::Layout {
+                    surface: Some(win.toplevel().wl_surface().clone()),
+                    id: Some(win.id()),
+                })
             };
 
             let excl_focus_on_layer = |layer| {
@@ -1294,9 +1364,15 @@ impl State {
                 surface = surface.or_else(|| excl_focus_on_layer(Layer::Background));
             }
 
-            surface.unwrap_or(KeyboardFocus::Layout { surface: None })
+            surface.unwrap_or(KeyboardFocus::Layout {
+                surface: None,
+                id: None,
+            })
         } else {
-            KeyboardFocus::Layout { surface: None }
+            KeyboardFocus::Layout {
+                surface: None,
+                id: None,
+            }
         };
 
         let keyboard = self.niri.seat.get_keyboard().unwrap();
@@ -1308,19 +1384,24 @@ impl State {
             );
 
             // Tell the windows their new focus state for window rule purposes.
-            if let KeyboardFocus::Layout {
-                surface: Some(surface),
-            } = &self.niri.keyboard_focus
-            {
-                if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
-                    mapped.set_is_focused(false);
-                }
+            if let Some(id) = self.niri.keyboard_focus.layout_id() {
+                self.niri.layout.with_windows_mut(|mapped, _| {
+                    if mapped.id() == id {
+                        mapped.set_is_focused(false);
+                    }
+                });
             }
-            if let KeyboardFocus::Layout {
-                surface: Some(surface),
-            } = &focus
-            {
-                if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+            if let Some(id) = focus.layout_id() {
+                let stamp = get_monotonic_time();
+                let debounce = self.niri.config.borrow().recent_windows.debounce_ms;
+                let debounce = Duration::from_millis(u64::from(debounce));
+                let mut pending_mru_commit = None;
+
+                self.niri.layout.with_windows_mut(|mapped, _| {
+                    if mapped.id() != id {
+                        return;
+                    }
+
                     mapped.set_is_focused(true);
 
                     // If `mapped` does not have a focus timestamp, then the window is newly
@@ -1328,33 +1409,32 @@ impl State {
                     //
                     // If `mapped` already has a timestamp only update it after the focus lock-in
                     // period has gone by without the focus having elsewhere.
-                    let stamp = get_monotonic_time();
-
-                    let debounce = self.niri.config.borrow().recent_windows.debounce_ms;
-                    let debounce = Duration::from_millis(u64::from(debounce));
-
                     if mapped.get_focus_timestamp().is_none() || debounce.is_zero() {
                         mapped.set_focus_timestamp(stamp);
                     } else {
-                        let timer = Timer::from_duration(debounce);
+                        pending_mru_commit = Some(mapped.id());
+                    }
+                });
 
-                        let focus_token = self
-                            .niri
-                            .event_loop
-                            .insert_source(timer, move |_, _, state| {
-                                state.niri.mru_apply_keyboard_commit();
-                                TimeoutAction::Drop
-                            })
-                            .unwrap();
-                        if let Some(PendingMruCommit { token, .. }) =
-                            self.niri.pending_mru_commit.replace(PendingMruCommit {
-                                id: mapped.id(),
-                                token: focus_token,
-                                stamp,
-                            })
-                        {
-                            self.niri.event_loop.remove(token);
-                        }
+                if let Some(id) = pending_mru_commit {
+                    let timer = Timer::from_duration(debounce);
+
+                    let focus_token = self
+                        .niri
+                        .event_loop
+                        .insert_source(timer, move |_, _, state| {
+                            state.niri.mru_apply_keyboard_commit();
+                            TimeoutAction::Drop
+                        })
+                        .unwrap();
+                    if let Some(PendingMruCommit { token, .. }) =
+                        self.niri.pending_mru_commit.replace(PendingMruCommit {
+                            id,
+                            token: focus_token,
+                            stamp,
+                        })
+                    {
+                        self.niri.event_loop.remove(token);
                     }
                 }
             }
@@ -2149,7 +2229,7 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
+    pub fn store_unmap_snapshot(&mut self, window: &MappedId, output: Option<&Output>) {
         // The unmapping tile may have an xray background, in which case we will render xray
         // elements, so they need to be updated.
         self.niri.update_xray_render_elements(output);
@@ -2727,7 +2807,10 @@ impl Niri {
             single_pixel_buffer_state,
 
             seat,
-            keyboard_focus: KeyboardFocus::Layout { surface: None },
+            keyboard_focus: KeyboardFocus::Layout {
+                surface: None,
+                id: None,
+            },
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
@@ -3714,18 +3797,22 @@ impl Niri {
             let window = &mapped.window;
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let win_pos_within_output = win_pos;
+                let source_buf_pos = if mapped.is_mirror() {
+                    let (_, scale) = mapped.mirror_content_transform();
+                    (pos_within_output - win_pos_within_output).downscale(scale)
+                } else {
+                    pos_within_output - win_pos_within_output
+                };
                 window
-                    .surface_under(
-                        pos_within_output - win_pos_within_output,
-                        WindowSurfaceType::ALL,
-                    )
-                    .map(|(s, pos_within_window)| {
-                        (s, pos_within_window.to_f64() + win_pos_within_output)
+                    .surface_under(source_buf_pos, WindowSurfaceType::ALL)
+                    .map(|(s, surface_loc)| {
+                        let source_surface_local = source_buf_pos - surface_loc.to_f64();
+                        (s, pos_within_output - source_surface_local)
                     })
             } else {
                 None
             };
-            (surface_and_pos, (Some((window.clone(), hit)), None))
+            (surface_and_pos, (Some((mapped.id(), hit)), None))
         };
 
         let interactive_moved_window_under = || {
@@ -3945,6 +4032,52 @@ impl Niri {
             .map(|(_, m)| m.window.clone())
     }
 
+    pub fn find_mapped_id_by_window(&self, window: &Window) -> Option<MappedId> {
+        self.layout
+            .windows()
+            .find(|(_, m)| !m.is_mirror() && &m.window == window)
+            .map(|(_, m)| m.id())
+    }
+
+    pub fn mapped_ids_for_source(&self, source_id: MappedId) -> Vec<MappedId> {
+        self.layout
+            .windows()
+            .filter(|(_, m)| m.source_id() == source_id)
+            .map(|(_, m)| m.id())
+            .collect()
+    }
+
+    pub fn mapped_instances_for_source(
+        &self,
+        source_id: MappedId,
+    ) -> Vec<(MappedId, Option<Output>)> {
+        self.layout
+            .windows()
+            .filter(|(_, m)| m.source_id() == source_id)
+            .map(|(monitor, mapped)| (mapped.id(), monitor.map(|monitor| monitor.output().clone())))
+            .collect()
+    }
+
+    pub fn outputs_for_source(&self, source_id: MappedId) -> Vec<Output> {
+        let mut outputs = Vec::new();
+
+        for (monitor, mapped) in self.layout.windows() {
+            if mapped.source_id() != source_id {
+                continue;
+            }
+
+            let Some(output) = monitor.map(|monitor| monitor.output()) else {
+                continue;
+            };
+
+            if outputs.iter().all(|existing| existing != output) {
+                outputs.push(output.clone());
+            }
+        }
+
+        outputs
+    }
+
     pub fn output_for_tablet(&self) -> Option<&Output> {
         let config = self.config.borrow();
         if config.input.tablet.map_to_focused_output {
@@ -4131,7 +4264,7 @@ impl Niri {
         if let Some(tablet_pos) = self.tablet_cursor_location {
             let contents = self.contents_under(tablet_pos);
             if let Some((w, HitType::Input { win_pos })) = contents.window {
-                if w == mapped.window {
+                if w == mapped.id() {
                     // Tablet tools don't currently expose current focus, and don't currently
                     // have grabs. When those are implemented, this branch should be adjusted
                     // to look more similar to the branch below.
@@ -4141,7 +4274,7 @@ impl Niri {
         }
         // Regular cursor.
         else if let Some((w, HitType::Input { win_pos })) = &self.pointer_contents.window {
-            if w == &mapped.window {
+            if w == &mapped.id() {
                 // Grabs can modify the pointer focus, making it different from
                 // pointer_contents. Notably, gestures like Mod+MMB will remove the pointer
                 // focus, and ClickGrab will keep pointer focus on the clicked window even
@@ -4163,7 +4296,7 @@ impl Niri {
                     || pointer
                         .current_focus()
                         .map(|focused| self.find_root_shell_surface(&focused))
-                        .is_some_and(|focused| mapped.is_wl_surface(&focused));
+                        .is_some_and(|focused| mapped.toplevel().wl_surface() == &focused);
                 if current_focus_matches {
                     // We don't check for pointer visibility because it can only be Visible or
                     // Hidden, and never Disabled (then it wouldn't have focus). Even when the
@@ -4379,7 +4512,7 @@ impl Niri {
         let mut outputs = HashSet::new();
         self.layout.with_windows_mut(|mapped, output| {
             if mapped.recompute_window_rules_if_needed(window_rules, self.is_at_startup) {
-                windows.push(mapped.window.clone());
+                windows.push((mapped.id(), mapped.window.clone()));
 
                 if let Some(output) = output {
                     outputs.insert(output.clone());
@@ -4393,8 +4526,8 @@ impl Niri {
         });
         drop(config);
 
-        for win in windows {
-            self.layout.update_window(&win, None);
+        for (id, win) in windows {
+            self.layout.update_window(&id, None);
             win.toplevel()
                 .expect("no X11 support")
                 .send_pending_configure();
@@ -5358,55 +5491,37 @@ impl Niri {
             );
         }
 
-        // We're only updating the current output's windows and layer surfaces. This should be fine
-        // as in niri they can only be rendered on a single output at a time.
-        //
-        // The reason to do this at all is that it keeps track of whether the surface is visible or
-        // not in a unified way with the pointer surfaces, which makes the logic elsewhere simpler.
-
+        // Windows usually have a single mapped instance per output. Mirrors can have several
+        // mapped instances for one shared surface tree on the same output, with only a subset of
+        // them actually visible. Aggregate those instances first so a hidden mirror cannot clear
+        // the primary scanout state after a visible sibling sets it.
+        let mut mapped_by_source = HashMap::<MappedId, Vec<&Mapped>>::new();
         for mapped in self.layout.windows_for_output(output) {
-            let win = &mapped.window;
-            let offscreen_data = mapped.offscreen_data();
-            let offscreen_data = offscreen_data.as_ref();
+            mapped_by_source
+                .entry(mapped.source_id())
+                .or_default()
+                .push(mapped);
+        }
 
-            win.with_surfaces(|surface, states| {
+        for mapped_group in mapped_by_source.into_values() {
+            let mapped = mapped_group[0];
+            mapped.window.with_surfaces(|surface, states| {
                 let primary_scanout_output = states
                     .data_map
                     .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
                 let mut primary_scanout_output = primary_scanout_output.lock().unwrap();
 
-                let mut id = Id::from_wayland_resource(surface);
-
-                if let Some(data) = offscreen_data {
-                    // We have offscreen data; it's likely that all surfaces are on it.
-                    if data.states.element_was_presented(id.clone()) {
-                        // If the surface was presented to the offscreen, use the offscreen's id.
-                        id = data.id.clone();
-                    }
-
-                    // If we the surface wasn't presented to the offscreen it can mean:
-                    //
-                    // - The surface was invisible. For example, it's obscured by another surface on
-                    //   the offscreen, or simply isn't mapped.
-                    // - The surface is rendered separately from the offscreen, for example: popups
-                    //   during the window resize animation.
-                    //
-                    // In both of these cases, using the original surface element id and the
-                    // original states is the correct thing to do. We may find the surface in the
-                    // original states (in the second case). Either way, we definitely know it is
-                    // *not* in the offscreen, and we won't miss it.
-                    //
-                    // There's one edge case: if the surface is both in the offscreen and separate,
-                    // and the offscreen itself is invisible, while the separate surface is
-                    // visible. In this case we'll currently mark the surface as invisible. We
-                    // don't really use offscreens like that however, and if we start, it's easy
-                    // enough to fix (need an extra check).
-                }
+                let id = mapped_group
+                    .iter()
+                    .map(|mapped| primary_scanout_element_id_for_mapped(mapped, surface))
+                    .find(|id| id.was_presented(render_element_states))
+                    .unwrap_or_else(|| primary_scanout_element_id_for_mapped(mapped, surface));
+                let PrimaryScanoutElementId { id, namespace } = id;
 
                 primary_scanout_output.update_from_render_element_states(
                     id,
                     output,
-                    None,
+                    namespace,
                     render_element_states,
                     |_, _, output, _| output,
                 );
@@ -5504,10 +5619,13 @@ impl Niri {
     ) {
         let _span = tracy_client::span!("Niri::send_dmabuf_feedbacks");
 
-        // We can unconditionally send the current output's feedback to regular and layer-shell
-        // surfaces, as they can only be displayed on a single output at a time. Even if a surface
-        // is currently invisible, this is the DMABUF feedback that it should know about.
+        // Mirrors share the same surface tree with their source window, so let the real mapped
+        // entry own DMABUF feedback to avoid sending conflicting per-output feedback updates.
         for mapped in self.layout.windows_for_output(output) {
+            if mapped.is_mirror() {
+                continue;
+            }
+
             mapped.window.send_dmabuf_feedback(
                 output,
                 |_, _| Some(output.clone()),
@@ -7051,12 +7169,12 @@ impl Niri {
             let mut windows = vec![];
             self.layout.with_windows_mut(|mapped, _| {
                 if mapped.recompute_window_rules(window_rules, self.is_at_startup) {
-                    windows.push(mapped.window.clone());
+                    windows.push(mapped.id());
                 }
             });
             let changed = !windows.is_empty();
-            for win in windows {
-                self.layout.update_window(&win, None);
+            for id in windows {
+                self.layout.update_window(&id, None);
             }
             changed
         };
@@ -7138,14 +7256,13 @@ impl Niri {
         self.notified_activity_this_iteration = true;
     }
 
-    pub fn close_mru(&mut self, close_request: MruCloseRequest) -> Option<Window> {
+    pub fn close_mru(&mut self, close_request: MruCloseRequest) -> Option<MappedId> {
         if !self.window_mru_ui.is_open() {
             return None;
         }
         self.queue_redraw_all();
 
-        let id = self.window_mru_ui.close(close_request)?;
-        self.find_window_by_id(id)
+        self.window_mru_ui.close(close_request)
     }
 
     pub fn cancel_mru(&mut self) {

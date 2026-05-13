@@ -1,16 +1,16 @@
 use std::time::Duration;
 
-use smithay::desktop::Window;
 use smithay::input::touch::{
     DownEvent, GrabStartData as TouchGrabStartData, MotionEvent, OrientationEvent, ShapeEvent,
     TouchGrab, TouchInnerHandle, UpEvent,
 };
 use smithay::input::SeatHandler;
 use smithay::output::Output;
-use smithay::utils::{IsAlive, Logical, Point, Serial};
+use smithay::utils::{Logical, Point, Serial};
 
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::niri::State;
+use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
 // When the touch is stationary for this much time, it becomes an interactive move.
@@ -24,7 +24,7 @@ pub struct TouchOverviewGrab {
     start_pos_within_output: Point<f64, Logical>,
     workspace_id: Option<WorkspaceId>,
     workspace_matched_narrow: bool,
-    window: Option<Window>,
+    window: Option<MappedId>,
     gesture: GestureState,
 }
 
@@ -44,7 +44,7 @@ impl TouchOverviewGrab {
         start_pos_within_output: Point<f64, Logical>,
         workspace_id: Option<WorkspaceId>,
         workspace_matched_narrow: bool,
-        window: Option<Window>,
+        window: Option<MappedId>,
     ) -> Self {
         Self {
             last_location: start_data.location,
@@ -175,11 +175,11 @@ impl TouchGrab<State> for TouchOverviewGrab {
 
         // Check if we should become interactive move.
         if matches!(self.gesture, GestureState::Recognizing) {
-            if let Some(window) = self.window.as_ref().filter(|win| win.alive()) {
+            if let Some(window) = self.window.as_ref().filter(|win| layout.has_window(win)) {
                 let passed = timestamp.saturating_sub(self.start_timestamp);
                 if INTERACTIVE_MOVE_THRESHOLD <= passed
                     && layout.interactive_move_begin(
-                        window.clone(),
+                        *window,
                         &self.output,
                         self.start_pos_within_output,
                     )

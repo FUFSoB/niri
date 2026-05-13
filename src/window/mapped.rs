@@ -1,10 +1,12 @@
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::HashSet;
+use std::convert::TryInto;
 use std::time::Duration;
 
 use niri_config::{BlockOutFrom, Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::{Kind, NamespacedElement};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -32,11 +34,13 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
 };
+use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
 use crate::utils::id::IdCounter;
@@ -54,11 +58,26 @@ pub struct Mapped {
     /// Unique ID of this `Mapped`.
     id: MappedId,
 
+    /// ID of the real source window for mirrors, or `id` for real windows.
+    source_id: MappedId,
+
+    /// Whether this mapped entry is only a mirror of another entry.
+    is_mirror: bool,
+
+    /// Current visual size for mirror entries.
+    mirror_size: Size<i32, Logical>,
+
+    /// Current sizing mode for mirror entries.
+    mirror_sizing_mode: SizingMode,
+
+    /// Pending sizing mode for mirror entries.
+    mirror_pending_sizing_mode: SizingMode,
+
     /// Credentials of the process that created the Wayland connection.
     credentials: Option<Credentials>,
 
     /// Pre-commit hook that we have on all mapped toplevel surfaces.
-    pre_commit_hook: HookId,
+    pre_commit_hook: Option<HookId>,
 
     /// Up-to-date rules.
     rules: ResolvedWindowRules,
@@ -90,6 +109,9 @@ pub struct Mapped {
 
     /// Whether this window has the keyboard focus.
     is_focused: bool,
+
+    /// Whether this layout entry currently requests xdg_toplevel::Activated.
+    is_activated: bool,
 
     /// Whether this window is the active window in its column.
     is_active_in_column: bool,
@@ -241,6 +263,38 @@ impl MappedId {
     }
 }
 
+#[derive(Default)]
+struct SurfaceActivatedEntries {
+    ids: RefCell<HashSet<MappedId>>,
+}
+
+fn update_surface_activated_entries(surface: &WlSurface, id: MappedId, active: bool) -> bool {
+    with_states(surface, |states| {
+        let entries = states
+            .data_map
+            .get_or_insert(SurfaceActivatedEntries::default);
+        let mut ids = entries.ids.borrow_mut();
+
+        if active {
+            ids.insert(id);
+        } else {
+            ids.remove(&id);
+        }
+
+        !ids.is_empty()
+    })
+}
+
+fn baked_texture_logical_size(
+    baked: &BakedBuffer<TextureBuffer<GlesTexture>>,
+) -> Size<f64, Logical> {
+    baked
+        .dst
+        .map(|dst| dst.to_f64())
+        .or_else(|| baked.src.map(|src| src.size))
+        .unwrap_or_else(|| baked.buffer.logical_size())
+}
+
 /// Interactive resize state.
 #[derive(Debug)]
 enum InteractiveResize {
@@ -276,15 +330,28 @@ enum RequestSizeOnce {
     UseWindowSize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MirrorContentTransform {
+    source_bbox: Rectangle<f64, Logical>,
+    content_rect: Rectangle<f64, Logical>,
+    scale: f64,
+}
+
 impl Mapped {
     pub fn new(window: Window, rules: ResolvedWindowRules, hook: HookId, config: &Config) -> Self {
         let surface = window.wl_surface().expect("no X11 support");
         let credentials = get_credentials_for_surface(&surface);
+        let id = MappedId::next();
         let mut rv = Self {
             window,
-            id: MappedId::next(),
+            id,
+            source_id: id,
+            is_mirror: false,
+            mirror_size: Size::from((1, 1)),
+            mirror_sizing_mode: SizingMode::Normal,
+            mirror_pending_sizing_mode: SizingMode::Normal,
             credentials,
-            pre_commit_hook: hook,
+            pre_commit_hook: Some(hook),
             rules,
             need_to_recompute_rules: false,
             needs_configure: false,
@@ -292,6 +359,7 @@ impl Mapped {
             offscreen_data: RefCell::new(None),
             is_urgent: false,
             is_focused: false,
+            is_activated: false,
             is_active_in_column: true,
             is_floating: false,
             is_sticky: false,
@@ -323,6 +391,54 @@ impl Mapped {
         rv
     }
 
+    pub fn new_mirror(source: &Mapped) -> Self {
+        let id = MappedId::next();
+        let mut rules = source.rules.clone();
+        rules.clip_to_geometry = Some(true);
+        Self {
+            window: source.window.clone(),
+            id,
+            source_id: source.source_id,
+            is_mirror: true,
+            mirror_size: source.size(),
+            mirror_sizing_mode: SizingMode::Normal,
+            mirror_pending_sizing_mode: SizingMode::Normal,
+            credentials: source.credentials.clone(),
+            pre_commit_hook: None,
+            rules,
+            need_to_recompute_rules: false,
+            needs_configure: false,
+            needs_frame_callback: false,
+            offscreen_data: RefCell::new(None),
+            is_urgent: false,
+            is_focused: false,
+            is_activated: false,
+            is_active_in_column: true,
+            is_floating: source.is_floating,
+            is_sticky: false,
+            is_window_cast_target: false,
+            ignore_opacity_window_rule: source.ignore_opacity_window_rule,
+            invert_block_out_window_rule: source.invert_block_out_window_rule,
+            block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
+            blur_config: source.blur_config,
+            animate_next_configure: false,
+            animate_serials: Vec::new(),
+            animation_snapshot: None,
+            request_size_once: None,
+            transaction_for_next_configure: None,
+            pending_transactions: Vec::new(),
+            interactive_resize: None,
+            last_interactive_resize_start: Cell::new(None),
+            is_windowed_fullscreen: false,
+            is_pending_windowed_fullscreen: false,
+            uncommitted_windowed_fullscreen: Vec::new(),
+            is_maximized: false,
+            is_pending_maximized: false,
+            uncommitted_maximized: Vec::new(),
+            focus_timestamp: None,
+        }
+    }
+
     pub fn toplevel(&self) -> &ToplevelSurface {
         self.window.toplevel().expect("no X11 support")
     }
@@ -331,7 +447,11 @@ impl Mapped {
     pub fn recompute_window_rules(&mut self, rules: &[WindowRule], is_at_startup: bool) -> bool {
         self.need_to_recompute_rules = false;
 
-        let new_rules = ResolvedWindowRules::compute(rules, WindowRef::Mapped(self), is_at_startup);
+        let mut new_rules =
+            ResolvedWindowRules::compute(rules, WindowRef::Mapped(self), is_at_startup);
+        if self.is_mirror {
+            new_rules.clip_to_geometry = Some(true);
+        }
         if new_rules == self.rules {
             return false;
         }
@@ -359,11 +479,59 @@ impl Mapped {
     }
 
     pub fn set_needs_configure(&mut self) {
+        if self.is_mirror {
+            return;
+        }
         self.needs_configure = true;
     }
 
     pub fn id(&self) -> MappedId {
         self.id
+    }
+
+    pub fn source_id(&self) -> MappedId {
+        self.source_id
+    }
+
+    pub fn is_mirror(&self) -> bool {
+        self.is_mirror
+    }
+
+    pub fn element_namespace(&self) -> Option<usize> {
+        self.is_mirror
+            .then(|| self.id.get().try_into().unwrap_or(usize::MAX))
+    }
+
+    fn mirror_transform(&self) -> MirrorContentTransform {
+        let dst = self.mirror_size.to_f64();
+        let mut source_bbox = self.window.bbox_with_popups().to_f64();
+        source_bbox.size.w = source_bbox.size.w.max(1.);
+        source_bbox.size.h = source_bbox.size.h.max(1.);
+
+        let scale = f64::min(dst.w / source_bbox.size.w, dst.h / source_bbox.size.h).max(0.0001);
+        let rendered = source_bbox.size.upscale(scale);
+        let offset = Point::from(((dst.w - rendered.w) / 2., (dst.h - rendered.h) / 2.));
+
+        MirrorContentTransform {
+            source_bbox,
+            content_rect: Rectangle::new(offset, rendered),
+            scale,
+        }
+    }
+
+    pub fn mirror_content_transform(&self) -> (Point<f64, Logical>, f64) {
+        let transform = self.mirror_transform();
+        (transform.content_rect.loc, transform.scale)
+    }
+
+    pub fn mirror_point_to_source(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let transform = self.mirror_transform();
+        let point = (point - transform.content_rect.loc).downscale(transform.scale)
+            + transform.source_bbox.loc;
+        transform.source_bbox.contains(point).then_some(point)
     }
 
     pub fn credentials(&self) -> Option<&Credentials> {
@@ -457,7 +625,19 @@ impl Mapped {
         let mut contents = vec![];
 
         let surface = self.toplevel().wl_surface();
-        render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
+        if self.is_mirror {
+            render_snapshot_from_surface_tree(renderer, surface, Point::default(), &mut contents);
+
+            let transform = self.mirror_transform();
+            for baked in &mut contents {
+                let logical_size = baked_texture_logical_size(baked);
+                baked.location = transform.content_rect.loc
+                    + (baked.location - transform.source_bbox.loc).upscale(transform.scale);
+                baked.dst = Some(logical_size.upscale(transform.scale).to_i32_round());
+            }
+        } else {
+            render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
+        }
 
         RenderSnapshot {
             contents,
@@ -533,7 +713,11 @@ impl Mapped {
         block_out_enabled: bool,
         push: &mut dyn FnMut(WindowCastRenderElements<R>),
     ) {
-        let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
+        let bbox = if self.is_mirror {
+            Rectangle::from_size(self.size()).to_physical_precise_up(scale)
+        } else {
+            self.window.bbox_with_popups().to_physical_precise_up(scale)
+        };
 
         let has_border_shader = BorderRenderElement::has_shader(renderer);
         let radius = self.geometry_corner_radius();
@@ -543,7 +727,11 @@ impl Mapped {
             .to_physical_precise_round(scale)
             .to_logical(scale);
         let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
-        let location = self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale);
+        let location = if self.is_mirror {
+            Point::default()
+        } else {
+            self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale)
+        };
 
         let use_border = |elem| {
             if let LayoutElementRenderElement::SolidColor(elem) = &elem {
@@ -624,6 +812,11 @@ impl Mapped {
     }
 
     pub fn update_tiled_state(&self, prefer_no_csd: bool) {
+        if self.is_mirror {
+            let _ = prefer_no_csd;
+            return;
+        }
+
         update_tiled_state(self.toplevel(), prefer_no_csd, self.rules.tiled_state);
     }
 
@@ -648,15 +841,31 @@ impl Mapped {
 
 impl Drop for Mapped {
     fn drop(&mut self) {
-        remove_pre_commit_hook(self.toplevel().wl_surface(), &self.pre_commit_hook);
+        if self.is_activated {
+            let surface = self.toplevel().wl_surface();
+            if surface.is_alive() {
+                let any_active = update_surface_activated_entries(surface, self.id, false);
+                self.toplevel().with_pending_state(|state| {
+                    if any_active {
+                        state.states.set(xdg_toplevel::State::Activated)
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Activated)
+                    }
+                });
+            }
+        }
+
+        if let Some(hook) = &self.pre_commit_hook {
+            remove_pre_commit_hook(self.toplevel().wl_surface(), hook);
+        }
     }
 }
 
 impl LayoutElement for Mapped {
-    type Id = Window;
+    type Id = MappedId;
 
     fn id(&self) -> &Self::Id {
-        &self.window
+        &self.id
     }
 
     fn update_config(&mut self, blur_config: niri_config::Blur) {
@@ -664,14 +873,32 @@ impl LayoutElement for Mapped {
     }
 
     fn size(&self) -> Size<i32, Logical> {
+        if self.is_mirror {
+            return self.mirror_size;
+        }
+
         self.window.geometry().size
     }
 
     fn buf_loc(&self) -> Point<i32, Logical> {
+        if self.is_mirror {
+            let transform = self.mirror_transform();
+            return (transform.content_rect.loc
+                - transform.source_bbox.loc.upscale(transform.scale))
+            .to_i32_round();
+        }
+
         Point::from((0, 0)) - self.window.geometry().loc
     }
 
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
+        if self.is_mirror {
+            let Some(point) = self.mirror_point_to_source(point) else {
+                return false;
+            };
+            return self.window.is_in_input_region(&point);
+        }
+
         let surface_local = point + self.window.geometry().loc.to_f64();
         self.window.is_in_input_region(&surface_local)
     }
@@ -684,6 +911,54 @@ impl LayoutElement for Mapped {
         alpha: f32,
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
+        if self.is_mirror {
+            let blocked_out = ctx.should_block_out(self.effective_block_out_from());
+            let namespace = self.element_namespace().unwrap();
+            let mut buffer = self.block_out_buffer.borrow_mut();
+            // Keep a full-size element for damage/tracking, but leave the letterboxed area
+            // transparent unless the mirror is intentionally blocked out.
+            buffer.update(
+                self.mirror_size.to_f64(),
+                if blocked_out {
+                    [0., 0., 0., 1.]
+                } else {
+                    [0., 0., 0., 0.]
+                },
+            );
+            let elem =
+                SolidColorRenderElement::from_buffer(&buffer, location, alpha, Kind::Unspecified);
+            push(elem.into());
+
+            if blocked_out {
+                return;
+            }
+
+            let transform = self.mirror_transform();
+            let content_loc = location + transform.content_rect.loc;
+            let content_origin = content_loc.to_physical_precise_round(scale);
+            let buf_pos =
+                content_origin - transform.source_bbox.loc.to_physical_precise_round(scale);
+            let surface = self.toplevel().wl_surface();
+            let mut push = |elem: WaylandSurfaceRenderElement<R>| {
+                let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
+                    NamespacedElement::new(elem, namespace),
+                    content_origin,
+                    Scale::from(transform.scale),
+                );
+                push(elem.into())
+            };
+            push_elements_from_surface_tree(
+                ctx.renderer,
+                surface,
+                buf_pos,
+                scale,
+                alpha,
+                Kind::Unspecified,
+                &mut push,
+            );
+            return;
+        }
+
         if ctx.should_block_out(self.effective_block_out_from()) {
             let mut buffer = self.block_out_buffer.borrow_mut();
             buffer.resize(self.window.geometry().size.to_f64());
@@ -716,6 +991,79 @@ impl LayoutElement for Mapped {
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
         if ctx.should_block_out(self.effective_block_out_from()) {
+            return;
+        }
+
+        if self.is_mirror {
+            let transform = self.mirror_transform();
+            let namespace = self.element_namespace().unwrap();
+            let content_loc = location + transform.content_rect.loc;
+            let content_origin = content_loc.to_physical_precise_round(scale);
+            let root = self.toplevel().wl_surface();
+
+            for (popup, offset) in PopupManager::popups_for_surface(root) {
+                let popup_rules = match popup {
+                    PopupKind::Xdg(_) => self.rules.popups,
+                    PopupKind::InputMethod(_) => niri_config::ResolvedPopupsRules::default(),
+                };
+                let alpha = alpha * popup_rules.opacity.unwrap_or(1.).clamp(0., 1.);
+
+                let surface = popup.wl_surface();
+                let popup_geo = popup.geometry();
+                let surface_loc = content_origin
+                    - transform.source_bbox.loc.to_physical_precise_round(scale)
+                    + (offset - popup_geo.loc)
+                        .to_f64()
+                        .to_physical_precise_round(scale);
+
+                push_elements_from_surface_tree(
+                    ctx.renderer,
+                    surface,
+                    surface_loc,
+                    scale,
+                    alpha,
+                    Kind::Unspecified,
+                    &mut |elem| {
+                        let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
+                            NamespacedElement::new(elem, namespace),
+                            content_origin,
+                            Scale::from(transform.scale),
+                        );
+                        push(elem.into())
+                    },
+                );
+
+                let geometry = Rectangle::new(
+                    content_loc
+                        + (offset.to_f64() - transform.source_bbox.loc).upscale(transform.scale),
+                    popup_geo.size.to_f64().upscale(transform.scale),
+                );
+                let surface_off = popup_geo.loc.upscale(-1).to_f64();
+                let surface_anim_scale = Scale::from(transform.scale);
+                let mut effect = popup_rules.background_effect;
+                // Default xray to false for pop-ups since they're always on top of something.
+                if effect.xray.is_none() {
+                    effect.xray = Some(false);
+                }
+                let xray_pos = xray_pos.offset(geometry.loc - location);
+                background_effect::render_for_tile(
+                    ctx.as_gles(),
+                    None,
+                    geometry,
+                    scale.x,
+                    false,
+                    surface,
+                    surface_off,
+                    surface_anim_scale,
+                    self.blur_config,
+                    popup_rules.geometry_corner_radius.unwrap_or_default(),
+                    effect,
+                    false,
+                    xray_pos,
+                    &mut |elem| push(elem.into()),
+                );
+            }
+
             return;
         }
 
@@ -786,6 +1134,35 @@ impl LayoutElement for Mapped {
             return;
         }
 
+        if self.is_mirror {
+            let transform = self.mirror_transform();
+            let geometry = Rectangle::new(
+                geometry.loc + transform.content_rect.loc,
+                transform.content_rect.size,
+            );
+            let surface_anim_scale = Scale {
+                x: surface_anim_scale.x * transform.scale,
+                y: surface_anim_scale.y * transform.scale,
+            };
+            background_effect::render_for_tile(
+                ctx,
+                None,
+                geometry,
+                scale,
+                clip_to_geometry,
+                self.toplevel().wl_surface(),
+                transform.source_bbox.loc.upscale(-1.),
+                surface_anim_scale,
+                self.blur_config,
+                radius,
+                self.rules.background_effect,
+                false,
+                xray_pos.offset(transform.content_rect.loc),
+                push,
+            );
+            return;
+        }
+
         background_effect::render_for_tile(
             ctx,
             None,
@@ -811,6 +1188,15 @@ impl LayoutElement for Mapped {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        if self.is_mirror {
+            let size = Size::from((size.w.max(1), size.h.max(1)));
+            self.mirror_size = size;
+            self.mirror_sizing_mode = mode;
+            self.mirror_pending_sizing_mode = mode;
+            let _ = (animate, transaction);
+            return;
+        }
+
         // Going into real fullscreen resets windowed fullscreen.
         if mode == SizingMode::Fullscreen {
             self.is_pending_windowed_fullscreen = false;
@@ -863,6 +1249,11 @@ impl LayoutElement for Mapped {
     }
 
     fn request_size_once(&mut self, size: Size<i32, Logical>, animate: bool) {
+        if self.is_mirror {
+            self.request_size(size, SizingMode::Normal, animate, None);
+            return;
+        }
+
         // Assume that when calling this function, the window is going floating, so it can no
         // longer participate in any transactions with other windows.
         self.transaction_for_next_configure = None;
@@ -935,6 +1326,10 @@ impl LayoutElement for Mapped {
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
+        if self.is_mirror {
+            return Size::from((1, 1));
+        }
+
         let min_size = with_states(self.toplevel().wl_surface(), |state| {
             let mut guard = state.cached_state.get::<SurfaceCachedState>();
             guard.current().min_size
@@ -944,6 +1339,10 @@ impl LayoutElement for Mapped {
     }
 
     fn max_size(&self) -> Size<i32, Logical> {
+        if self.is_mirror {
+            return Size::from((0, 0));
+        }
+
         let max_size = with_states(self.toplevel().wl_surface(), |state| {
             let mut guard = state.cached_state.get::<SurfaceCachedState>();
             guard.current().max_size
@@ -953,10 +1352,18 @@ impl LayoutElement for Mapped {
     }
 
     fn is_wl_surface(&self, wl_surface: &WlSurface) -> bool {
+        if self.is_mirror {
+            return false;
+        }
+
         self.toplevel().wl_surface() == wl_surface
     }
 
     fn set_preferred_scale_transform(&self, scale: output::Scale, transform: Transform) {
+        if self.is_mirror {
+            return;
+        }
+
         self.window.with_surfaces(|surface, data| {
             send_scale_transform(surface, data, scale, transform);
         });
@@ -983,11 +1390,21 @@ impl LayoutElement for Mapped {
     }
 
     fn output_enter(&self, output: &Output) {
+        if self.is_mirror {
+            let _ = output;
+            return;
+        }
+
         let overlap = Rectangle::from_size(Size::from((i32::MAX, i32::MAX)));
         self.window.output_enter(output, overlap)
     }
 
     fn output_leave(&self, output: &Output) {
+        if self.is_mirror {
+            let _ = output;
+            return;
+        }
+
         self.window.output_leave(output)
     }
 
@@ -1016,13 +1433,22 @@ impl LayoutElement for Mapped {
     }
 
     fn set_activated(&mut self, active: bool) {
+        if self.is_activated == active {
+            return;
+        }
+
+        self.is_activated = active;
+
+        let surface = self.toplevel().wl_surface();
+        let any_active = update_surface_activated_entries(surface, self.id, active);
         let changed = self.toplevel().with_pending_state(|state| {
-            if active {
+            if any_active {
                 state.states.set(xdg_toplevel::State::Activated)
             } else {
                 state.states.unset(xdg_toplevel::State::Activated)
             }
         });
+        self.need_to_recompute_rules = true;
         self.need_to_recompute_rules |= changed;
     }
 
@@ -1045,12 +1471,21 @@ impl LayoutElement for Mapped {
     }
 
     fn set_bounds(&self, bounds: Size<i32, Logical>) {
+        if self.is_mirror {
+            let _ = bounds;
+            return;
+        }
+
         self.toplevel().with_pending_state(|state| {
             state.bounds = Some(bounds);
         });
     }
 
     fn configure_intent(&self) -> ConfigureIntent {
+        if self.is_mirror {
+            return ConfigureIntent::NotNeeded;
+        }
+
         let _span =
             trace_span!("configure_intent", surface = ?self.toplevel().wl_surface().id()).entered();
 
@@ -1110,6 +1545,10 @@ impl LayoutElement for Mapped {
     }
 
     fn send_pending_configure(&mut self) {
+        if self.is_mirror {
+            return;
+        }
+
         let toplevel = self.toplevel();
         let _span =
             trace_span!("send_pending_configure", surface = ?toplevel.wl_surface().id()).entered();
@@ -1211,6 +1650,10 @@ impl LayoutElement for Mapped {
     }
 
     fn sizing_mode(&self) -> SizingMode {
+        if self.is_mirror {
+            return self.mirror_sizing_mode;
+        }
+
         if self.is_windowed_fullscreen {
             return if self.is_maximized {
                 SizingMode::Maximized
@@ -1238,6 +1681,10 @@ impl LayoutElement for Mapped {
     }
 
     fn pending_sizing_mode(&self) -> SizingMode {
+        if self.is_mirror {
+            return self.mirror_pending_sizing_mode;
+        }
+
         if self.is_pending_windowed_fullscreen {
             return if self.is_pending_maximized {
                 SizingMode::Maximized
@@ -1266,10 +1713,18 @@ impl LayoutElement for Mapped {
     }
 
     fn requested_size(&self) -> Option<Size<i32, Logical>> {
+        if self.is_mirror {
+            return Some(self.mirror_size);
+        }
+
         self.toplevel().with_pending_state(|state| state.size)
     }
 
     fn expected_size(&self) -> Option<Size<i32, Logical>> {
+        if self.is_mirror {
+            return Some(self.mirror_size);
+        }
+
         // We can only use current size if it's not maximized or fullscreen.
         let current_size = (self.sizing_mode().is_normal()).then(|| self.window.geometry().size);
 
@@ -1358,14 +1813,33 @@ impl LayoutElement for Mapped {
     }
 
     fn is_windowed_fullscreen(&self) -> bool {
+        if self.is_mirror {
+            return self.mirror_sizing_mode.is_fullscreen();
+        }
+
         self.is_windowed_fullscreen
     }
 
     fn is_pending_windowed_fullscreen(&self) -> bool {
+        if self.is_mirror {
+            return self.mirror_pending_sizing_mode.is_fullscreen();
+        }
+
         self.is_pending_windowed_fullscreen
     }
 
     fn request_windowed_fullscreen(&mut self, value: bool) {
+        if self.is_mirror {
+            let mode = if value {
+                SizingMode::Fullscreen
+            } else {
+                SizingMode::Normal
+            };
+            self.mirror_sizing_mode = mode;
+            self.mirror_pending_sizing_mode = mode;
+            return;
+        }
+
         if self.is_pending_windowed_fullscreen == value {
             return;
         }
@@ -1394,10 +1868,18 @@ impl LayoutElement for Mapped {
     }
 
     fn is_child_of(&self, parent: &Self) -> bool {
+        if self.is_mirror || parent.is_mirror {
+            return false;
+        }
+
         self.toplevel().parent().as_ref() == Some(parent.toplevel().wl_surface())
     }
 
     fn refresh(&self) {
+        if self.is_mirror {
+            return;
+        }
+
         self.window.refresh();
     }
 
@@ -1410,6 +1892,11 @@ impl LayoutElement for Mapped {
     }
 
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>) {
+        if self.is_mirror {
+            self.interactive_resize = data.map(InteractiveResize::Ongoing);
+            return;
+        }
+
         self.toplevel().with_pending_state(|state| {
             if data.is_some() {
                 state.states.set(xdg_toplevel::State::Resizing);
@@ -1440,6 +1927,11 @@ impl LayoutElement for Mapped {
     }
 
     fn on_commit(&mut self, commit_serial: Serial) {
+        if self.is_mirror {
+            let _ = commit_serial;
+            return;
+        }
+
         if let Some(InteractiveResize::WaitingForLastCommit { serial, .. }) =
             &self.interactive_resize
         {

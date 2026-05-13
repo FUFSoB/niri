@@ -395,7 +395,7 @@ window-rule {{
         })
         .unwrap();
     let is_fullscreen = mapped.sizing_mode().is_fullscreen();
-    let win = mapped.window.clone();
+    let win = mapped.id();
     let mon = mon.unwrap().output_name().clone();
     let ws = ws.name().cloned().unwrap_or(String::from("unnamed"));
 
@@ -657,7 +657,7 @@ layout {
     let mut post_unfullscreen = String::new();
     let mapped = f.niri().layout.windows().next().unwrap().1;
     let is_fullscreen = mapped.sizing_mode().is_fullscreen();
-    let win = mapped.window.clone();
+    let win = mapped.id();
     if is_fullscreen {
         f.niri().layout.set_fullscreen(&win, false);
         f.double_roundtrip(id);
@@ -840,7 +840,7 @@ window-rule {
     let mut post_unfullscreen = String::new();
     let mapped = f.niri().layout.windows().next().unwrap().1;
     let is_fullscreen = mapped.sizing_mode().is_fullscreen();
-    let win = mapped.window.clone();
+    let win = mapped.id();
     if is_fullscreen {
         f.niri().layout.set_fullscreen(&win, false);
         f.double_roundtrip(id);
@@ -860,7 +860,7 @@ window-rule {
     let mut post_unmaximize = String::new();
     let mapped = f.niri().layout.windows().next().unwrap().1;
     let is_maximized = mapped.sizing_mode().is_maximized();
-    let win = mapped.window.clone();
+    let win = mapped.id();
     if is_maximized {
         f.niri().layout.set_maximized(&win, false);
         f.double_roundtrip(id);

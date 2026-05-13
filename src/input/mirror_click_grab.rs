@@ -1,35 +1,45 @@
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorImageStatus, GestureHoldBeginEvent, GestureHoldEndEvent,
-    GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
-    GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData,
-    MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
+    AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+    GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+    GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
+    PointerInnerHandle, RelativeMotionEvent,
 };
 use smithay::input::SeatHandler;
 use smithay::utils::{Logical, Point};
 
 use crate::niri::State;
-use crate::window::mapped::MappedId;
 
-pub struct ResizeGrab {
+pub struct MirrorClickGrab {
     start_data: PointerGrabStartData<State>,
-    window: MappedId,
+    start_surface_local: Point<f64, Logical>,
+    mirror_scale: f64,
 }
 
-impl ResizeGrab {
-    pub fn new(start_data: PointerGrabStartData<State>, window: MappedId) -> Self {
-        Self { start_data, window }
+impl MirrorClickGrab {
+    pub fn new(
+        start_data: PointerGrabStartData<State>,
+        start_surface_local: Point<f64, Logical>,
+        mirror_scale: f64,
+    ) -> Self {
+        Self {
+            start_data,
+            start_surface_local,
+            mirror_scale,
+        }
     }
 
-    fn on_ungrab(&mut self, state: &mut State) {
-        state.niri.layout.interactive_resize_end(&self.window);
-        state
-            .niri
-            .cursor_manager
-            .set_cursor_image(CursorImageStatus::default_named());
+    fn focus_for_location(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)> {
+        let (focus, _) = self.start_data.focus.as_ref()?;
+        let surface_local = self.start_surface_local
+            + (location - self.start_data.location).downscale(self.mirror_scale);
+        Some((focus.clone(), location - surface_local))
     }
 }
 
-impl PointerGrab<State> for ResizeGrab {
+impl PointerGrab<State> for MirrorClickGrab {
     fn motion(
         &mut self,
         data: &mut State,
@@ -37,22 +47,7 @@ impl PointerGrab<State> for ResizeGrab {
         _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
-        // While the grab is active, no client has pointer focus.
-        handle.motion(data, None, event);
-
-        if data.niri.layout.has_window(&self.window) {
-            let delta = event.location - self.start_data.location;
-            let ongoing = data
-                .niri
-                .layout
-                .interactive_resize_update(&self.window, delta);
-            if ongoing {
-                return;
-            }
-        }
-
-        // The resize is no longer ongoing.
-        handle.unset_grab(self, data, event.serial, event.time, true);
+        handle.motion(data, self.focus_for_location(event.location), event);
     }
 
     fn relative_motion(
@@ -62,8 +57,7 @@ impl PointerGrab<State> for ResizeGrab {
         _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
-        // While the grab is active, no client has pointer focus.
-        handle.relative_motion(data, None, event);
+        handle.relative_motion(data, self.start_data.focus.clone(), event);
     }
 
     fn button(
@@ -75,8 +69,7 @@ impl PointerGrab<State> for ResizeGrab {
         handle.button(data, event);
 
         if handle.current_pressed().is_empty() {
-            // No more buttons are pressed, release the grab.
-            handle.unset_grab(self, data, event.serial, event.time, true);
+            handle.unset_grab(self, data, event.serial, event.time, false);
         }
     }
 
@@ -169,7 +162,51 @@ impl PointerGrab<State> for ResizeGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, data: &mut State) {
-        self.on_ungrab(data);
+    fn unset(&mut self, _data: &mut State) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Logical, Point};
+
+    fn focus_origin_for_location(
+        start_location: Point<f64, Logical>,
+        start_surface_local: Point<f64, Logical>,
+        mirror_scale: f64,
+        location: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let surface_local =
+            start_surface_local + (location - start_location).downscale(mirror_scale);
+        location - surface_local
+    }
+
+    #[test]
+    fn mirror_focus_origin_tracks_scaled_motion() {
+        let start_location = Point::from((100., 100.));
+        let start_surface_local = Point::from((20., 10.));
+
+        let origin = focus_origin_for_location(
+            start_location,
+            start_surface_local,
+            2.,
+            Point::from((106., 100.)),
+        );
+
+        assert_eq!(origin, Point::from((83., 90.)));
+    }
+
+    #[test]
+    fn mirror_focus_origin_matches_unscaled_motion_at_scale_one() {
+        let start_location = Point::from((100., 100.));
+        let start_surface_local = Point::from((20., 10.));
+
+        let origin = focus_origin_for_location(
+            start_location,
+            start_surface_local,
+            1.,
+            Point::from((106., 104.)),
+        );
+
+        assert_eq!(origin, Point::from((80., 90.)));
     }
 }

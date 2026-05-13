@@ -74,6 +74,7 @@
           src = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
+              ./build.rs
               ./niri-config
               ./niri-ipc
               ./niri-visual-tests

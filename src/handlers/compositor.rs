@@ -191,7 +191,7 @@ impl CompositorHandler for State {
                                 || output.is_none()
                                 || output.as_ref() == *parent_output
                         })
-                        .map(|(mapped, _)| mapped.window.clone());
+                        .map(|(mapped, _)| mapped.id());
 
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
@@ -200,7 +200,7 @@ impl CompositorHandler for State {
                         let config = self.niri.config.borrow();
                         Mapped::new(window, rules, hook, &config)
                     };
-                    let window = mapped.window.clone();
+                    let id = mapped.id();
 
                     let target = if let Some(p) = &parent {
                         // Open dialogs next to their parent window.
@@ -230,17 +230,17 @@ impl CompositorHandler for State {
                     // here so that unfullscreening the window makes it maximized.
                     if let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) {
                         if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
-                            self.niri.layout.set_maximized(&window, true);
+                            self.niri.layout.set_maximized(&id, true);
                         }
                     } else {
                         error!("layout is missing the window that we just added");
                     }
 
                     if let Some(output) = output {
-                        self.niri.layout.start_open_animation_for_window(&window);
+                        self.niri.layout.start_open_animation_for_window(&id);
 
-                        let new_focus = self.niri.layout.focus().map(|m| &m.window);
-                        if new_focus == Some(&window) {
+                        let new_focus = self.niri.layout.focus().map(Mapped::id);
+                        if new_focus == Some(id) {
                             // We activated the newly opened window.
                             self.maybe_warp_cursor_to_focus();
                             self.niri.layer_shell_on_demand_focus = None;
@@ -267,6 +267,7 @@ impl CompositorHandler for State {
                 let output = output.cloned();
 
                 let id = mapped.id();
+                let instances = self.niri.mapped_instances_for_source(id);
 
                 // This is a commit of a previously-mapped toplevel.
                 let is_mapped = is_mapped(surface);
@@ -274,11 +275,14 @@ impl CompositorHandler for State {
                 // Must start the close animation before window.on_commit().
                 let transaction = Transaction::new();
                 if !is_mapped {
-                    let blocker = transaction.blocker();
                     self.backend.with_primary_renderer(|renderer| {
-                        self.niri
-                            .layout
-                            .start_close_animation_for_window(renderer, &window, blocker);
+                        for (instance_id, _) in &instances {
+                            self.niri.layout.start_close_animation_for_window(
+                                renderer,
+                                instance_id,
+                                transaction.blocker(),
+                            );
+                        }
                     });
                 }
 
@@ -290,14 +294,19 @@ impl CompositorHandler for State {
                     // Test client: wleird-unmap.
                     trace!("toplevel got unmapped");
 
-                    let active_window = self.niri.layout.focus().map(|m| &m.window);
-                    let was_active = active_window == Some(&window);
+                    let active_window = self.niri.layout.focus().map(Mapped::source_id);
+                    let was_active = active_window == Some(id);
 
-                    self.niri
-                        .stop_casts_for_target(CastTarget::Window { id: id.get() });
+                    let outputs = self.niri.outputs_for_source(id);
+                    for (id, _) in &instances {
+                        self.niri
+                            .stop_casts_for_target(CastTarget::Window { id: id.get() });
+                    }
 
-                    self.niri.window_mru_ui.remove_window(id);
-                    self.niri.layout.remove_window(&window, transaction.clone());
+                    for (id, _) in instances {
+                        self.niri.window_mru_ui.remove_window(id);
+                        self.niri.layout.remove_window(&id, transaction.clone());
+                    }
                     self.add_default_dmabuf_pre_commit_hook(surface);
 
                     // If this is the only instance, then this transaction will complete
@@ -315,10 +324,10 @@ impl CompositorHandler for State {
                     let unmapped = Unmapped::new(window);
                     self.niri.unmapped_windows.insert(surface.clone(), unmapped);
 
-                    if let Some(output) = output {
+                    for output in outputs {
                         self.niri.queue_redraw(&output);
-                        self.niri.queue_redraw_mru_output();
                     }
+                    self.niri.queue_redraw_mru_output();
                     return;
                 }
 
@@ -344,15 +353,20 @@ impl CompositorHandler for State {
                 }
 
                 // The toplevel remains mapped.
-                self.niri.window_mru_ui.update_window(&self.niri.layout, id);
-                self.niri.layout.update_window(&window, serial);
+                for (instance_id, _) in &instances {
+                    self.niri
+                        .window_mru_ui
+                        .update_window(&self.niri.layout, *instance_id);
+                    let instance_serial = if *instance_id == id { serial } else { None };
+                    self.niri.layout.update_window(instance_id, instance_serial);
+                }
 
                 // Move the toplevel according to the attach offset.
                 if let Some(delta) = buffer_delta {
                     if delta.x != 0 || delta.y != 0 {
                         let (x, y) = delta.to_f64().into();
                         self.niri.layout.move_floating_window(
-                            Some(&window),
+                            Some(&id),
                             PositionChange::AdjustFixed(x),
                             PositionChange::AdjustFixed(y),
                             false,
@@ -363,8 +377,10 @@ impl CompositorHandler for State {
                 // Popup placement depends on window size which might have changed.
                 self.update_reactive_popups(&window);
 
-                if let Some(output) = output {
-                    self.niri.queue_redraw(&output);
+                if output.is_some() {
+                    for output in self.niri.outputs_for_source(id) {
+                        self.niri.queue_redraw(&output);
+                    }
                     self.niri.queue_redraw_mru_output();
                 }
                 return;
@@ -377,14 +393,20 @@ impl CompositorHandler for State {
         let root_window_output = self.niri.layout.find_window_and_output(&root_surface);
         if let Some((mapped, output)) = root_window_output {
             let window = mapped.window.clone();
+            let id = mapped.id();
             let output = output.cloned();
+            let instances = self.niri.mapped_instances_for_source(id);
             window.on_commit();
-            self.niri
-                .window_mru_ui
-                .update_window(&self.niri.layout, mapped.id());
-            self.niri.layout.update_window(&window, None);
-            if let Some(output) = output {
-                self.niri.queue_redraw(&output);
+            for (instance_id, _) in &instances {
+                self.niri
+                    .window_mru_ui
+                    .update_window(&self.niri.layout, *instance_id);
+                self.niri.layout.update_window(instance_id, None);
+            }
+            if output.is_some() {
+                for output in self.niri.outputs_for_source(id) {
+                    self.niri.queue_redraw(&output);
+                }
                 self.niri.queue_redraw_mru_output();
             }
             return;
@@ -492,7 +514,7 @@ impl CompositorHandler for State {
         // gets most of the job done.
         if let Some(root) = self.niri.root_surface.get(surface) {
             if let Some((mapped, output)) = self.niri.layout.find_window_and_output(root) {
-                let window = mapped.window.clone();
+                let window = mapped.id();
                 let output = output.cloned();
                 self.store_unmap_snapshot(&window, output.as_ref());
             }

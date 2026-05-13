@@ -5,11 +5,13 @@ use std::sync::Arc;
 use arrayvec::ArrayVec;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::{
-    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1}, ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
-    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1}, zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
@@ -18,12 +20,12 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 use smithay::wayland::shell::xdg::{
-    ToplevelState, ToplevelStateSet, XdgToplevelSurfaceRoleAttributes
+    ToplevelState, ToplevelStateSet, ToplevelSurface, XdgToplevelSurfaceRoleAttributes,
 };
 
 use crate::niri::State;
-use crate::window::mapped::MappedId;
 use crate::utils::with_toplevel_role_and_current;
+use crate::window::mapped::MappedId;
 
 const EXT_LIST_VERSION: u32 = 1;
 const WLR_MANAGEMENT_VERSION: u32 = 3;
@@ -60,6 +62,14 @@ struct ToplevelData {
 #[derive(Clone)]
 pub struct ForeignToplevelGlobalData {
     filter: Arc<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
+}
+
+struct RefreshEntry {
+    toplevel: ToplevelSurface,
+    identifier: MappedId,
+    output: Option<Output>,
+    has_focus: bool,
+    has_source: bool,
 }
 
 impl ForeignToplevelManagerState {
@@ -114,39 +124,36 @@ pub fn refresh(state: &mut State) {
 
     // Handle new and existing windows.
     //
-    // Save the focused window for last, this way when the focus changes, we will first deactivate
-    // the previous window and only then activate the newly focused window.
-    let mut focused = None;
+    // Mirrors share the underlying wl_surface, while foreign-toplevel state is keyed by that
+    // surface, so aggregate per surface before refreshing.
+    let mut refreshes = HashMap::new();
     state.niri.layout.with_windows(|mapped, output, _, _| {
-        let toplevel = mapped.toplevel();
-        let wl_surface = toplevel.wl_surface();
-        with_toplevel_role_and_current(toplevel, |role, cur| {
-            let Some(cur) = cur else {
-                error!("mapped must have had initial commit");
-                return;
-            };
+        let toplevel = mapped.toplevel().clone();
+        let entry = refreshes
+            .entry(toplevel.wl_surface().clone())
+            .or_insert_with(|| RefreshEntry {
+                toplevel: toplevel.clone(),
+                identifier: mapped.source_id(),
+                output: output.cloned(),
+                has_focus: false,
+                has_source: !mapped.is_mirror(),
+            });
 
-            if state.niri.keyboard_focus.surface() == Some(wl_surface) {
-                focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
-            } else {
-                refresh_toplevel(
-                    protocol_state,
-                    wl_surface,
-                    mapped.id(),
-                    role,
-                    cur,
-                    output,
-                    false,
-                );
-            }
-        });
+        if !mapped.is_mirror() {
+            entry.identifier = mapped.source_id();
+            entry.output = output.cloned();
+            entry.has_source = true;
+        } else if !entry.has_source && entry.output.is_none() {
+            entry.output = output.cloned();
+        }
+
+        if state.niri.keyboard_focus.layout_id() == Some(mapped.id()) {
+            entry.has_focus = true;
+        }
     });
 
-    // Finally, refresh the focused window.
-    if let Some((identifier, window, output)) = focused {
-        let toplevel = window.toplevel().expect("no X11 support");
-        let wl_surface = toplevel.wl_surface();
-        with_toplevel_role_and_current(toplevel, |role, cur| {
+    let mut refresh_entry = |entry: RefreshEntry| {
+        with_toplevel_role_and_current(&entry.toplevel, |role, cur| {
             let Some(cur) = cur else {
                 error!("mapped must have had initial commit");
                 return;
@@ -154,14 +161,29 @@ pub fn refresh(state: &mut State) {
 
             refresh_toplevel(
                 protocol_state,
-                wl_surface,
-                identifier,
+                entry.toplevel.wl_surface(),
+                entry.identifier,
                 role,
                 cur,
-                output.as_ref(),
-                true,
+                entry.output.as_ref(),
+                entry.has_focus,
             );
         });
+    };
+
+    // Save the focused window for last, this way when the focus changes, we will first deactivate
+    // the previous window and only then activate the newly focused window.
+    let mut focused = None;
+    for (_, entry) in refreshes {
+        if entry.has_focus {
+            focused = Some(entry);
+        } else {
+            refresh_entry(entry);
+        }
+    }
+
+    if let Some(entry) = focused {
+        refresh_entry(entry);
     }
 }
 

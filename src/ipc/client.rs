@@ -793,7 +793,11 @@ fn print_output(output: Output) -> anyhow::Result<()> {
 fn print_window(window: &Window) {
     let focused = if window.is_focused { " (focused)" } else { "" };
     let urgent = if window.is_urgent { " (urgent)" } else { "" };
-    println!("Window ID {}:{focused}{urgent}", window.id);
+    let mirror = if window.is_mirror { " (mirror)" } else { "" };
+    println!("Window ID {}:{focused}{urgent}{mirror}", window.id);
+    if let Some(source_id) = window.source_window_id {
+        println!("  Source window ID: {source_id}");
+    }
 
     if let Some(title) = &window.title {
         println!("  Title: \"{title}\"");

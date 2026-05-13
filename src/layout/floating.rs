@@ -1184,6 +1184,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let original_window_size = resize.original_window_size;
         let edges = resize.data.edges;
+        let idx = self.idx_of(window).unwrap();
+        let prev_size = self.data[idx].size;
+        let prev_window_size = self.tiles[idx].window().size();
 
         if edges.intersects(ResizeEdge::LEFT_RIGHT) {
             let mut dx = delta.x;
@@ -1203,6 +1206,24 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
             let window_height = (original_window_size.h + dy).round() as i32;
             self.set_window_height(Some(window), SizeChange::SetFixed(window_height), false);
+        }
+
+        // Mirrors apply size updates synchronously and never commit, so mirror the update_window()
+        // path now to keep geometry and edge-anchored resizing correct.
+        if self.tiles[idx].window().size() != prev_window_size {
+            let tile = &mut self.tiles[idx];
+            let data = &mut self.data[idx];
+            tile.update_window();
+            data.update(tile);
+
+            let mut offset = Point::from((0., 0.));
+            if edges.contains(ResizeEdge::LEFT) {
+                offset.x += prev_size.w - data.size.w;
+            }
+            if edges.contains(ResizeEdge::TOP) {
+                offset.y += prev_size.h - data.size.h;
+            }
+            data.set_logical_pos(data.logical_pos + offset);
         }
 
         true

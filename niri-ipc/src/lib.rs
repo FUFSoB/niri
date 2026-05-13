@@ -302,6 +302,18 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Create a mirror of a window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Create a mirror of the focused window")
+    )]
+    CreateWindowMirror {
+        /// Id of the window to mirror.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Toggle fullscreen on a window.
     #[cfg_attr(
         feature = "clap",
@@ -1380,6 +1392,12 @@ pub struct Window {
     /// an implementation detail subject to change. For example, ids may change to be randomly
     /// generated for each new window.
     pub id: u64,
+    /// Whether this entry is a mirror of another window.
+    pub is_mirror: bool,
+    /// Source window id for mirrors.
+    ///
+    /// This is `None` for real windows.
+    pub source_window_id: Option<u64>,
     /// Title, if set.
     pub title: Option<String>,
     /// Application ID, if set.

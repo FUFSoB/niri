@@ -987,6 +987,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    fn animate_relocated_tile_from(
+        tile: &mut Tile<W>,
+        prev_window_size: Size<i32, Logical>,
+        offset: Point<f64, Logical>,
+    ) {
+        // Mirrors apply size requests immediately, unlike regular Wayland clients. If we keep the
+        // cross-column move animation in that case, the destination column snaps to its new height
+        // distribution first and leaves a visible gap until the moved tile finishes travelling.
+        if tile.window().size() == prev_window_size {
+            tile.animate_move_from(offset);
+        }
+    }
+
     pub fn add_tile_right_of(
         &mut self,
         right_of: &W::Id,
@@ -1897,6 +1910,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Transaction::new(),
                 Some(self.options.animations.window_movement.0),
             );
+            let prev_window_size = tile.window().size();
             self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
 
             let target_column = &mut self.columns[target_column_idx];
@@ -1904,13 +1918,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
 
             let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
+            Self::animate_relocated_tile_from(new_tile, prev_window_size, offset);
         } else {
             // Move out of column.
             let mut offset = Point::from((source_column.render_offset().x, 0.));
 
             let removed =
                 self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+            let prev_window_size = removed.tile.window().size();
 
             // We're inserting into the source column position.
             let target_column_idx = source_col_idx;
@@ -1936,7 +1951,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
             let new_col = &mut self.columns[target_column_idx];
             offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
+            Self::animate_relocated_tile_from(&mut new_col.tiles[0], prev_window_size, offset);
         }
     }
 
@@ -1993,19 +2008,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Transaction::new(),
                 Some(self.options.animations.window_movement.0),
             );
+            let prev_window_size = tile.window().size();
             self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
 
             let target_column = &mut self.columns[target_column_idx];
             offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
 
             let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
+            Self::animate_relocated_tile_from(new_tile, prev_window_size, offset);
         } else {
             // Move out of column.
             let prev_width = self.data[source_col_idx].width;
 
             let removed =
                 self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+            let prev_window_size = removed.tile.window().size();
 
             let target_column_idx = source_col_idx + 1;
 
@@ -2028,7 +2045,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
             let new_col = &mut self.columns[target_column_idx];
             offset += prev_off - new_col.tile_offset(0);
-            new_col.tiles[0].animate_move_from(offset);
+            Self::animate_relocated_tile_from(&mut new_col.tiles[0], prev_window_size, offset);
         }
     }
 
@@ -2051,6 +2068,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let prev_off = self.columns[source_column_idx].tile_offset(0);
 
         let removed = self.remove_tile_by_idx(source_column_idx, 0, Transaction::new(), None);
+        let prev_window_size = removed.tile.window().size();
         self.add_tile_to_column(target_column_idx, None, removed.tile, false);
 
         let target_column = &mut self.columns[target_column_idx];
@@ -2058,7 +2076,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         offset.x -= target_column.render_offset().x;
 
         let new_tile = target_column.tiles.last_mut().unwrap();
-        new_tile.animate_move_from(offset);
+        Self::animate_relocated_tile_from(new_tile, prev_window_size, offset);
     }
 
     pub fn expel_from_column(&mut self) {
@@ -2082,6 +2100,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let removed =
             self.remove_tile_by_idx(source_col_idx, source_tile_idx, Transaction::new(), None);
+        let prev_window_size = removed.tile.window().size();
 
         self.add_tile(
             Some(target_col_idx),
@@ -2096,7 +2115,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let new_col = &mut self.columns[target_col_idx];
         offset += prev_off - new_col.tile_offset(0);
-        new_col.tiles[0].animate_move_from(offset);
+        Self::animate_relocated_tile_from(&mut new_col.tiles[0], prev_window_size, offset);
     }
 
     pub fn swap_window_in_direction(&mut self, direction: ScrollDirection) {
@@ -3125,11 +3144,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col = &mut self.columns[col_idx];
         }
 
+        let tile_idx = col
+            .tiles
+            .iter()
+            .position(|tile| tile.window().id() == window)
+            .unwrap();
+        let prev_window_size = col.tiles[tile_idx].window().size();
         col.set_fullscreen(is_fullscreen);
+        let sync_resize_applied = col.tiles[tile_idx].window().size() != prev_window_size;
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
         self.restore_manual_view_pos_if_needed(manual_view_pos);
+        if sync_resize_applied && manual_view_pos.is_none() {
+            self.animate_view_offset_to_column(None, col_idx, None);
+        }
 
         true
     }
@@ -3158,11 +3187,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col = &mut self.columns[col_idx];
         }
 
+        let tile_idx = col
+            .tiles
+            .iter()
+            .position(|tile| tile.window().id() == window)
+            .unwrap();
+        let prev_window_size = col.tiles[tile_idx].window().size();
         col.set_maximized(maximize);
+        let sync_resize_applied = col.tiles[tile_idx].window().size() != prev_window_size;
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
         self.restore_manual_view_pos_if_needed(manual_view_pos);
+        if sync_resize_applied && manual_view_pos.is_none() {
+            self.animate_view_offset_to_column(None, col_idx, None);
+        }
 
         true
     }
@@ -3968,12 +4007,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
+        let original_window_size = resize.original_window_size;
+        let edges = resize.data.edges;
         let is_centering = self.is_centering_focused_column();
 
-        let col = self
+        let (col_idx, col) = self
             .columns
             .iter_mut()
-            .find(|col| col.contains(window))
+            .enumerate()
+            .find(|(_, col)| col.contains(window))
             .unwrap();
 
         let tile_idx = col
@@ -3981,10 +4023,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .iter()
             .position(|tile| tile.window().id() == window)
             .unwrap();
+        let prev_col_width = self.data[col_idx].width;
+        let prev_window_size = col.tiles[tile_idx].window().size();
 
-        if resize.data.edges.intersects(ResizeEdge::LEFT_RIGHT) {
+        if edges.intersects(ResizeEdge::LEFT_RIGHT) {
             let mut dx = delta.x;
-            if resize.data.edges.contains(ResizeEdge::LEFT) {
+            if edges.contains(ResizeEdge::LEFT) {
                 dx = -dx;
             };
 
@@ -3992,24 +4036,51 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 dx *= 2.;
             }
 
-            let window_width = (resize.original_window_size.w + dx).round() as i32;
+            let window_width = (original_window_size.w + dx).round() as i32;
             col.set_column_width(SizeChange::SetFixed(window_width), Some(tile_idx), false);
         }
 
-        if resize.data.edges.intersects(ResizeEdge::TOP_BOTTOM) {
+        if edges.intersects(ResizeEdge::TOP_BOTTOM) {
             // Prevent the simplest case of weird resizing (top edge when this is the topmost
             // window).
-            if !(resize.data.edges.contains(ResizeEdge::TOP) && tile_idx == 0) {
+            if !(edges.contains(ResizeEdge::TOP) && tile_idx == 0) {
                 let mut dy = delta.y;
-                if resize.data.edges.contains(ResizeEdge::TOP) {
+                if edges.contains(ResizeEdge::TOP) {
                     dy = -dy;
                 };
 
                 // FIXME: some smarter height distribution would be nice here so that vertical
                 // resizes work as expected in more cases.
 
-                let window_height = (resize.original_window_size.h + dy).round() as i32;
+                let window_height = (original_window_size.h + dy).round() as i32;
                 col.set_window_height(SizeChange::SetFixed(window_height), Some(tile_idx), false);
+            }
+        }
+
+        // Mirrors apply size updates synchronously and never commit, so keep both column caches and
+        // the active-column anchor behavior in sync right here.
+        let sync_resize_applied = col.tiles[tile_idx].window().size() != prev_window_size;
+        if sync_resize_applied {
+            self.data[col_idx].update(col);
+
+            if edges.intersects(ResizeEdge::LEFT_RIGHT) && col_idx == self.active_column_idx {
+                let offset = prev_col_width - self.data[col_idx].width;
+                if offset != 0. && !self.is_manual_view_active() {
+                    let view_delta = if is_centering {
+                        let width = self.data[col_idx].width;
+                        let new_offset =
+                            -(self.working_area.size.w - width) / 2. - self.working_area.loc.x;
+                        new_offset - self.view_offset.target()
+                    } else if edges.contains(ResizeEdge::LEFT) {
+                        -offset
+                    } else {
+                        0.
+                    };
+
+                    if view_delta != 0. {
+                        self.view_offset.offset(view_delta);
+                    }
+                }
             }
         }
 
@@ -4840,6 +4911,13 @@ impl<W: LayoutElement> Column<W> {
                     tile.request_maximized(self.parent_area.size, animate, transaction);
                 }
             }
+
+            // Some layout elements, such as window mirrors, apply size requests synchronously.
+            // Refresh cached sizes so placement for fullscreen/maximized columns uses current
+            // geometry immediately.
+            for (data, tile) in zip(&mut self.data, &self.tiles) {
+                data.update(tile);
+            }
             return;
         }
 
@@ -5113,6 +5191,13 @@ impl<W: LayoutElement> Column<W> {
             };
 
             tile.request_tile_size(size, animate, transaction);
+        }
+
+        // Some layout elements, such as window mirrors, apply size requests synchronously. Refresh
+        // the cached tile sizes so placement uses the new geometry immediately instead of waiting
+        // for a later window update path that may never run for those elements.
+        for (data, tile) in zip(&mut self.data, &self.tiles) {
+            data.update(tile);
         }
     }
 

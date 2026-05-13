@@ -1,20 +1,20 @@
-use smithay::desktop::Window;
 use smithay::input::touch::{
     DownEvent, GrabStartData as TouchGrabStartData, MotionEvent, OrientationEvent, ShapeEvent,
     TouchGrab, TouchInnerHandle, UpEvent,
 };
 use smithay::input::SeatHandler;
-use smithay::utils::{IsAlive, Logical, Point, Serial};
+use smithay::utils::{Logical, Point, Serial};
 
 use crate::niri::State;
+use crate::window::mapped::MappedId;
 
 pub struct TouchResizeGrab {
     start_data: TouchGrabStartData<State>,
-    window: Window,
+    window: MappedId,
 }
 
 impl TouchResizeGrab {
-    pub fn new(start_data: TouchGrabStartData<State>, window: Window) -> Self {
+    pub fn new(start_data: TouchGrabStartData<State>, window: MappedId) -> Self {
         Self { start_data, window }
     }
 
@@ -65,7 +65,7 @@ impl TouchGrab<State> for TouchResizeGrab {
             return;
         }
 
-        if self.window.alive() {
+        if data.niri.layout.has_window(&self.window) {
             let delta = event.location - self.start_data.location;
             let ongoing = data
                 .niri

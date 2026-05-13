@@ -47,7 +47,7 @@ use crate::utils::transaction::Transaction;
 use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
 };
-use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -128,18 +128,18 @@ impl XdgShellHandler for State {
             return;
         };
 
-        let window = mapped.window.clone();
+        let window = mapped.id();
         let output = output.clone();
 
         match &start_data {
             PointerOrTouchStartData::Pointer(_) => {
-                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                if let Some(grab) = MoveGrab::new(self, start_data, window, true, None) {
                     pointer.set_grab(self, grab, serial, Focus::Clear);
                 }
             }
             PointerOrTouchStartData::Touch(_) => {
                 let touch = self.niri.seat.get_touch().unwrap();
-                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                if let Some(grab) = MoveGrab::new(self, start_data, window, true, None) {
                     touch.set_grab(self, grab, serial);
                 }
             }
@@ -193,7 +193,7 @@ impl XdgShellHandler for State {
         };
 
         let edges = ResizeEdge::from(edges);
-        let window = mapped.window.clone();
+        let window = mapped.id();
 
         // See if we got a double resize-click gesture.
         let time = get_monotonic_time();
@@ -230,11 +230,7 @@ impl XdgShellHandler for State {
             }
         }
 
-        if !self
-            .niri
-            .layout
-            .interactive_resize_begin(window.clone(), edges)
-        {
+        if !self.niri.layout.interactive_resize_begin(window, edges) {
             return;
         }
 
@@ -416,7 +412,7 @@ impl XdgShellHandler for State {
             // changes.
             mapped.set_needs_configure();
 
-            let window = mapped.window.clone();
+            let window = mapped.id();
             self.niri.layout.set_maximized(&window, true);
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
@@ -498,7 +494,7 @@ impl XdgShellHandler for State {
             // changes.
             mapped.set_needs_configure();
 
-            let window = mapped.window.clone();
+            let window = mapped.id();
             self.niri.layout.set_maximized(&window, false);
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
@@ -624,7 +620,7 @@ impl XdgShellHandler for State {
             // changes.
             mapped.set_needs_configure();
 
-            let window = mapped.window.clone();
+            let window = mapped.id();
 
             if let Some(requested_output) = requested_output {
                 if Some(&requested_output) != current_output {
@@ -710,7 +706,7 @@ impl XdgShellHandler for State {
             // changes.
             mapped.set_needs_configure();
 
-            let window = mapped.window.clone();
+            let window = mapped.id();
             self.niri.layout.set_fullscreen(&window, false);
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
@@ -835,34 +831,42 @@ impl XdgShellHandler for State {
             .layout
             .find_window_and_output(surface.wl_surface());
 
-        let Some((mapped, output)) = win_out else {
+        let Some((mapped, _output)) = win_out else {
             // I have no idea how this can happen, but I saw it happen once, in a weird interaction
             // involving laptop going to sleep and resuming.
             error!("toplevel missing from both unmapped_windows and layout");
             return;
         };
-        let window = mapped.window.clone();
-        let output = output.cloned();
 
         let id = mapped.id();
-        self.niri
-            .stop_casts_for_target(CastTarget::Window { id: id.get() });
-
-        self.store_unmap_snapshot(&window, output.as_ref());
+        let instances = self.niri.mapped_instances_for_source(id);
+        let outputs = self.niri.outputs_for_source(id);
+        for (id, _) in &instances {
+            self.niri
+                .stop_casts_for_target(CastTarget::Window { id: id.get() });
+        }
 
         let transaction = Transaction::new();
-        let blocker = transaction.blocker();
+        for (id, output) in &instances {
+            self.store_unmap_snapshot(id, output.as_ref());
+        }
         self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
+            for (id, _) in &instances {
+                self.niri.layout.start_close_animation_for_window(
+                    renderer,
+                    id,
+                    transaction.blocker(),
+                );
+            }
         });
 
-        let active_window = self.niri.layout.focus().map(|m| &m.window);
-        let was_active = active_window == Some(&window);
+        let active_window = self.niri.layout.focus().map(Mapped::source_id);
+        let was_active = active_window == Some(id);
 
-        self.niri.window_mru_ui.remove_window(id);
-        self.niri.layout.remove_window(&window, transaction.clone());
+        for (id, _) in instances {
+            self.niri.window_mru_ui.remove_window(id);
+            self.niri.layout.remove_window(&id, transaction.clone());
+        }
 
         let surface = surface.wl_surface();
         // This check is necessary because implicit resource destruction is done with
@@ -883,10 +887,10 @@ impl XdgShellHandler for State {
             self.maybe_warp_cursor_to_focus();
         }
 
-        if let Some(output) = output {
+        for output in outputs {
             self.niri.queue_redraw(&output);
-            self.niri.queue_redraw_mru_output();
         }
+        self.niri.queue_redraw_mru_output();
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
@@ -910,7 +914,7 @@ impl XdgShellHandler for State {
 
         if let Some((mapped, output)) = self.niri.layout.find_window_and_output_mut(&parent) {
             let output = output.cloned();
-            let window = mapped.window.clone();
+            let window = mapped.id();
             if self.niri.layout.descendants_added(&window) {
                 if let Some(output) = output {
                     self.niri.queue_redraw(&output);
@@ -1257,7 +1261,10 @@ impl State {
     fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window) {
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
-        let mut target = self.niri.layout.popup_target_rect(window);
+        let Some(window) = self.niri.find_mapped_id_by_window(window) else {
+            return;
+        };
+        let mut target = self.niri.layout.popup_target_rect(&window);
         target.loc -= get_popup_toplevel_coords(popup).to_f64();
 
         self.position_popup_within_rect(popup, target, true);
@@ -1388,7 +1395,7 @@ impl State {
             if mapped.recompute_window_rules(window_rules, self.niri.is_at_startup) {
                 drop(config);
                 let output = output.cloned();
-                let window = mapped.window.clone();
+                let window = mapped.id();
                 self.niri.layout.update_window(&window, None);
 
                 if let Some(output) = output {
@@ -1446,119 +1453,127 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         let span =
             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
 
-        let Some((mapped, output)) = state.niri.layout.find_window_and_output_mut(surface) else {
-            error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
-            return;
-        };
-
-        let (got_unmapped, dmabuf, commit_serial) = with_states(surface, |states| {
-            let (got_unmapped, dmabuf) = {
-                let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                match guard.pending().buffer.as_ref() {
-                    Some(BufferAssignment::NewBuffer(buffer)) => {
-                        let dmabuf = get_dmabuf(buffer).cloned().ok();
-                        (false, dmabuf)
-                    }
-                    Some(BufferAssignment::Removed) => (true, None),
-                    None => (false, None),
-                }
+        let (window, got_unmapped) = {
+            let Some((mapped, _output)) = state.niri.layout.find_window_and_output_mut(surface)
+            else {
+                error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
+                return;
             };
 
-            let role = states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-            let serial = role.last_acked.as_ref().map(|c| c.serial);
-
-            (got_unmapped, dmabuf, serial)
-        });
-
-        let mut transaction_for_dmabuf = None;
-        let mut animate = false;
-        if let Some(serial) = commit_serial {
-            if !span.is_disabled() {
-                span.record("serial", format!("{serial:?}"));
-            }
-
-            // trace!("taking pending transaction");
-            if let Some(transaction) = mapped.take_pending_transaction(serial) {
-                // Transaction can be already completed if it ran past the deadline.
-                let disable = state.niri.config.borrow().debug.disable_transactions;
-                if !transaction.is_completed() && !disable {
-                    // Register the deadline even if this is the last pending, since dmabuf
-                    // rendering can still run over the deadline.
-                    transaction.register_deadline_timer(&state.niri.event_loop);
-
-                    let is_last = transaction.is_last();
-
-                    // If this is the last transaction, we don't need to add a separate
-                    // notification, because the transaction will complete in our dmabuf blocker
-                    // callback, which already calls blocker_cleared(), or by the end of this
-                    // function, in which case there would be no blocker in the first place.
-                    if !is_last {
-                        // Waiting for some other surface; register a notification and add a
-                        // transaction blocker.
-                        if let Some(client) = surface.client() {
-                            transaction.add_notification(
-                                state.niri.blocker_cleared_tx.clone(),
-                                client.clone(),
-                            );
-                            add_blocker(surface, transaction.blocker());
+            let (got_unmapped, dmabuf, commit_serial) = with_states(surface, |states| {
+                let (got_unmapped, dmabuf) = {
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    match guard.pending().buffer.as_ref() {
+                        Some(BufferAssignment::NewBuffer(buffer)) => {
+                            let dmabuf = get_dmabuf(buffer).cloned().ok();
+                            (false, dmabuf)
                         }
+                        Some(BufferAssignment::Removed) => (true, None),
+                        None => (false, None),
                     }
+                };
 
-                    // Delay dropping (and completing) the transaction until the dmabuf is ready.
-                    // If there's no dmabuf, this will be dropped by the end of this pre-commit
-                    // hook.
-                    transaction_for_dmabuf = Some(transaction);
+                let role = states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap();
+                let serial = role.last_acked.as_ref().map(|c| c.serial);
+
+                (got_unmapped, dmabuf, serial)
+            });
+
+            let mut transaction_for_dmabuf = None;
+            let mut animate = false;
+            if let Some(serial) = commit_serial {
+                if !span.is_disabled() {
+                    span.record("serial", format!("{serial:?}"));
+                }
+
+                // trace!("taking pending transaction");
+                if let Some(transaction) = mapped.take_pending_transaction(serial) {
+                    // Transaction can be already completed if it ran past the deadline.
+                    let disable = state.niri.config.borrow().debug.disable_transactions;
+                    if !transaction.is_completed() && !disable {
+                        // Register the deadline even if this is the last pending, since dmabuf
+                        // rendering can still run over the deadline.
+                        transaction.register_deadline_timer(&state.niri.event_loop);
+
+                        let is_last = transaction.is_last();
+
+                        // If this is the last transaction, we don't need to add a separate
+                        // notification, because the transaction will complete in our dmabuf blocker
+                        // callback, which already calls blocker_cleared(), or by the end of this
+                        // function, in which case there would be no blocker in the first place.
+                        if !is_last {
+                            // Waiting for some other surface; register a notification and add a
+                            // transaction blocker.
+                            if let Some(client) = surface.client() {
+                                transaction.add_notification(
+                                    state.niri.blocker_cleared_tx.clone(),
+                                    client.clone(),
+                                );
+                                add_blocker(surface, transaction.blocker());
+                            }
+                        }
+
+                        // Delay dropping (and completing) the transaction until the dmabuf is
+                        // ready. If there's no dmabuf, this will be dropped by the end of this
+                        // pre-commit hook.
+                        transaction_for_dmabuf = Some(transaction);
+                    }
+                }
+
+                animate = mapped.should_animate_commit(serial);
+            } else if !got_unmapped {
+                error!("commit on a mapped surface without a configured serial");
+            };
+
+            if let Some((blocker, source)) =
+                dmabuf.and_then(|dmabuf| dmabuf.generate_blocker(Interest::READ).ok())
+            {
+                if let Some(client) = surface.client() {
+                    let res = state
+                        .niri
+                        .event_loop
+                        .insert_source(source, move |_, _, state| {
+                            // This surface is now ready for the transaction.
+                            drop(transaction_for_dmabuf.take());
+
+                            let display_handle = state.niri.display_handle.clone();
+                            state
+                                .client_compositor_state(&client)
+                                .blocker_cleared(state, &display_handle);
+
+                            Ok(())
+                        });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
+                        trace!("added dmabuf blocker");
+                    }
                 }
             }
 
-            animate = mapped.should_animate_commit(serial);
-        } else if !got_unmapped {
-            error!("commit on a mapped surface without a configured serial");
-        };
-
-        if let Some((blocker, source)) =
-            dmabuf.and_then(|dmabuf| dmabuf.generate_blocker(Interest::READ).ok())
-        {
-            if let Some(client) = surface.client() {
-                let res = state
-                    .niri
-                    .event_loop
-                    .insert_source(source, move |_, _, state| {
-                        // This surface is now ready for the transaction.
-                        drop(transaction_for_dmabuf.take());
-
-                        let display_handle = state.niri.display_handle.clone();
-                        state
-                            .client_compositor_state(&client)
-                            .blocker_cleared(state, &display_handle);
-
-                        Ok(())
-                    });
-                if res.is_ok() {
-                    add_blocker(surface, blocker);
-                    trace!("added dmabuf blocker");
-                }
-            }
-        }
-
-        let window = mapped.window.clone();
-        if got_unmapped {
-            let output = output.cloned();
-            state.store_unmap_snapshot(&window, output.as_ref());
-        } else {
-            if animate {
+            if animate && !got_unmapped {
                 state.backend.with_primary_renderer(|renderer| {
                     mapped.store_animation_snapshot(renderer);
                 });
             }
 
+            (mapped.id(), got_unmapped)
+        };
+
+        let instances = state.niri.mapped_instances_for_source(window);
+        if got_unmapped {
+            for (id, output) in &instances {
+                state.store_unmap_snapshot(id, output.as_ref());
+            }
+        } else {
             // The toplevel remains mapped; clear any stored unmap snapshot.
-            state.niri.layout.clear_unmap_snapshot(&window);
+            for (id, _) in instances {
+                state.niri.layout.clear_unmap_snapshot(&id);
+            }
         }
     })
 }

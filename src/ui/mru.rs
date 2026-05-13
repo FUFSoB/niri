@@ -29,11 +29,14 @@ use crate::layout::{Layout, LayoutElement as _, LayoutElementRenderElement};
 use crate::niri::Niri;
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
+use crate::render_helpers::clipped_surface::{
+    ClippedSurfaceRenderElement, NamespacedClippedSurfaceRenderElement,
+};
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderCtx;
@@ -111,6 +114,8 @@ niri_render_elements! {
     ThumbnailRenderElement<R> => {
         LayoutElement = LayoutElementRenderElement<R>,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
+        NamespacedClippedSurface = NamespacedClippedSurfaceRenderElement<R>,
+        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
         Border = BorderRenderElement,
     }
 }
@@ -393,6 +398,40 @@ impl Thumbnail {
                 let elem = LayoutElementRenderElement::Wayland(elem);
                 ThumbnailRenderElement::LayoutElement(elem)
             }
+            LayoutElementRenderElement::NamespacedWayland(elem) => {
+                if let Some(shader) = clip_shader.clone() {
+                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
+                        let elem = NamespacedClippedSurfaceRenderElement::new(
+                            elem,
+                            s,
+                            geo,
+                            shader.clone(),
+                            radius,
+                        );
+                        return ThumbnailRenderElement::NamespacedClippedSurface(elem);
+                    }
+                }
+
+                let elem = LayoutElementRenderElement::NamespacedWayland(elem);
+                ThumbnailRenderElement::LayoutElement(elem)
+            }
+            LayoutElementRenderElement::MirrorScaledWayland(elem) => {
+                if let Some(shader) = clip_shader.clone() {
+                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
+                        return ClippedSurfaceRenderElement::new(
+                            elem,
+                            s,
+                            geo,
+                            shader.clone(),
+                            radius,
+                        )
+                        .into();
+                    }
+                }
+
+                let elem = LayoutElementRenderElement::MirrorScaledWayland(elem);
+                ThumbnailRenderElement::LayoutElement(elem)
+            }
             LayoutElementRenderElement::SolidColor(elem) => {
                 // In this branch we're rendering a blocked-out window with a solid
                 // color. We need to render it with a rounded corner shader even if
@@ -598,7 +637,7 @@ impl WindowMru {
             let Some(mon) = mon else {
                 continue;
             };
-            if !niri.layout.is_sticky_window(&mapped.window) {
+            if !niri.layout.is_sticky_window(&mapped.id()) {
                 continue;
             }
 

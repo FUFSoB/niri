@@ -20,11 +20,14 @@ use crate::layout::SizingMode;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
+use crate::render_helpers::clipped_surface::{
+    ClippedSurfaceRenderElement, NamespacedClippedSurfaceRenderElement, RoundedCornerDamage,
+};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
+use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -133,6 +136,8 @@ niri_render_elements! {
         Border = BorderRenderElement,
         Shadow = ShadowRenderElement,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
+        NamespacedClippedSurface = NamespacedClippedSurfaceRenderElement<R>,
+        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
@@ -1194,6 +1199,42 @@ impl<W: LayoutElement> Tile<W> {
 
                     // Otherwise, render it normally.
                     LayoutElementRenderElement::Wayland(elem).into()
+                }
+                LayoutElementRenderElement::NamespacedWayland(elem) => {
+                    if clip_to_geometry {
+                        if let Some(shader) = clip_shader.clone() {
+                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                                return NamespacedClippedSurfaceRenderElement::new(
+                                    elem,
+                                    scale,
+                                    geo,
+                                    shader.clone(),
+                                    radius,
+                                )
+                                .into();
+                            }
+                        }
+                    }
+
+                    LayoutElementRenderElement::NamespacedWayland(elem).into()
+                }
+                LayoutElementRenderElement::MirrorScaledWayland(elem) => {
+                    if clip_to_geometry {
+                        if let Some(shader) = clip_shader.clone() {
+                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                                return ClippedSurfaceRenderElement::new(
+                                    elem,
+                                    scale,
+                                    geo,
+                                    shader.clone(),
+                                    radius,
+                                )
+                                .into();
+                            }
+                        }
+                    }
+
+                    LayoutElementRenderElement::MirrorScaledWayland(elem).into()
                 }
                 LayoutElementRenderElement::SolidColor(elem) => {
                     // In this branch we're rendering a blocked-out window with a solid

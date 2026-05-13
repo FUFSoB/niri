@@ -567,6 +567,8 @@ fn make_ipc_window(
 ) -> niri_ipc::Window {
     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
         id: mapped.id().get(),
+        is_mirror: mapped.is_mirror(),
+        source_window_id: mapped.is_mirror().then(|| mapped.source_id().get()),
         title: role.title.clone(),
         app_id: role.app_id.clone(),
         pid: mapped.credentials().map(|c| c.pid),

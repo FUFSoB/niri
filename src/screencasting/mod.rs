@@ -10,14 +10,14 @@ use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{Physical, Point, Scale, Size};
+use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::layout::workspace::WorkspaceId;
+use crate::layout::LayoutElement as _;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -36,7 +36,7 @@ pub struct Screencasting {
     pub pw_to_niri: calloop::channel::Sender<PwToNiri>,
 
     /// Screencast output for each mapped window.
-    pub mapped_cast_output: HashMap<Window, Output>,
+    pub mapped_cast_output: HashMap<MappedId, Output>,
 
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     pub dynamic_cast_id_for_portal: MappedId,
@@ -214,15 +214,19 @@ impl State {
 
             // Use the cached output since it will be present even if the output was
             // currently disconnected.
-            let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) else {
+            let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.id()) else {
                 break;
             };
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let bbox = mapped
-                .window
-                .bbox_with_popups()
-                .to_physical_precise_up(scale);
+            let bbox = if mapped.is_mirror() {
+                Rectangle::from_size(mapped.size()).to_physical_precise_up(scale)
+            } else {
+                mapped
+                    .window
+                    .bbox_with_popups()
+                    .to_physical_precise_up(scale)
+            };
 
             match cast.ensure_size(bbox.size) {
                 Ok(CastSizeChange::Ready) => (),
@@ -246,7 +250,11 @@ impl State {
                         // - win_pos is the position of the main window surface in output-local
                         //   coordinates
                         // - bbox.loc moves us relative to the screencast buffer
-                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                        let buf_pos = if mapped.is_mirror() {
+                            win_pos - mapped.buf_loc().to_f64()
+                        } else {
+                            win_pos + bbox.loc.to_f64().to_logical(scale)
+                        };
                         let output_pos =
                             self.niri.global_space.output_geometry(output).unwrap().loc;
                         pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
@@ -313,7 +321,7 @@ impl State {
             CastTarget::Window { id } => {
                 let mut windows = self.niri.layout.windows();
                 if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
-                    if let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) {
+                    if let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.id()) {
                         refresh = Some(output.current_mode().unwrap().refresh as u32);
                     }
                 }
@@ -556,13 +564,13 @@ impl Niri {
         let mut output_changed = vec![];
 
         self.layout.with_windows(|mapped, output, _, _| {
-            seen.insert(mapped.window.clone());
+            seen.insert(mapped.id());
 
             let Some(output) = output else {
                 return;
             };
 
-            match self.casting.mapped_cast_output.entry(mapped.window.clone()) {
+            match self.casting.mapped_cast_output.entry(mapped.id()) {
                 Entry::Occupied(mut entry) => {
                     if entry.get() != output {
                         entry.insert(output.clone());
@@ -577,7 +585,7 @@ impl Niri {
 
         self.casting
             .mapped_cast_output
-            .retain(|win, _| seen.contains(win));
+            .retain(|id, _| seen.contains(id));
 
         let mut to_stop = vec![];
         for (id, out) in output_changed {
@@ -995,14 +1003,21 @@ impl Niri {
             .layout
             .windows()
             .find(|(_, m)| m.id().get() == window_id)?;
-        let output = self.casting.mapped_cast_output.get(&mapped.window)?;
+        let output = self.casting.mapped_cast_output.get(&mapped.id())?;
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let bbox = mapped
-            .window
-            .bbox_with_popups()
-            .to_physical_precise_up(scale);
+        let size = if mapped.is_mirror() {
+            Rectangle::from_size(mapped.size())
+                .to_physical_precise_up(scale)
+                .size
+        } else {
+            mapped
+                .window
+                .bbox_with_popups()
+                .to_physical_precise_up(scale)
+                .size
+        };
         let refresh = output.current_mode().unwrap().refresh as u32;
-        Some((bbox.size, refresh))
+        Some((size, refresh))
     }
 
     fn cast_params_for_workspace(

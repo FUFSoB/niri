@@ -22,7 +22,7 @@ use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
+    AxisFrame, ButtonEvent, ClickGrab, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
     GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
     GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab, RelativeMotionEvent,
@@ -40,6 +40,7 @@ use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerCons
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
+use self::mirror_click_grab::MirrorClickGrab;
 use self::move_grab::MoveGrab;
 use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
@@ -48,14 +49,17 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
+use crate::utils::transaction::Transaction;
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::window::Mapped;
 
 pub mod backend_ext;
+pub mod mirror_click_grab;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
@@ -113,6 +117,36 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 }
 
 impl State {
+    fn create_window_mirror(&mut self, id: Option<u64>) {
+        let window = match id {
+            Some(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id().get() == id)
+                .map(|(_, mapped)| (mapped.id(), Mapped::new_mirror(mapped))),
+            None => self
+                .niri
+                .layout
+                .focus()
+                .map(|mapped| (mapped.id(), Mapped::new_mirror(mapped))),
+        };
+
+        if let Some((source_id, mirror)) = window {
+            self.niri.layout.add_window(
+                mirror,
+                AddWindowTarget::NextTo(&source_id),
+                None,
+                None,
+                false,
+                false,
+                false,
+                ActivateWindow::Smart,
+            );
+            self.niri.queue_redraw_all();
+        }
+    }
+
     fn active_zoom_output(&self, requested_output: Option<&str>) -> Option<Output> {
         let output = match requested_output {
             Some(name) => self.niri.output_by_name_match(name).cloned(),
@@ -842,18 +876,54 @@ impl State {
                 }
             }
             Action::CloseWindow => {
-                if let Some(mapped) = self.niri.layout.focus() {
-                    mapped.toplevel().send_close();
+                let focus = self
+                    .niri
+                    .layout
+                    .focus()
+                    .map(|mapped| (mapped.id(), mapped.is_mirror()));
+                if let Some((id, true)) = focus {
+                    self.niri
+                        .stop_casts_for_target(CastTarget::Window { id: id.get() });
+                    self.niri.window_mru_ui.remove_window(id);
+                    self.niri.layout.remove_window(&id, Transaction::new());
+                    self.niri.queue_redraw_all();
+                } else if let Some((id, false)) = focus {
+                    if let Some((_, mapped)) =
+                        self.niri.layout.windows().find(|(_, m)| m.id() == id)
+                    {
+                        mapped.toplevel().send_close();
+                    }
                 }
             }
             Action::CloseWindowById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                if let Some((_, mapped)) = window {
-                    mapped.toplevel().send_close();
+                let window = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id)
+                    .map(|(_, mapped)| (mapped.id(), mapped.is_mirror()));
+                if let Some((id, true)) = window {
+                    self.niri
+                        .stop_casts_for_target(CastTarget::Window { id: id.get() });
+                    self.niri.window_mru_ui.remove_window(id);
+                    self.niri.layout.remove_window(&id, Transaction::new());
+                    self.niri.queue_redraw_all();
+                } else if let Some((id, false)) = window {
+                    if let Some((_, mapped)) =
+                        self.niri.layout.windows().find(|(_, m)| m.id() == id)
+                    {
+                        mapped.toplevel().send_close();
+                    }
                 }
             }
+            Action::CreateWindowMirror => {
+                self.create_window_mirror(None);
+            }
+            Action::CreateWindowMirrorById(id) => {
+                self.create_window_mirror(Some(id));
+            }
             Action::FullscreenWindow => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.niri.layout.focus().map(|m| m.id());
                 if let Some(window) = focus {
                     self.niri.layout.toggle_fullscreen(&window);
                     // FIXME: granular
@@ -862,7 +932,7 @@ impl State {
             }
             Action::FullscreenWindowById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_fullscreen(&window);
                     // FIXME: granular
@@ -870,7 +940,7 @@ impl State {
                 }
             }
             Action::ToggleWindowedFullscreen => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.niri.layout.focus().map(|m| m.id());
                 if let Some(window) = focus {
                     self.niri.layout.toggle_windowed_fullscreen(&window);
                     // FIXME: granular
@@ -879,7 +949,7 @@ impl State {
             }
             Action::ToggleWindowedFullscreenById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_windowed_fullscreen(&window);
                     // FIXME: granular
@@ -888,9 +958,9 @@ impl State {
             }
             Action::FocusWindow(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
-                    self.focus_window(&window);
+                    self.focus_mapped(window);
                 }
             }
             Action::FocusWindowInColumn(index) => {
@@ -909,12 +979,12 @@ impl State {
                     .map(|(_, win)| win)
                     .filter(|win| Some(win.id()) != current)
                     .max_by_key(|win| win.get_focus_timestamp())
-                    .map(|win| win.window.clone())
+                    .map(|win| win.id())
                 {
                     // Commit current focus so repeated focus-window-previous works as expected.
                     self.niri.mru_apply_keyboard_commit();
 
-                    self.focus_window(&window);
+                    self.focus_mapped(window);
                 }
             }
             Action::SwitchLayout(action) => {
@@ -1054,7 +1124,7 @@ impl State {
             }
             Action::ConsumeOrExpelWindowLeftById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.consume_or_expel_window_left(Some(&window));
                     self.maybe_warp_cursor_to_focus();
@@ -1070,7 +1140,7 @@ impl State {
             }
             Action::ConsumeOrExpelWindowRightById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri
                         .layout
@@ -1368,7 +1438,7 @@ impl State {
                 focus,
             } => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     if let Some((output, index)) =
                         self.niri.find_output_and_workspace_index(reference)
@@ -1409,7 +1479,7 @@ impl State {
 
                             // If we focused the target window.
                             let new_focus = self.niri.layout.focus();
-                            if new_focus.is_some_and(|win| win.window == window) {
+                            if new_focus.is_some_and(|win| win.id() == window) {
                                 self.maybe_warp_cursor_to_focus();
                             }
                         }
@@ -1628,14 +1698,14 @@ impl State {
             }
             Action::SwitchPresetWindowWidthById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_width(Some(&window), true);
                 }
             }
             Action::SwitchPresetWindowWidthBackById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_width(Some(&window), false);
                 }
@@ -1648,14 +1718,14 @@ impl State {
             }
             Action::SwitchPresetWindowHeightById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_height(Some(&window), true);
                 }
             }
             Action::SwitchPresetWindowHeightBackById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_height(Some(&window), false);
                 }
@@ -1672,7 +1742,7 @@ impl State {
             }
             Action::CenterWindowById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.center_window(Some(&window));
                     // FIXME: granular
@@ -1688,7 +1758,7 @@ impl State {
                 self.niri.layout.toggle_full_width();
             }
             Action::MaximizeWindowToEdges => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.niri.layout.focus().map(|m| m.id());
                 if let Some(window) = focus {
                     self.niri.layout.toggle_maximized(&window);
                     // FIXME: granular
@@ -1697,7 +1767,7 @@ impl State {
             }
             Action::MaximizeWindowToEdgesById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_maximized(&window);
                     // FIXME: granular
@@ -1882,7 +1952,7 @@ impl State {
             Action::MoveWindowToMonitorById { id, output } => {
                 if let Some(output) = self.niri.output_by_name_match(&output).cloned() {
                     let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                    let window = window.map(|(_, m)| m.window.clone());
+                    let window = window.map(|(_, m)| m.id());
 
                     if let Some(window) = window {
                         let target_was_active = self
@@ -2036,7 +2106,7 @@ impl State {
             }
             Action::SetWindowWidthById { id, change } => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.set_window_width(Some(&window), change);
                 }
@@ -2053,7 +2123,7 @@ impl State {
             }
             Action::SetWindowHeightById { id, change } => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.set_window_height(Some(&window), change);
                 }
@@ -2063,7 +2133,7 @@ impl State {
             }
             Action::ResetWindowHeightById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.reset_window_height(Some(&window));
                 }
@@ -2165,7 +2235,7 @@ impl State {
             }
             Action::ToggleWindowFloatingById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_floating(Some(&window));
                     // FIXME: granular
@@ -2179,7 +2249,7 @@ impl State {
             }
             Action::ToggleWindowStickyById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.toggle_window_sticky(Some(&window));
                     // FIXME: granular
@@ -2193,7 +2263,7 @@ impl State {
             }
             Action::MoveWindowToFloatingById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.set_window_floating(Some(&window), true);
                     // FIXME: granular
@@ -2207,7 +2277,7 @@ impl State {
             }
             Action::MoveWindowToTilingById(id) => {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let window = window.map(|(_, m)| m.window.clone());
+                let window = window.map(|(_, m)| m.id());
                 if let Some(window) = window {
                     self.niri.layout.set_window_floating(Some(&window), false);
                     // FIXME: granular
@@ -2235,7 +2305,7 @@ impl State {
             Action::MoveFloatingWindowById { id, x, y } => {
                 let window = if let Some(id) = id {
                     let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                    let window = window.map(|(_, m)| m.window.clone());
+                    let window = window.map(|(_, m)| m.id());
                     if window.is_none() {
                         return;
                     }
@@ -3088,7 +3158,7 @@ impl State {
             }
 
             if let Some(mapped) = self.niri.window_under_cursor() {
-                let window = mapped.window.clone();
+                let window = mapped.id();
 
                 // Check if we need to start an interactive move.
                 if button == Some(MouseButton::Left) && !pointer.is_grabbed() {
@@ -3107,7 +3177,7 @@ impl State {
                         let start_data = PointerOrTouchStartData::Pointer(start_data);
                         let icon = CursorIcon::Grabbing;
                         if let Some(grab) =
-                            MoveGrab::new(self, start_data, window.clone(), false, Some(icon))
+                            MoveGrab::new(self, start_data, window, false, Some(icon))
                         {
                             pointer.set_grab(self, grab, serial, Focus::Clear);
 
@@ -3173,17 +3243,13 @@ impl State {
 
                         self.niri.layout.activate_window(&window);
 
-                        if self
-                            .niri
-                            .layout
-                            .interactive_resize_begin(window.clone(), edges)
-                        {
+                        if self.niri.layout.interactive_resize_begin(window, edges) {
                             let start_data = PointerGrabStartData {
                                 focus: None,
                                 button: button_code,
                                 location,
                             };
-                            let grab = ResizeGrab::new(start_data, window.clone());
+                            let grab = ResizeGrab::new(start_data, window);
                             pointer.set_grab(self, grab, serial, Focus::Clear);
                             self.niri
                                 .cursor_manager
@@ -3267,6 +3333,46 @@ impl State {
                 time: event.time_msec(),
             },
         );
+
+        if ButtonState::Pressed == button_state {
+            let replace_with_mirror_grab = pointer
+                .with_grab(|_, grab| grab.as_any().is::<ClickGrab<State>>())
+                .unwrap_or(false)
+                .then(|| {
+                    let (window, surface) = (
+                        self.niri.pointer_contents.window?,
+                        self.niri.pointer_contents.surface.clone()?,
+                    );
+                    let (window_id, _) = window;
+                    let mirror_scale = self
+                        .niri
+                        .layout
+                        .windows()
+                        .find(|(_, mapped)| mapped.id() == window_id)
+                        .and_then(|(_, mapped)| {
+                            mapped
+                                .is_mirror()
+                                .then(|| mapped.mirror_content_transform().1)
+                        })?;
+                    let location = pointer.current_location();
+                    let start_surface_local = location - surface.1;
+                    let start_data = PointerGrabStartData {
+                        focus: Some(surface),
+                        button: button_code,
+                        location,
+                    };
+                    Some(MirrorClickGrab::new(
+                        start_data,
+                        start_surface_local,
+                        mirror_scale,
+                    ))
+                })
+                .flatten();
+
+            if let Some(grab) = replace_with_mirror_grab {
+                pointer.set_grab(self, grab, serial, Focus::Keep);
+            }
+        }
         pointer.frame(self);
     }
 
@@ -3891,7 +3997,7 @@ impl State {
                         if let Some(output) = is_overview_open.then_some(under.output).flatten() {
                             let mut workspaces = self.niri.layout.workspaces();
                             let ws_idx = workspaces.find_map(|(_, ws_idx, ws)| {
-                                ws.windows().any(|w| w.window == window).then_some(ws_idx)
+                                ws.windows().any(|w| w.id() == window).then_some(ws_idx)
                             });
                             let ws_idx = ws_idx.or_else(|| {
                                 if !self.niri.layout.is_sticky_window(&window) {
@@ -4506,7 +4612,7 @@ impl State {
                 let ws_id = ws.map(|(_, ws)| ws.id());
 
                 let mapped = self.niri.window_under(pos);
-                let window = mapped.map(|mapped| mapped.window.clone());
+                let window = mapped.map(|mapped| mapped.id());
 
                 let start_data = TouchGrabStartData {
                     focus: None,
@@ -4535,8 +4641,7 @@ impl State {
                         location: pos,
                     };
                     let start_data = PointerOrTouchStartData::Touch(start_data);
-                    if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None)
-                    {
+                    if let Some(grab) = MoveGrab::new(self, start_data, window, true, None) {
                         handle.set_grab(self, grab, serial);
                     }
                 }

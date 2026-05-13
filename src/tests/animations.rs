@@ -5,12 +5,16 @@ use insta::assert_snapshot;
 use niri_config::animations::{Curve, EasingParams, Kind};
 use niri_config::Config;
 use niri_ipc::SizeChange;
-use smithay::utils::{Point, Size};
+use smithay::utils::{Logical, Point, Size};
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
+use crate::layout::{ActivateWindow, AddWindowTarget};
 use crate::niri::Niri;
+use crate::utils::ResizeEdge;
+use crate::window::mapped::MappedId;
+use crate::window::Mapped;
 
 fn format_tiles(niri: &Niri) -> String {
     let mut buf = String::new();
@@ -29,6 +33,16 @@ fn format_tiles(niri: &Niri) -> String {
     buf
 }
 
+fn tile_geometry_for(niri: &Niri, id: MappedId) -> (Point<i32, Logical>, Size<i32, Logical>) {
+    let ws = niri.layout.active_workspace().unwrap();
+    let (tile, pos, visible) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == id)
+        .unwrap();
+    assert!(visible);
+    (pos.to_i32_round(), tile.animated_tile_size().to_i32_round())
+}
+
 fn create_window(f: &mut Fixture, id: ClientId, w: u16, h: u16) -> WlSurface {
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
@@ -42,6 +56,33 @@ fn create_window(f: &mut Fixture, id: ClientId, w: u16, h: u16) -> WlSurface {
     f.roundtrip(id);
 
     surface
+}
+
+fn create_window_mirror_next_to(
+    f: &mut Fixture,
+    source_id: MappedId,
+    next_to: MappedId,
+) -> MappedId {
+    let niri = f.niri();
+    let mapped = niri
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == source_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    let mirror = Mapped::new_mirror(mapped);
+    let mirror_id = mirror.id();
+    niri.layout.add_window(
+        mirror,
+        AddWindowTarget::NextTo(&next_to),
+        None,
+        None,
+        false,
+        false,
+        false,
+        ActivateWindow::No,
+    );
+    mirror_id
 }
 
 fn set_time(niri: &mut Niri, time: Duration) {
@@ -66,8 +107,7 @@ fn set_time(niri: &mut Niri, time: Duration) {
     niri.clock.set_rate(0.0);
 }
 
-// Sets up a fixture with linear animations, a renderer, and an output.
-fn set_up() -> Fixture {
+fn set_up_base(with_renderer: bool) -> Fixture {
     const LINEAR: Kind = Kind::Easing(EasingParams {
         duration_ms: 1000,
         curve: Curve::Linear,
@@ -79,10 +119,21 @@ fn set_up() -> Fixture {
     config.animations.window_movement.0.kind = LINEAR;
 
     let mut f = Fixture::with_config(config);
-    f.niri_state().backend.headless().add_renderer().unwrap();
+    if with_renderer {
+        f.niri_state().backend.headless().add_renderer().unwrap();
+    }
     f.add_output(1, (1920, 1080));
 
     f
+}
+
+// Sets up a fixture with linear animations, a renderer, and an output.
+fn set_up() -> Fixture {
+    set_up_base(true)
+}
+
+fn set_up_without_renderer() -> Fixture {
+    set_up_base(false)
 }
 
 fn set_up_two_in_column() -> (Fixture, ClientId, WlSurface, WlSurface) {
@@ -187,4 +238,97 @@ fn egl_clientside_height_change_doesnt_animate() {
     100 ×  50 at x:  0 y:  0
     200 × 200 at x:  0 y: 50
     ");
+}
+
+#[test]
+fn mirror_consume_into_column_snaps_to_final_positions() {
+    let mut f = set_up_without_renderer();
+    let id = f.add_client();
+    create_window(&mut f, id, 100, 100);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror1_id = create_window_mirror_next_to(&mut f, source_id, source_id);
+    let mirror2_id = create_window_mirror_next_to(&mut f, source_id, mirror1_id);
+
+    f.niri_complete_animations();
+    f.niri().layout.focus_right();
+
+    f.niri().layout.consume_into_column();
+
+    let working_area = f.niri().layout.active_workspace().unwrap().working_area();
+    let area_x = working_area.loc.x.round() as i32;
+    let area_y = working_area.loc.y.round() as i32;
+    let area_w = working_area.size.w.round() as i32;
+    let area_h = working_area.size.h.round() as i32;
+
+    let (mirror1_pos, mirror1_size) = tile_geometry_for(f.niri(), mirror1_id);
+    let (mirror2_pos, mirror2_size) = tile_geometry_for(f.niri(), mirror2_id);
+
+    assert_eq!(mirror1_pos.x, mirror2_pos.x);
+    assert_eq!(mirror1_size.w, mirror2_size.w);
+    assert_eq!(mirror1_size.h, mirror2_size.h);
+    assert_eq!(mirror2_pos.y, mirror1_pos.y + mirror1_size.h);
+
+    assert!(mirror1_pos.x >= area_x);
+    assert!(mirror1_pos.y >= area_y);
+    assert!(mirror2_pos.x + mirror2_size.w <= area_x + area_w);
+    assert!(mirror2_pos.y + mirror2_size.h <= area_y + area_h);
+}
+
+#[test]
+fn mirror_interactive_resize_left_keeps_right_edge() {
+    let mut f = set_up_without_renderer();
+    let id = f.add_client();
+    create_window(&mut f, id, 100, 100);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_next_to(&mut f, source_id, source_id);
+    f.niri_complete_animations();
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_complete_animations();
+
+    let (before_pos, before_size) = tile_geometry_for(f.niri(), mirror_id);
+    let before_right = before_pos.x + before_size.w;
+
+    assert!(f
+        .niri()
+        .layout
+        .interactive_resize_begin(mirror_id, ResizeEdge::LEFT));
+    assert!(f
+        .niri()
+        .layout
+        .interactive_resize_update(&mirror_id, Point::from((-40., 0.))));
+
+    let (after_pos, after_size) = tile_geometry_for(f.niri(), mirror_id);
+    let after_right = after_pos.x + after_size.w;
+
+    assert!(after_size.w > before_size.w);
+    assert_eq!(after_right, before_right);
+}
+
+#[test]
+fn mirror_maximize_to_edges_stays_within_viewport() {
+    let mut f = set_up_without_renderer();
+    let id = f.add_client();
+    create_window(&mut f, id, 40, 20);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_next_to(&mut f, source_id, source_id);
+    f.niri_complete_animations();
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri().layout.set_maximized(&mirror_id, true);
+    f.niri_complete_animations();
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    let area = ws.scrolling().parent_area();
+    let area_x = area.loc.x.round() as i32;
+    let area_y = area.loc.y.round() as i32;
+    let area_w = area.size.w.round() as i32;
+    let area_h = area.size.h.round() as i32;
+
+    let (mirror_pos, mirror_size) = tile_geometry_for(f.niri(), mirror_id);
+    assert_eq!(mirror_pos.x, area_x);
+    assert_eq!(mirror_pos.y, area_y);
+    assert!(mirror_pos.x + mirror_size.w <= area_x + area_w);
+    assert!(mirror_pos.y + mirror_size.h <= area_y + area_h);
 }

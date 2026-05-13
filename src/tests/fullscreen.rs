@@ -35,7 +35,7 @@ fn windowed_fullscreen() {
 
     let niri = f.niri();
     let mapped = niri.layout.windows().next().unwrap().1;
-    let window_id = mapped.window.clone();
+    let window_id = mapped.id();
 
     // Enable windowed fullscreen.
     niri.layout.toggle_windowed_fullscreen(&window_id);
@@ -93,7 +93,7 @@ fn windowed_fullscreen_chain() {
     let _ = f.client(id).window(&surface).recent_configures();
 
     let mapped = f.niri().layout.windows().next().unwrap().1;
-    let window_id = mapped.window.clone();
+    let window_id = mapped.id();
 
     f.niri().layout.toggle_windowed_fullscreen(&window_id);
     f.roundtrip(id);
@@ -174,7 +174,7 @@ fn unfullscreen_before_fullscreen_ack_doesnt_prevent_view_offset_save_restore() 
 
     let niri = f.niri();
     let mapped2 = niri.layout.windows().last().unwrap().1;
-    let window2_id = mapped2.window.clone();
+    let window2_id = mapped2.id();
 
     // The view position is at the first window.
     assert_snapshot!(niri.layout.active_workspace().unwrap().scrolling().view_pos(), @"-16");
@@ -224,7 +224,7 @@ fn interactive_move_unfullscreen_to_scrolling_restores_size() {
 
     let niri = f.niri();
     let mapped = niri.layout.windows().next().unwrap().1;
-    let window = mapped.window.clone();
+    let window = mapped.id();
     niri.layout.set_fullscreen(&window, true);
     f.double_roundtrip(id);
 
@@ -238,7 +238,7 @@ fn interactive_move_unfullscreen_to_scrolling_restores_size() {
     let output = f.niri_output(1);
     let niri = f.niri();
     let mapped = niri.layout.windows().next().unwrap().1;
-    let window = mapped.window.clone();
+    let window = mapped.id();
     niri.layout
         .interactive_move_begin(window.clone(), &output, Point::default());
     niri.layout.interactive_move_update(
@@ -264,7 +264,7 @@ fn interactive_move_unmaximize_to_scrolling_restores_size() {
 
     let niri = f.niri();
     let mapped = niri.layout.windows().next().unwrap().1;
-    let window = mapped.window.clone();
+    let window = mapped.id();
     niri.layout.set_maximized(&window, true);
     f.double_roundtrip(id);
 
@@ -278,7 +278,7 @@ fn interactive_move_unmaximize_to_scrolling_restores_size() {
     let output = f.niri_output(1);
     let niri = f.niri();
     let mapped = niri.layout.windows().next().unwrap().1;
-    let window = mapped.window.clone();
+    let window = mapped.id();
     niri.layout
         .interactive_move_begin(window.clone(), &output, Point::default());
     niri.layout.interactive_move_update(
