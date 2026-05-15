@@ -46,6 +46,10 @@
           name = "windows-mirroring";
           pr = null;
         }
+        {
+          name = "capture-cursor";
+          pr = null;
+        }
       ];
       niri-package =
         {

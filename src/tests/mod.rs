@@ -6,6 +6,7 @@ mod server;
 
 mod animations;
 mod capture_block_out;
+mod cursor_capture;
 mod floating;
 mod fullscreen;
 mod layer_shell;

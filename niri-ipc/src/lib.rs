@@ -908,6 +908,18 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Toggle whether a window captures the cursor.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Toggle cursor capture for the focused window")
+    )]
+    ToggleWindowCursorCapture {
+        /// Id of the window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Toggle whether a window is blocked out from screen capture.
     #[cfg_attr(
         feature = "clap",

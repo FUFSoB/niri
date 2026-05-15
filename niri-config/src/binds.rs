@@ -360,6 +360,9 @@ pub enum Action {
     ToggleWindowRuleOpacity,
     #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
+    ToggleWindowCursorCapture,
+    #[knuffel(skip)]
+    ToggleWindowCursorCaptureById(u64),
     ToggleBlockOutWindow,
     #[knuffel(skip)]
     ToggleBlockOutWindowById(u64),
@@ -712,6 +715,12 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleWindowRuleOpacity { id: None } => Self::ToggleWindowRuleOpacity,
             niri_ipc::Action::ToggleWindowRuleOpacity { id: Some(id) } => {
                 Self::ToggleWindowRuleOpacityById(id)
+            }
+            niri_ipc::Action::ToggleWindowCursorCapture { id: None } => {
+                Self::ToggleWindowCursorCapture
+            }
+            niri_ipc::Action::ToggleWindowCursorCapture { id: Some(id) } => {
+                Self::ToggleWindowCursorCaptureById(id)
             }
             niri_ipc::Action::ToggleBlockOutWindow { id: None } => Self::ToggleBlockOutWindow,
             niri_ipc::Action::ToggleBlockOutWindow { id: Some(id) } => {

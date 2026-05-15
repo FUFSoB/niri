@@ -2348,6 +2348,31 @@ impl State {
                     }
                 }
             }
+            Action::ToggleWindowCursorCapture => {
+                let focus = self.niri.layout.focus().map(|window| window.id());
+                if let Some(window) = focus {
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.toggle_cursor_capture_window_rule();
+                        }
+                    });
+                }
+            }
+            Action::ToggleWindowCursorCaptureById(id) => {
+                let window = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, mapped)| mapped.id().get() == id)
+                    .map(|(_, mapped)| mapped.id());
+                if let Some(window) = window {
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.toggle_cursor_capture_window_rule();
+                        }
+                    });
+                }
+            }
             Action::ToggleBlockOutWindow => {
                 let active_window = self
                     .niri
@@ -2806,32 +2831,36 @@ impl State {
             }
         }
 
+        let source_window_captures_cursor = self
+            .niri
+            .pointer_contents
+            .window
+            .as_ref()
+            .map(|(window, _)| self.niri.layout.window_captures_cursor(window));
         let under = self.niri.contents_under(new_pos);
 
         // Handle confined pointer.
         if let Some((focus_surface, region)) = pointer_confined {
-            let entering_floating_or_sticky = under
+            let destination_window_captures_cursor = under
                 .window
                 .as_ref()
-                .is_some_and(|(window, _)| self.niri.layout.is_floating_or_sticky_window(window));
-            let mut prevent = false;
-
-            if !entering_floating_or_sticky {
-                // Prevent the pointer from leaving the focused surface.
-                if Some(&focus_surface.0) != under.surface.as_ref().map(|(s, _)| s) {
-                    prevent = true;
-                }
-
-                // Prevent the pointer from leaving the confine region, if any.
-                if let Some(region) = region {
+                .map(|(window, _)| self.niri.layout.window_captures_cursor(window));
+            let stays_on_focused_surface =
+                Some(&focus_surface.0) == under.surface.as_ref().map(|(s, _)| s);
+            let stays_within_region = match region {
+                Some(region) => {
                     let new_pos_within_surface = new_pos - focus_surface.1;
-                    if !region.contains(new_pos_within_surface.to_i32_round()) {
-                        prevent = true;
-                    }
+                    region.contains(new_pos_within_surface.to_i32_round())
                 }
-            }
+                None => true,
+            };
 
-            if prevent {
+            if confined_pointer_move_should_be_prevented(
+                source_window_captures_cursor,
+                destination_window_captures_cursor,
+                stays_on_focused_surface,
+                stays_within_region,
+            ) {
                 pointer.relative_motion(
                     self,
                     Some(focus_surface),
@@ -5558,6 +5587,21 @@ fn make_binds_iter<'a>(
     general_binds.chain(mru_binds).chain(mru_open_binds)
 }
 
+fn confined_pointer_move_should_be_prevented(
+    source_window_captures_cursor: Option<bool>,
+    destination_window_captures_cursor: Option<bool>,
+    stays_on_focused_surface: bool,
+    stays_within_region: bool,
+) -> bool {
+    if source_window_captures_cursor == Some(false)
+        || destination_window_captures_cursor == Some(false)
+    {
+        return false;
+    }
+
+    !stays_on_focused_surface || !stays_within_region
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -5934,5 +5978,61 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn confined_pointer_move_stays_strict_when_both_windows_capture() {
+        assert!(confined_pointer_move_should_be_prevented(
+            Some(true),
+            Some(true),
+            false,
+            true,
+        ));
+        assert!(confined_pointer_move_should_be_prevented(
+            Some(true),
+            Some(true),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn confined_pointer_move_allows_entering_window_without_capture() {
+        assert!(!confined_pointer_move_should_be_prevented(
+            Some(true),
+            Some(false),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn confined_pointer_move_allows_leaving_window_without_capture() {
+        assert!(!confined_pointer_move_should_be_prevented(
+            Some(false),
+            None,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn confined_pointer_move_allows_ruleless_windows_by_default() {
+        assert!(!confined_pointer_move_should_be_prevented(
+            Some(false),
+            Some(false),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn confined_pointer_move_prevents_escape_without_window_override() {
+        assert!(confined_pointer_move_should_be_prevented(
+            Some(true),
+            None,
+            false,
+            false,
+        ));
     }
 }

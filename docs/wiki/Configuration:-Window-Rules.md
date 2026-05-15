@@ -639,6 +639,28 @@ This global toggle does not change the window's own `is_block_out` state reporte
 > This is because window title (and app ID) are not double-buffered in the Wayland protocol, so they are not tied to specific window contents.
 > There's no robust way for Firefox to synchronize visibly showing a different tab and changing the window title.
 
+#### `cursor-capture`
+
+Control whether this window captures the cursor when it requests a confined pointer constraint.
+
+By default, windows do not capture the cursor.
+Set this to `true` for windows where you want niri to keep the pointer confined to the focused
+surface and region while the constraint is active.
+
+You can temporarily override the per-window cursor capture state at runtime with the
+[`toggle-window-cursor-capture`](./Configuration:-Key-Bindings.md#toggle-window-cursor-capture)
+action.
+If a window is already configured with `cursor-capture true`, the action turns capture off for it.
+Otherwise, it turns cursor capture on for that window.
+
+```kdl
+window-rule {
+    match app-id="^my-game$"
+
+    cursor-capture true
+}
+```
+
 #### `opacity`
 
 Set the opacity of the window.

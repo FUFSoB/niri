@@ -479,6 +479,7 @@ fn action_name(action: &Action) -> String {
         Action::ConsumeOrExpelWindowRight => String::from("Consume or Expel Window Right"),
         Action::ToggleWindowFloating => String::from("Move Window Between Floating and Tiling"),
         Action::ToggleWindowSticky => String::from("Toggle Window Sticky Across Workspaces"),
+        Action::ToggleWindowCursorCapture => String::from("Toggle Window Cursor Capture"),
         Action::ToggleBlockOutWindow => String::from("Toggle Window Block-Out"),
         Action::ToggleBlockOut => String::from("Toggle Global Block-Out"),
         Action::SwitchFocusBetweenFloatingAndTiling => {

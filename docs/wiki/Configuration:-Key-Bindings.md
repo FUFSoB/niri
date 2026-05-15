@@ -362,6 +362,20 @@ binds {
 }
 ```
 
+#### `toggle-window-cursor-capture`
+
+<sup>Since: own-patches</sup>
+
+Toggle cursor capture for the focused window.
+If the window is already configured with `cursor-capture true`, this temporarily disables it.
+Otherwise, this temporarily enables cursor capture for that window.
+
+```kdl
+binds {
+    Mod+Ctrl+V { toggle-window-cursor-capture; }
+}
+```
+
 #### `toggle-block-out-window`
 
 <sup>Since: own-patches</sup>

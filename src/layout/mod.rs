@@ -277,6 +277,9 @@ pub trait LayoutElement {
     fn set_sticky(&mut self, sticky: bool);
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
+    fn effective_cursor_capture(&self) -> bool {
+        self.rules().cursor_capture.unwrap_or(false)
+    }
     fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
         self.rules().block_out_from
     }
@@ -6703,12 +6706,6 @@ impl<W: LayoutElement> Layout<W> {
         iter_normal.chain(iter_no_outputs)
     }
 
-    fn workspace_for_window(&self, window: &W::Id) -> Option<&Workspace<W>> {
-        self.workspaces()
-            .find(|(_, _, ws)| ws.has_window(window))
-            .map(|(_, _, ws)| ws)
-    }
-
     fn workspace_for_window_mut(&mut self, window: &W::Id) -> Option<&mut Workspace<W>> {
         self.workspaces_mut().find(|ws| ws.has_window(window))
     }
@@ -6734,19 +6731,22 @@ impl<W: LayoutElement> Layout<W> {
         moving_window.chain(sticky).chain(rest)
     }
 
+    fn window_by_id(&self, window: &W::Id) -> Option<&W> {
+        self.windows()
+            .find_map(|(_, win)| (win.id() == window).then_some(win))
+    }
+
     pub fn has_window(&self, window: &W::Id) -> bool {
-        self.windows().any(|(_, win)| win.id() == window)
+        self.window_by_id(window).is_some()
     }
 
     pub fn is_sticky_window(&self, window: &W::Id) -> bool {
         self.monitors().any(|mon| mon.sticky_has_window(window))
     }
 
-    pub fn is_floating_or_sticky_window(&self, window: &W::Id) -> bool {
-        self.is_sticky_window(window)
-            || self
-                .workspace_for_window(window)
-                .is_some_and(|ws| ws.is_floating(window))
+    pub fn window_captures_cursor(&self, window: &W::Id) -> bool {
+        self.window_by_id(window)
+            .is_some_and(|win| win.effective_cursor_capture())
     }
 
     pub fn is_overview_open(&self) -> bool {

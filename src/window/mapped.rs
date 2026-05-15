@@ -131,6 +131,9 @@ pub struct Mapped {
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
 
+    /// Whether this window should invert its configured cursor capture state.
+    invert_cursor_capture_window_rule: bool,
+
     /// Whether this window should invert its configured block-out state.
     invert_block_out_window_rule: bool,
 
@@ -417,6 +420,7 @@ impl Mapped {
             is_window_cast_target: false,
             is_screen_cast_target: false,
             ignore_opacity_window_rule: false,
+            invert_cursor_capture_window_rule: false,
             invert_block_out_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: config.blur,
@@ -474,6 +478,7 @@ impl Mapped {
             is_window_cast_target: false,
             is_screen_cast_target: false,
             ignore_opacity_window_rule: source.ignore_opacity_window_rule,
+            invert_cursor_capture_window_rule: source.invert_cursor_capture_window_rule,
             invert_block_out_window_rule: source.invert_block_out_window_rule,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: source.blur_config,
@@ -776,6 +781,19 @@ impl Mapped {
 
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
         self.ignore_opacity_window_rule = !self.ignore_opacity_window_rule;
+    }
+
+    pub fn effective_cursor_capture(&self) -> bool {
+        let cursor_capture = self.rules.cursor_capture.unwrap_or(false);
+        if !self.invert_cursor_capture_window_rule {
+            return cursor_capture;
+        }
+
+        !cursor_capture
+    }
+
+    pub fn toggle_cursor_capture_window_rule(&mut self) {
+        self.invert_cursor_capture_window_rule = !self.invert_cursor_capture_window_rule;
     }
 
     pub fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
@@ -1916,6 +1934,10 @@ impl LayoutElement for Mapped {
 
     fn is_ignoring_opacity_window_rule(&self) -> bool {
         self.ignore_opacity_window_rule
+    }
+
+    fn effective_cursor_capture(&self) -> bool {
+        Mapped::effective_cursor_capture(self)
     }
 
     fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
