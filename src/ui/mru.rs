@@ -432,6 +432,10 @@ impl Thumbnail {
                 let elem = LayoutElementRenderElement::MirrorScaledWayland(elem);
                 ThumbnailRenderElement::LayoutElement(elem)
             }
+            LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
+                let elem = LayoutElementRenderElement::MirrorScaledClippedWayland(elem);
+                ThumbnailRenderElement::LayoutElement(elem)
+            }
             LayoutElementRenderElement::SolidColor(elem) => {
                 // In this branch we're rendering a blocked-out window with a solid
                 // color. We need to render it with a rounded corner shader even if

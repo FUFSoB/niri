@@ -32,6 +32,7 @@ use crate::layout::{
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
+use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
@@ -295,6 +296,42 @@ fn baked_texture_logical_size(
         .unwrap_or_else(|| baked.buffer.logical_size())
 }
 
+fn crop_baked_texture_to_rect(
+    baked: &mut BakedBuffer<TextureBuffer<GlesTexture>>,
+    clip: Rectangle<f64, Logical>,
+) -> bool {
+    let logical_size = baked_texture_logical_size(baked);
+    let logical_rect = Rectangle::new(baked.location, logical_size);
+    let Some(intersection) = logical_rect.intersection(clip) else {
+        return false;
+    };
+
+    if intersection == logical_rect {
+        return true;
+    }
+
+    let full_src = baked
+        .src
+        .unwrap_or_else(|| Rectangle::from_size(baked.buffer.logical_size()));
+    let src_scale = Scale::from((
+        full_src.size.w / logical_rect.size.w.max(1e-9),
+        full_src.size.h / logical_rect.size.h.max(1e-9),
+    ));
+    let src_offset = (intersection.loc - logical_rect.loc).upscale(src_scale);
+
+    baked.location = intersection.loc;
+    baked.src = Some(Rectangle::new(
+        full_src.loc + src_offset,
+        intersection.size.upscale(src_scale),
+    ));
+
+    if baked.dst.is_some() {
+        baked.dst = Some(intersection.size.to_i32_round());
+    }
+
+    true
+}
+
 /// Interactive resize state.
 #[derive(Debug)]
 enum InteractiveResize {
@@ -332,10 +369,21 @@ enum RequestSizeOnce {
 
 #[derive(Debug, Clone, Copy)]
 struct MirrorContentTransform {
-    source_bbox: Rectangle<f64, Logical>,
+    source_geometry: Rectangle<f64, Logical>,
     content_rect: Rectangle<f64, Logical>,
+    visible_rect: Rectangle<f64, Logical>,
     scale: f64,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct MirrorRenderLayout {
+    transform: MirrorContentTransform,
+    visible_loc: Point<f64, Logical>,
+    content_origin: Point<i32, smithay::utils::Physical>,
+    surface_origin: Point<i32, smithay::utils::Physical>,
+}
+
+const MIRROR_NEAREST_SCALE_SNAP_TOLERANCE: f64 = 1.;
 
 impl Mapped {
     pub fn new(window: Window, rules: ResolvedWindowRules, hook: HookId, config: &Config) -> Self {
@@ -395,6 +443,9 @@ impl Mapped {
         let id = MappedId::next();
         let mut rules = source.rules.clone();
         rules.clip_to_geometry = Some(true);
+        // Mirrors are viewports around another window, so their letterboxing/padding must stay
+        // transparent instead of inheriting non-SSD border background fills from the source.
+        rules.draw_border_with_background = Some(false);
         Self {
             window: source.window.clone(),
             id,
@@ -451,6 +502,7 @@ impl Mapped {
             ResolvedWindowRules::compute(rules, WindowRef::Mapped(self), is_at_startup);
         if self.is_mirror {
             new_rules.clip_to_geometry = Some(true);
+            new_rules.draw_border_with_background = Some(false);
         }
         if new_rules == self.rules {
             return false;
@@ -503,20 +555,171 @@ impl Mapped {
     }
 
     fn mirror_transform(&self) -> MirrorContentTransform {
-        let dst = self.mirror_size.to_f64();
-        let mut source_bbox = self.window.bbox_with_popups().to_f64();
-        source_bbox.size.w = source_bbox.size.w.max(1.);
-        source_bbox.size.h = source_bbox.size.h.max(1.);
+        self.mirror_transform_for_size(self.mirror_size.to_f64())
+    }
 
-        let scale = f64::min(dst.w / source_bbox.size.w, dst.h / source_bbox.size.h).max(0.0001);
-        let rendered = source_bbox.size.upscale(scale);
+    fn mirror_content_rect_for_scale(
+        &self,
+        dst: Size<f64, Logical>,
+        source_geometry: Rectangle<f64, Logical>,
+        scale: f64,
+    ) -> MirrorContentTransform {
+        let rendered = source_geometry.size.upscale(scale);
         let offset = Point::from(((dst.w - rendered.w) / 2., (dst.h - rendered.h) / 2.));
+        let content_rect = Rectangle::new(offset, rendered);
+        let visible_rect = content_rect
+            .intersection(Rectangle::from_size(dst))
+            .unwrap_or_else(|| Rectangle::from_size(Size::from((0., 0.))));
 
         MirrorContentTransform {
-            source_bbox,
-            content_rect: Rectangle::new(offset, rendered),
+            source_geometry,
+            content_rect,
+            visible_rect,
             scale,
         }
+    }
+
+    fn mirror_nearest_scale_candidate(
+        &self,
+        dst: Size<f64, Logical>,
+        source_geometry: Rectangle<f64, Logical>,
+    ) -> Option<f64> {
+        let scale_x = dst.w / source_geometry.size.w;
+        let scale_y = dst.h / source_geometry.size.h;
+        let contain_scale = f64::min(scale_x, scale_y).max(0.0001);
+
+        let candidate = if contain_scale >= 1. {
+            contain_scale.round().max(1.)
+        } else {
+            let reciprocal = (1. / contain_scale).round().max(1.);
+            1. / reciprocal
+        };
+
+        if (candidate - contain_scale).abs() <= f64::EPSILON {
+            return Some(candidate);
+        }
+
+        let rendered = source_geometry.size.upscale(candidate);
+        let width_is_constraining = scale_x <= scale_y + f64::EPSILON;
+        let height_is_constraining = scale_y <= scale_x + f64::EPSILON;
+
+        let width_matches = !width_is_constraining
+            || (rendered.w - dst.w).abs() <= MIRROR_NEAREST_SCALE_SNAP_TOLERANCE;
+        let height_matches = !height_is_constraining
+            || (rendered.h - dst.h).abs() <= MIRROR_NEAREST_SCALE_SNAP_TOLERANCE;
+
+        let width_overflow_ok = rendered.w - dst.w <= MIRROR_NEAREST_SCALE_SNAP_TOLERANCE;
+        let height_overflow_ok = rendered.h - dst.h <= MIRROR_NEAREST_SCALE_SNAP_TOLERANCE;
+
+        (width_matches && height_matches && width_overflow_ok && height_overflow_ok)
+            .then_some(candidate)
+    }
+
+    fn mirror_transform_for_size(&self, dst: Size<f64, Logical>) -> MirrorContentTransform {
+        let mut source_geometry = self.window.geometry().to_f64();
+        source_geometry.size.w = source_geometry.size.w.max(1.);
+        source_geometry.size.h = source_geometry.size.h.max(1.);
+
+        // Mirrors look crisper when the viewport is effectively asking for an integer upscale or
+        // reciprocal downscale. If the contain-fit size differs by at most one logical pixel on
+        // the constraining axis, prefer that nearest-neighbour-friendly scale and clip/pad the
+        // remainder instead of resampling the whole window.
+        if let Some(scale) = self.mirror_nearest_scale_candidate(dst, source_geometry) {
+            return self.mirror_content_rect_for_scale(dst, source_geometry, scale);
+        }
+
+        let scale = f64::min(
+            dst.w / source_geometry.size.w,
+            dst.h / source_geometry.size.h,
+        )
+        .max(0.0001);
+        self.mirror_content_rect_for_scale(dst, source_geometry, scale)
+    }
+
+    fn mirror_render_layout(
+        &self,
+        location: Point<f64, Logical>,
+        mirror_size: Size<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> MirrorRenderLayout {
+        let transform = self.mirror_transform_for_size(mirror_size);
+        let content_loc = location + transform.content_rect.loc;
+        let visible_loc = location + transform.visible_rect.loc;
+        let content_origin = content_loc.to_physical_precise_round(scale);
+        let surface_origin =
+            (content_loc - transform.source_geometry.loc).to_physical_precise_round(scale);
+
+        MirrorRenderLayout {
+            transform,
+            visible_loc,
+            content_origin,
+            surface_origin,
+        }
+    }
+
+    fn render_mirror_normal<R: NiriRenderer>(
+        &self,
+        ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        mirror_size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        alpha: f32,
+        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
+        let blocked_out = ctx.should_block_out(self.effective_block_out_from());
+        let namespace = self.element_namespace().unwrap();
+        let mut buffer = self.block_out_buffer.borrow_mut();
+        // Keep a full-size transparent element for damage/tracking and letterboxing. When the
+        // mirror is blocked out we simply stop after this transparent fill, matching real windows.
+        buffer.update(mirror_size, [0., 0., 0., 0.]);
+        let elem =
+            SolidColorRenderElement::from_buffer(&buffer, location, alpha, Kind::Unspecified);
+        push(elem.into());
+
+        if blocked_out {
+            return;
+        }
+
+        let layout = self.mirror_render_layout(location, mirror_size, scale);
+        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+        let clip_geo = Rectangle::new(layout.visible_loc, layout.transform.visible_rect.size);
+        let clip_radius = self
+            .geometry_corner_radius()
+            .fit_to(clip_geo.size.w as f32, clip_geo.size.h as f32);
+        let surface = self.toplevel().wl_surface();
+        let mut push = |elem: WaylandSurfaceRenderElement<R>| {
+            let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
+                NamespacedElement::new(elem, namespace),
+                layout.content_origin,
+                Scale::from(layout.transform.scale),
+            );
+            if let Some(shader) = clip_shader.clone() {
+                if ClippedSurfaceRenderElement::will_clip(&elem, scale, clip_geo, clip_radius) {
+                    push(
+                        ClippedSurfaceRenderElement::new(
+                            elem,
+                            scale,
+                            clip_geo,
+                            shader,
+                            clip_radius,
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+            }
+
+            push(elem.into());
+        };
+        push_elements_from_surface_tree(
+            ctx.renderer,
+            surface,
+            layout.surface_origin,
+            scale,
+            alpha,
+            Kind::Unspecified,
+            &mut push,
+        );
     }
 
     pub fn mirror_content_transform(&self) -> (Point<f64, Logical>, f64) {
@@ -530,8 +733,8 @@ impl Mapped {
     ) -> Option<Point<f64, Logical>> {
         let transform = self.mirror_transform();
         let point = (point - transform.content_rect.loc).downscale(transform.scale)
-            + transform.source_bbox.loc;
-        transform.source_bbox.contains(point).then_some(point)
+            + transform.source_geometry.loc;
+        transform.source_geometry.contains(point).then_some(point)
     }
 
     pub fn credentials(&self) -> Option<&Credentials> {
@@ -612,7 +815,7 @@ impl Mapped {
         let size = self.size().to_f64();
 
         let mut buffer = self.block_out_buffer.borrow_mut();
-        buffer.resize(size);
+        buffer.update(size, [0., 0., 0., 0.]);
         let blocked_out_contents = vec![BakedBuffer {
             buffer: buffer.clone(),
             location: Point::from((0., 0.)),
@@ -629,12 +832,16 @@ impl Mapped {
             render_snapshot_from_surface_tree(renderer, surface, Point::default(), &mut contents);
 
             let transform = self.mirror_transform();
+            let source_geometry = transform.source_geometry;
+            contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, source_geometry));
+
             for baked in &mut contents {
                 let logical_size = baked_texture_logical_size(baked);
                 baked.location = transform.content_rect.loc
-                    + (baked.location - transform.source_bbox.loc).upscale(transform.scale);
+                    + (baked.location - transform.source_geometry.loc).upscale(transform.scale);
                 baked.dst = Some(logical_size.upscale(transform.scale).to_i32_round());
             }
+            contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, transform.visible_rect));
         } else {
             render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
         }
@@ -713,11 +920,7 @@ impl Mapped {
         block_out_enabled: bool,
         push: &mut dyn FnMut(WindowCastRenderElements<R>),
     ) {
-        let bbox = if self.is_mirror {
-            Rectangle::from_size(self.size()).to_physical_precise_up(scale)
-        } else {
-            self.window.bbox_with_popups().to_physical_precise_up(scale)
-        };
+        let bbox = self.window_cast_bbox(scale);
 
         let has_border_shader = BorderRenderElement::has_shader(renderer);
         let radius = self.geometry_corner_radius();
@@ -730,7 +933,7 @@ impl Mapped {
         let location = if self.is_mirror {
             Point::default()
         } else {
-            self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale)
+            self.window.geometry().loc.to_f64() - bbox.loc.to_f64().to_logical(scale)
         };
 
         let use_border = |elem| {
@@ -776,6 +979,27 @@ impl Mapped {
             XrayPos::default(),
             &mut |elem| push(use_border(elem)),
         );
+    }
+
+    pub fn window_cast_bbox(&self, scale: Scale<f64>) -> Rectangle<i32, smithay::utils::Physical> {
+        if self.is_mirror {
+            Rectangle::from_size(self.size()).to_physical_precise_up(scale)
+        } else {
+            self.window.bbox_with_popups().to_physical_precise_up(scale)
+        }
+    }
+
+    pub fn window_cast_buffer_pos(
+        &self,
+        win_pos: Point<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> Point<f64, Logical> {
+        if self.is_mirror {
+            win_pos - self.buf_loc().to_f64()
+        } else {
+            let bbox = self.window_cast_bbox(scale);
+            win_pos + bbox.loc.to_f64().to_logical(scale)
+        }
     }
 
     pub fn get_focus_timestamp(&self) -> Option<Duration> {
@@ -884,7 +1108,7 @@ impl LayoutElement for Mapped {
         if self.is_mirror {
             let transform = self.mirror_transform();
             return (transform.content_rect.loc
-                - transform.source_bbox.loc.upscale(transform.scale))
+                - transform.source_geometry.loc.upscale(transform.scale))
             .to_i32_round();
         }
 
@@ -903,6 +1127,23 @@ impl LayoutElement for Mapped {
         self.window.is_in_input_region(&surface_local)
     }
 
+    fn render_normal_with_size<R: NiriRenderer>(
+        &self,
+        ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        alpha: f32,
+        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
+        if self.is_mirror {
+            self.render_mirror_normal(ctx, location, size, scale, alpha, push);
+            return;
+        }
+
+        self.render_normal(ctx, location, scale, alpha, push);
+    }
+
     fn render_normal<R: NiriRenderer>(
         &self,
         ctx: RenderCtx<R>,
@@ -912,50 +1153,7 @@ impl LayoutElement for Mapped {
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
         if self.is_mirror {
-            let blocked_out = ctx.should_block_out(self.effective_block_out_from());
-            let namespace = self.element_namespace().unwrap();
-            let mut buffer = self.block_out_buffer.borrow_mut();
-            // Keep a full-size element for damage/tracking, but leave the letterboxed area
-            // transparent unless the mirror is intentionally blocked out.
-            buffer.update(
-                self.mirror_size.to_f64(),
-                if blocked_out {
-                    [0., 0., 0., 1.]
-                } else {
-                    [0., 0., 0., 0.]
-                },
-            );
-            let elem =
-                SolidColorRenderElement::from_buffer(&buffer, location, alpha, Kind::Unspecified);
-            push(elem.into());
-
-            if blocked_out {
-                return;
-            }
-
-            let transform = self.mirror_transform();
-            let content_loc = location + transform.content_rect.loc;
-            let content_origin = content_loc.to_physical_precise_round(scale);
-            let buf_pos =
-                content_origin - transform.source_bbox.loc.to_physical_precise_round(scale);
-            let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<R>| {
-                let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
-                    NamespacedElement::new(elem, namespace),
-                    content_origin,
-                    Scale::from(transform.scale),
-                );
-                push(elem.into())
-            };
-            push_elements_from_surface_tree(
-                ctx.renderer,
-                surface,
-                buf_pos,
-                scale,
-                alpha,
-                Kind::Unspecified,
-                &mut push,
-            );
+            self.render_mirror_normal(ctx, location, self.mirror_size.to_f64(), scale, alpha, push);
             return;
         }
 
@@ -1010,11 +1208,9 @@ impl LayoutElement for Mapped {
 
                 let surface = popup.wl_surface();
                 let popup_geo = popup.geometry();
-                let surface_loc = content_origin
-                    - transform.source_bbox.loc.to_physical_precise_round(scale)
-                    + (offset - popup_geo.loc)
-                        .to_f64()
-                        .to_physical_precise_round(scale);
+                let surface_loc = (content_loc - transform.source_geometry.loc
+                    + (offset - popup_geo.loc).to_f64())
+                .to_physical_precise_round(scale);
 
                 push_elements_from_surface_tree(
                     ctx.renderer,
@@ -1035,7 +1231,8 @@ impl LayoutElement for Mapped {
 
                 let geometry = Rectangle::new(
                     content_loc
-                        + (offset.to_f64() - transform.source_bbox.loc).upscale(transform.scale),
+                        + (offset.to_f64() - transform.source_geometry.loc)
+                            .upscale(transform.scale),
                     popup_geo.size.to_f64().upscale(transform.scale),
                 );
                 let surface_off = popup_geo.loc.upscale(-1).to_f64();
@@ -1137,8 +1334,8 @@ impl LayoutElement for Mapped {
         if self.is_mirror {
             let transform = self.mirror_transform();
             let geometry = Rectangle::new(
-                geometry.loc + transform.content_rect.loc,
-                transform.content_rect.size,
+                geometry.loc + transform.visible_rect.loc,
+                transform.visible_rect.size,
             );
             let surface_anim_scale = Scale {
                 x: surface_anim_scale.x * transform.scale,
@@ -1151,13 +1348,13 @@ impl LayoutElement for Mapped {
                 scale,
                 clip_to_geometry,
                 self.toplevel().wl_surface(),
-                transform.source_bbox.loc.upscale(-1.),
+                transform.source_geometry.loc.upscale(-1.),
                 surface_anim_scale,
                 self.blur_config,
                 radius,
                 self.rules.background_effect,
                 false,
-                xray_pos.offset(transform.content_rect.loc),
+                xray_pos.offset(transform.visible_rect.loc),
                 push,
             );
             return;

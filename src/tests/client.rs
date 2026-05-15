@@ -354,6 +354,10 @@ impl Window {
         self.viewport.set_destination(i32::from(w), i32::from(h));
     }
 
+    pub fn set_window_geometry(&self, x: i32, y: i32, w: i32, h: i32) {
+        self.xdg_surface.set_window_geometry(x, y, w, h);
+    }
+
     pub fn set_fullscreen(&self, output: Option<&WlOutput>) {
         self.xdg_toplevel.set_fullscreen(output);
     }

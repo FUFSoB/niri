@@ -42,6 +42,10 @@
           name = "free-windows-pane";
           pr = null;
         }
+        {
+          name = "windows-mirroring";
+          pr = null;
+        }
       ];
       niri-package =
         {

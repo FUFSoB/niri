@@ -1453,7 +1453,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         let span =
             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
 
-        let (window, got_unmapped) = {
+        let (window, got_unmapped, animate) = {
             let Some((mapped, _output)) = state.niri.layout.find_window_and_output_mut(surface)
             else {
                 error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
@@ -1555,14 +1555,18 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 }
             }
 
-            if animate && !got_unmapped {
-                state.backend.with_primary_renderer(|renderer| {
-                    mapped.store_animation_snapshot(renderer);
-                });
-            }
-
-            (mapped.id(), got_unmapped)
+            (mapped.source_id(), got_unmapped, animate)
         };
+
+        if animate && !got_unmapped {
+            state.backend.with_primary_renderer(|renderer| {
+                state.niri.layout.with_windows_mut(|mapped, _| {
+                    if mapped.source_id() == window {
+                        mapped.store_animation_snapshot(renderer);
+                    }
+                });
+            });
+        }
 
         let instances = state.niri.mapped_instances_for_source(window);
         if got_unmapped {

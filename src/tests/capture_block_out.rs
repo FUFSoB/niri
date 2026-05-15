@@ -3,14 +3,15 @@ use std::str::FromStr;
 use niri_config::layer_rule::{LayerRule, Match as LayerMatch};
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
-use niri_config::{Action, BlockOutFrom, Config};
+use niri_config::{Action, BlockOutFrom, Config, CornerRadius};
 use niri_ipc::state::EventStreamStatePart as _;
 use niri_ipc::{BlockOutFrom as IpcBlockOutFrom, Layer as IpcLayer, SizeChange};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{
-    Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
+    Element as _, Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
 };
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
@@ -22,7 +23,9 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::{ClientId, LayerConfigureProps};
 use super::*;
-use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
+use crate::layout::{
+    ActivateWindow, AddWindowTarget, LayoutElement as _, LayoutElementRenderElement,
+};
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{
     encompassing_geo, render_to_vec as render_pixels, RenderCtx, RenderTarget,
@@ -59,6 +62,30 @@ fn create_window(
     let window = f.client(id).window(&surface);
     window.attach_rgba_buffer(rgba);
     window.set_size(size.0, size.1);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
+
+fn create_window_with_geometry(
+    f: &mut Fixture,
+    id: ClientId,
+    title: &str,
+    size: (u16, u16),
+    geometry: (i32, i32, i32, i32),
+    rgba: [u32; 4],
+) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_title(title);
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_rgba_buffer(rgba);
+    window.set_size(size.0, size.1);
+    window.set_window_geometry(geometry.0, geometry.1, geometry.2, geometry.3);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
@@ -351,6 +378,25 @@ fn rendered_element_states(ids: impl IntoIterator<Item = Id>) -> RenderElementSt
     states
 }
 
+fn first_surface_geometry(
+    elements: &[LayoutElementRenderElement<GlesRenderer>],
+    scale: Scale<f64>,
+) -> smithay::utils::Rectangle<i32, Physical> {
+    elements
+        .iter()
+        .find_map(|elem| match elem {
+            LayoutElementRenderElement::Wayland(elem) => Some(elem.geometry(scale)),
+            LayoutElementRenderElement::NamespacedWayland(elem) => Some(elem.geometry(scale)),
+            LayoutElementRenderElement::MirrorScaledWayland(elem) => Some(elem.geometry(scale)),
+            LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
+                Some(elem.geometry(scale))
+            }
+            LayoutElementRenderElement::SolidColor(_) => None,
+            LayoutElementRenderElement::BackgroundEffect(_) => None,
+        })
+        .unwrap()
+}
+
 fn mirror_output_content_rect(
     f: &mut Fixture,
     output: &Output,
@@ -364,9 +410,9 @@ fn mirror_output_content_rect(
         .find(|(_, mapped)| mapped.id() == id)
         .map(|(_, mapped)| mapped)
         .unwrap();
-    let source_bbox = mapped.window.bbox_with_popups().to_f64();
+    let source_geometry = mapped.window.geometry().to_f64();
     let (loc, content_scale) = mapped.mirror_content_transform();
-    smithay::utils::Rectangle::new(loc, source_bbox.size.upscale(content_scale))
+    smithay::utils::Rectangle::new(loc, source_geometry.size.upscale(content_scale))
         .to_physical_precise_round(scale)
 }
 
@@ -513,6 +559,439 @@ fn mirror_output_render_scales_and_centers_contents_across_sizes() {
 }
 
 #[test]
+fn mirror_equal_to_window_geometry_renders_1_to_1_on_output() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    let output = f.niri_output(1);
+
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(mapped.size(), Size::from((96, 56)));
+    assert_eq!(
+        mapped.mirror_content_transform(),
+        (Point::from((0., 0.)), 1.)
+    );
+
+    let (size, pixels) = render_window_output_pixels_for(&mut f, &output, mirror_id);
+    assert_eq!(size, Size::from((96, 56)));
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(sample_pixel(size, &pixels, 0, size.h / 2), [0, 255, 0, 255]);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w - 1, size.h / 2),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(sample_pixel(size, &pixels, size.w / 2, 0), [0, 255, 0, 255]);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h - 1),
+        [0, 255, 0, 255]
+    );
+}
+
+#[test]
+fn mirror_equal_size_matches_source_surface_geometry_at_fractional_scale() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (40, 20), (1, 1, 39, 19), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    backend
+        .with_primary_renderer(|renderer| {
+            let location = Point::from((0.4, 0.));
+            let scale = Scale::from(1.25);
+            let mut ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+
+            let source = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == source_id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let mut source_elements = Vec::new();
+            source.render_normal(ctx.r(), location, scale, 1., &mut |elem| {
+                source_elements.push(elem)
+            });
+
+            let mirror = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == mirror_id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let mut mirror_elements = Vec::new();
+            mirror.render_normal(ctx.r(), location, scale, 1., &mut |elem| {
+                mirror_elements.push(elem)
+            });
+
+            assert_eq!(
+                first_surface_geometry(&mirror_elements, scale),
+                first_surface_geometry(&source_elements, scale),
+            );
+        })
+        .unwrap();
+}
+
+#[test]
+fn tiled_mirror_one_pixel_short_keeps_source_scale() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    backend
+        .with_primary_renderer(|renderer| {
+            let scale = Scale::from(1.);
+            let mut ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+
+            let mirror = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == mirror_id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let mut mirror_elements = Vec::new();
+            mirror.render_normal_with_size(
+                ctx.r(),
+                Point::default(),
+                Size::from((40., 19.)),
+                scale,
+                1.,
+                &mut |elem| mirror_elements.push(elem),
+            );
+
+            assert_eq!(
+                first_surface_geometry(&mirror_elements, scale).size,
+                Size::from((40, 20)),
+            );
+        })
+        .unwrap();
+}
+
+#[test]
+fn tiled_mirror_near_double_size_keeps_integer_scale() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    backend
+        .with_primary_renderer(|renderer| {
+            let scale = Scale::from(1.);
+            let mut ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+
+            let mirror = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == mirror_id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let mut mirror_elements = Vec::new();
+            mirror.render_normal_with_size(
+                ctx.r(),
+                Point::default(),
+                Size::from((79., 39.)),
+                scale,
+                1.,
+                &mut |elem| mirror_elements.push(elem),
+            );
+
+            assert_eq!(
+                first_surface_geometry(&mirror_elements, scale).size,
+                Size::from((80, 40)),
+            );
+        })
+        .unwrap();
+}
+
+#[test]
+fn mirror_non_integer_scale_keeps_contain_scaling() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    backend
+        .with_primary_renderer(|renderer| {
+            let scale = Scale::from(1.);
+            let mut ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+
+            let mirror = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == mirror_id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let mut mirror_elements = Vec::new();
+            mirror.render_normal_with_size(
+                ctx.r(),
+                Point::default(),
+                Size::from((70., 39.)),
+                scale,
+                1.,
+                &mut |elem| mirror_elements.push(elem),
+            );
+
+            assert_eq!(
+                first_surface_geometry(&mirror_elements, scale).size,
+                Size::from((70, 35)),
+            );
+        })
+        .unwrap();
+}
+
+#[test]
+fn mirror_window_cast_bbox_matches_mirror_viewport() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(10));
+
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+
+    assert_eq!(mapped.window_cast_bbox(scale).size, Size::from((20, 10)));
+}
+
+#[test]
+fn floating_mirror_keeps_viewport_corner_radius_when_downscaled() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^source$").unwrap()),
+            is_floating: Some(true),
+            ..Default::default()
+        }],
+        geometry_corner_radius: Some(CornerRadius::from(20.)),
+        ..Default::default()
+    });
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^source$").unwrap()),
+            is_floating: Some(false),
+            ..Default::default()
+        }],
+        geometry_corner_radius: Some(CornerRadius::default()),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (80, 80), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(40));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(40));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_window_output_pixels_for(&mut f, &output, mirror_id);
+
+    assert_eq!(size, Size::from((40, 40)));
+    assert_eq!(sample_pixel(size, &pixels, 8, 2), [0, 0, 0, 0]);
+    assert_eq!(sample_pixel(size, &pixels, 2, 8), [0, 0, 0, 0]);
+    assert_eq!(sample_pixel(size, &pixels, 20, 20), [0, 255, 0, 255]);
+}
+
+#[test]
+fn oversized_mirror_with_window_geometry_keeps_padding_transparent() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(120));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(80));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_window_output_pixels_for(&mut f, &output, mirror_id);
+
+    assert_eq!(size, Size::from((120, 80)));
+    assert_eq!(sample_pixel(size, &pixels, size.w / 2, 4), [0, 0, 0, 0]);
+    assert_eq!(sample_pixel(size, &pixels, size.w / 2, 5), [0, 255, 0, 255]);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(sample_pixel(size, &pixels, 2, size.h / 2), [0, 255, 0, 255]);
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w - 3, size.h / 2),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(sample_pixel(size, &pixels, size.w / 2, 75), [0, 0, 0, 0]);
+}
+
+#[test]
+fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
+    let mut config = Config::default();
+    config.layout.border.off = false;
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^source$").unwrap()),
+            ..Default::default()
+        }],
+        draw_border_with_background: Some(true),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config(config);
+    if f.niri_state().backend.headless().add_renderer().is_err() {
+        eprintln!("skipping capture block-out test: headless EGL renderer unavailable");
+        return;
+    }
+    f.add_output(1, (200, 150));
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(120));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(80));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::Output);
+    let (window_render_loc, content_rect) = {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        let (tile, tile_pos, visible) = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == mirror_id)
+            .unwrap();
+        assert!(visible);
+
+        let window_render_loc = (tile_pos + tile.window_loc()).to_i32_round();
+        let mapped = f
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == mirror_id)
+            .map(|(_, mapped)| mapped)
+            .unwrap();
+        let (content_loc, content_scale) = mapped.mirror_content_transform();
+        let source_geometry = mapped.window.geometry().to_f64();
+        let content_rect = smithay::utils::Rectangle::new(
+            window_render_loc + content_loc.to_i32_round(),
+            source_geometry.size.upscale(content_scale).to_i32_round(),
+        );
+
+        (window_render_loc, content_rect)
+    };
+
+    let center_x = window_render_loc.x + 120 / 2;
+    assert_eq!(
+        sample_pixel(size, &pixels, center_x, content_rect.loc.y - 1),
+        [0, 0, 0, 0]
+    );
+    assert_eq!(
+        sample_pixel(size, &pixels, center_x, content_rect.loc.y),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        sample_pixel(
+            size,
+            &pixels,
+            center_x,
+            content_rect.loc.y + content_rect.size.h - 1
+        ),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        sample_pixel(
+            size,
+            &pixels,
+            center_x,
+            content_rect.loc.y + content_rect.size.h
+        ),
+        [0, 0, 0, 0]
+    );
+}
+
+#[test]
 fn mirror_windows_resize_independently_from_each_other() {
     let Some(mut f) = set_up(Config::default()) else {
         return;
@@ -602,6 +1081,37 @@ fn mirror_animation_snapshot_scales_contents_into_mirror() {
             assert_eq!(snapshot.contents.len(), 1);
             assert_eq!(snapshot.contents[0].location, Point::from((0., 20.)));
             assert_eq!(snapshot.contents[0].dst, Some(Size::from((80, 40))));
+        })
+        .unwrap();
+}
+
+#[test]
+fn mirror_animation_snapshot_uses_window_geometry_not_buffer_extents() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    let output = f.niri_output(1);
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    backend
+        .with_primary_renderer(|renderer| {
+            let mapped = niri
+                .layout
+                .windows_for_output_mut(&output)
+                .find(|mapped| mapped.id() == mirror_id)
+                .unwrap();
+
+            mapped.store_animation_snapshot(renderer);
+            let snapshot = mapped.take_animation_snapshot().unwrap();
+
+            assert_eq!(snapshot.size, Size::from((96., 56.)));
+            assert_eq!(snapshot.contents.len(), 1);
+            assert_eq!(snapshot.contents[0].location, Point::from((0., 0.)));
+            assert_eq!(snapshot.contents[0].dst, Some(Size::from((96, 56))));
         })
         .unwrap();
 }
@@ -927,6 +1437,47 @@ fn blocked_window_cast_is_fully_transparent() {
         sample_pixel(size, &pixels, size.w / 2, size.h / 2),
         [0, 0, 0, 0]
     );
+}
+
+#[test]
+fn blocked_mirror_window_cast_is_fully_transparent() {
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^blocked$").unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(BlockOutFrom::Screencast),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "blocked", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(80));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(80));
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
+
+    assert_eq!(size, Size::from((80, 80)));
+    assert_eq!(
+        sample_pixel(size, &pixels, size.w / 2, size.h / 2),
+        [0, 0, 0, 0]
+    );
+    assert_eq!(sample_pixel(size, &pixels, size.w / 2, 10), [0, 0, 0, 0]);
+    assert_eq!(sample_pixel(size, &pixels, 10, size.h / 2), [0, 0, 0, 0]);
 }
 
 #[test]

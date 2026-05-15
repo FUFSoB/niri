@@ -93,6 +93,9 @@ pub struct Tile<W: LayoutElement> {
     /// The animation of the window resizing.
     resize_animation: Option<ResizeAnimation>,
 
+    /// Pending live resize animation state for synchronous layout elements such as mirrors.
+    pending_live_resize: Option<PendingLiveResize>,
+
     /// The animation of a tile visually moving horizontally.
     move_x_animation: Option<MoveAnimation>,
 
@@ -151,7 +154,7 @@ pub type TileRenderSnapshot =
 struct ResizeAnimation {
     anim: Animation,
     size_from: Size<f64, Logical>,
-    snapshot: LayoutElementRenderSnapshot,
+    source: ResizeSource,
     offscreen: OffscreenBuffer,
     tile_size_from: Size<f64, Logical>,
     // If the resize involved the fullscreen state at some point, this is the progress toward the
@@ -162,6 +165,20 @@ struct ResizeAnimation {
     fullscreen_progress: Option<Animation>,
     // Similar to above but for fullscreen-or-maximized.
     expanded_progress: Option<Animation>,
+}
+
+#[derive(Debug)]
+enum ResizeSource {
+    Snapshot(LayoutElementRenderSnapshot),
+    Live { previous_offscreen: OffscreenBuffer },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingLiveResize {
+    size_from: Size<f64, Logical>,
+    tile_size_from: Size<f64, Logical>,
+    fullscreen_from: f64,
+    expanded_from: f64,
 }
 
 #[derive(Debug)]
@@ -211,6 +228,7 @@ impl<W: LayoutElement> Tile<W> {
             floating_preset_height_idx: None,
             open_animation: None,
             resize_animation: None,
+            pending_live_resize: None,
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
@@ -382,9 +400,66 @@ impl<W: LayoutElement> Tile<W> {
                 self.resize_animation = Some(ResizeAnimation {
                     anim,
                     size_from,
-                    snapshot: animate_from,
+                    source: ResizeSource::Snapshot(animate_from),
                     offscreen,
                     tile_size_from,
+                    fullscreen_progress,
+                    expanded_progress,
+                });
+            } else {
+                self.resize_animation = None;
+            }
+        } else if let Some(live_from) = self.pending_live_resize.take() {
+            let (offscreen, previous_offscreen) = if let Some(resize) = self.resize_animation.take()
+            {
+                let previous_offscreen = match resize.source {
+                    ResizeSource::Snapshot(_) => OffscreenBuffer::default(),
+                    ResizeSource::Live { previous_offscreen } => previous_offscreen,
+                };
+                (resize.offscreen, previous_offscreen)
+            } else {
+                (OffscreenBuffer::default(), OffscreenBuffer::default())
+            };
+
+            let change = self.window.size().to_f64().to_point() - live_from.size_from.to_point();
+            let change = f64::max(change.x.abs(), change.y.abs());
+            let tile_change =
+                self.tile_size().to_f64().to_point() - live_from.tile_size_from.to_point();
+            let tile_change = f64::max(tile_change.x.abs(), tile_change.y.abs());
+            let change = f64::max(change, tile_change);
+
+            let fullscreen_to = if self.sizing_mode.is_fullscreen() {
+                1.
+            } else {
+                0.
+            };
+            let expanded_to = if self.sizing_mode.is_normal() { 0. } else { 1. };
+            let fullscreen_progress_changed = live_from.fullscreen_from != fullscreen_to;
+            let expanded_progress_changed = live_from.expanded_from != expanded_to;
+
+            if change > RESIZE_ANIMATION_THRESHOLD
+                || fullscreen_progress_changed
+                || expanded_progress_changed
+            {
+                let anim = Animation::new(
+                    self.clock.clone(),
+                    0.,
+                    1.,
+                    0.,
+                    self.options.animations.window_resize.anim,
+                );
+
+                let fullscreen_progress = fullscreen_progress_changed
+                    .then(|| anim.restarted(live_from.fullscreen_from, fullscreen_to, 0.));
+                let expanded_progress = expanded_progress_changed
+                    .then(|| anim.restarted(live_from.expanded_from, expanded_to, 0.));
+
+                self.resize_animation = Some(ResizeAnimation {
+                    anim,
+                    size_from: live_from.size_from,
+                    source: ResizeSource::Live { previous_offscreen },
+                    offscreen,
+                    tile_size_from: live_from.tile_size_from,
                     fullscreen_progress,
                     expanded_progress,
                 });
@@ -922,7 +997,7 @@ impl<W: LayoutElement> Tile<W> {
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
         // round to avoid situations where proportionally-sized columns don't fit on the screen
         // exactly.
-        self.window.request_size(
+        self.request_size(
             size.to_i32_floor(),
             SizingMode::Normal,
             animate,
@@ -968,7 +1043,7 @@ impl<W: LayoutElement> Tile<W> {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
-        self.window.request_size(
+        self.request_size(
             size.to_i32_round(),
             SizingMode::Maximized,
             animate,
@@ -977,12 +1052,29 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn request_fullscreen(&mut self, animate: bool, transaction: Option<Transaction>) {
-        self.window.request_size(
+        self.request_size(
             self.view_size.to_i32_round(),
             SizingMode::Fullscreen,
             animate,
             transaction,
         );
+    }
+
+    pub fn request_window_size_once(&mut self, size: Size<i32, Logical>, animate: bool) -> bool {
+        let prev_size = self.window.size();
+        let prev_sizing_mode = self.window.sizing_mode();
+        self.pending_live_resize = animate.then(|| self.pending_live_resize_state());
+        self.window.request_size_once(size, animate);
+
+        let sync_resize_applied =
+            self.window.size() != prev_size || self.window.sizing_mode() != prev_sizing_mode;
+        if sync_resize_applied {
+            self.update_window();
+        } else {
+            self.pending_live_resize = None;
+        }
+
+        sync_resize_applied
     }
 
     pub fn min_size_nonfullscreen(&self) -> Size<f64, Logical> {
@@ -1099,8 +1191,44 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(resize) = &self.resize_animation {
             if ResizeRenderElement::has_shader(ctx.renderer) {
                 let mut ctx = ctx.as_gles();
+                let previous = match &resize.source {
+                    ResizeSource::Snapshot(snapshot) => {
+                        snapshot.texture(ctx.r(), scale).cloned().map(|texture| {
+                            let blocked_out = ctx.should_block_out(snapshot.block_out_from)
+                                && ctx.should_block_out(self.window.effective_block_out_from());
+                            (texture, snapshot.size, blocked_out)
+                        })
+                    }
+                    ResizeSource::Live { previous_offscreen } => {
+                        let mut window_elements = Vec::new();
+                        self.window.render_normal_with_size(
+                            ctx.r(),
+                            Point::from((0., 0.)),
+                            resize.size_from,
+                            scale,
+                            1.,
+                            &mut |elem| window_elements.push(elem),
+                        );
 
-                if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
+                        previous_offscreen
+                            .render(ctx.renderer, scale, &window_elements)
+                            .map(|(elem, _sync_point, _data)| {
+                                let texture = elem.texture().clone();
+                                let geo = elem.geometry(scale);
+                                (
+                                    (texture, geo),
+                                    resize.size_from,
+                                    ctx.should_block_out(self.window.effective_block_out_from()),
+                                )
+                            })
+                            .map_err(|err| {
+                                warn!("error rendering previous window state to texture: {err:?}")
+                            })
+                            .ok()
+                    }
+                };
+
+                if let Some((texture_from, size_from, previous_blocked_out)) = previous {
                     let mut window_elements = Vec::new();
                     self.window.render_normal(
                         ctx.r(),
@@ -1116,9 +1244,7 @@ impl<W: LayoutElement> Tile<W> {
                         .map_err(|err| warn!("error rendering window to texture: {err:?}"))
                         .ok();
 
-                    // Clip blocked-out resizes unconditionally because they use solid color render
-                    // elements.
-                    let clip_to_geometry = if ctx.should_block_out(resize.snapshot.block_out_from)
+                    let clip_to_geometry = if previous_blocked_out
                         && ctx.should_block_out(self.window.effective_block_out_from())
                     {
                         true
@@ -1136,8 +1262,8 @@ impl<W: LayoutElement> Tile<W> {
                         let elem = ResizeRenderElement::new(
                             area,
                             scale,
-                            texture_from.clone(),
-                            resize.snapshot.size,
+                            texture_from,
+                            size_from,
                             (texture_current, texture_current_geo),
                             window_size,
                             resize.anim.value() as f32,
@@ -1235,6 +1361,9 @@ impl<W: LayoutElement> Tile<W> {
                     }
 
                     LayoutElementRenderElement::MirrorScaledWayland(elem).into()
+                }
+                LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
+                    LayoutElementRenderElement::MirrorScaledClippedWayland(elem).into()
                 }
                 LayoutElementRenderElement::SolidColor(elem) => {
                     // In this branch we're rendering a blocked-out window with a solid
@@ -1604,5 +1733,37 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+
+    fn pending_live_resize_state(&self) -> PendingLiveResize {
+        PendingLiveResize {
+            size_from: self.animated_window_size(),
+            tile_size_from: self.animated_tile_size(),
+            fullscreen_from: self.fullscreen_progress(),
+            expanded_from: self.expanded_progress(),
+        }
+    }
+
+    fn request_size(
+        &mut self,
+        size: Size<i32, Logical>,
+        mode: SizingMode,
+        animate: bool,
+        transaction: Option<Transaction>,
+    ) -> bool {
+        let prev_size = self.window.size();
+        let prev_sizing_mode = self.window.sizing_mode();
+        self.pending_live_resize = animate.then(|| self.pending_live_resize_state());
+        self.window.request_size(size, mode, animate, transaction);
+
+        let sync_resize_applied =
+            self.window.size() != prev_size || self.window.sizing_mode() != prev_sizing_mode;
+        if sync_resize_applied {
+            self.update_window();
+        } else {
+            self.pending_live_resize = None;
+        }
+
+        sync_resize_applied
     }
 }

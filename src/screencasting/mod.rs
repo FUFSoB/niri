@@ -12,12 +12,11 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
+use smithay::utils::{Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::layout::workspace::WorkspaceId;
-use crate::layout::LayoutElement as _;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -219,14 +218,7 @@ impl State {
             };
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let bbox = if mapped.is_mirror() {
-                Rectangle::from_size(mapped.size()).to_physical_precise_up(scale)
-            } else {
-                mapped
-                    .window
-                    .bbox_with_popups()
-                    .to_physical_precise_up(scale)
-            };
+            let bbox = mapped.window_cast_bbox(scale);
 
             match cast.ensure_size(bbox.size) {
                 Ok(CastSizeChange::Ready) => (),
@@ -250,11 +242,7 @@ impl State {
                         // - win_pos is the position of the main window surface in output-local
                         //   coordinates
                         // - bbox.loc moves us relative to the screencast buffer
-                        let buf_pos = if mapped.is_mirror() {
-                            win_pos - mapped.buf_loc().to_f64()
-                        } else {
-                            win_pos + bbox.loc.to_f64().to_logical(scale)
-                        };
+                        let buf_pos = mapped.window_cast_buffer_pos(win_pos, scale);
                         let output_pos =
                             self.niri.global_space.output_geometry(output).unwrap().loc;
                         pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
@@ -875,10 +863,7 @@ impl Niri {
                 continue;
             };
 
-            let bbox = mapped
-                .window
-                .bbox_with_popups()
-                .to_physical_precise_up(scale);
+            let bbox = mapped.window_cast_bbox(scale);
 
             match cast.ensure_size(bbox.size) {
                 Ok(CastSizeChange::Ready) => (),
@@ -902,7 +887,7 @@ impl Niri {
                     // - win_pos is the position of the main window surface in output-local
                     //   coordinates
                     // - bbox.loc moves us relative to the screencast buffer
-                    let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                    let buf_pos = mapped.window_cast_buffer_pos(win_pos, scale);
                     let output_pos = self.global_space.output_geometry(output).unwrap().loc;
                     pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
 
@@ -1005,17 +990,7 @@ impl Niri {
             .find(|(_, m)| m.id().get() == window_id)?;
         let output = self.casting.mapped_cast_output.get(&mapped.id())?;
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let size = if mapped.is_mirror() {
-            Rectangle::from_size(mapped.size())
-                .to_physical_precise_up(scale)
-                .size
-        } else {
-            mapped
-                .window
-                .bbox_with_popups()
-                .to_physical_precise_up(scale)
-                .size
-        };
+        let size = mapped.window_cast_bbox(scale).size;
         let refresh = output.current_mode().unwrap().refresh as u32;
         Some((size, refresh))
     }

@@ -43,6 +43,11 @@ fn tile_geometry_for(niri: &Niri, id: MappedId) -> (Point<i32, Logical>, Size<i3
     (pos.to_i32_round(), tile.animated_tile_size().to_i32_round())
 }
 
+fn between_inclusive(value: i32, a: i32, b: i32) -> bool {
+    let (min, max) = if a <= b { (a, b) } else { (b, a) };
+    min <= value && value <= max
+}
+
 fn create_window(f: &mut Fixture, id: ClientId, w: u16, h: u16) -> WlSurface {
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
@@ -241,7 +246,7 @@ fn egl_clientside_height_change_doesnt_animate() {
 }
 
 #[test]
-fn mirror_consume_into_column_snaps_to_final_positions() {
+fn mirror_consume_into_column_animates_positions() {
     let mut f = set_up_without_renderer();
     let id = f.add_client();
     create_window(&mut f, id, 100, 100);
@@ -251,9 +256,27 @@ fn mirror_consume_into_column_snaps_to_final_positions() {
     let mirror2_id = create_window_mirror_next_to(&mut f, source_id, mirror1_id);
 
     f.niri_complete_animations();
-    f.niri().layout.focus_right();
+    f.niri().layout.activate_window(&mirror1_id);
+    f.niri_complete_animations();
+    set_time(f.niri(), Duration::ZERO);
+
+    let before_mirror1 = tile_geometry_for(f.niri(), mirror1_id);
+    let before_mirror2 = tile_geometry_for(f.niri(), mirror2_id);
 
     f.niri().layout.consume_into_column();
+    let start_mirror1 = tile_geometry_for(f.niri(), mirror1_id);
+    let start_mirror2 = tile_geometry_for(f.niri(), mirror2_id);
+
+    assert_eq!(start_mirror1, before_mirror1);
+    assert_eq!(start_mirror2, before_mirror2);
+
+    set_time(f.niri(), Duration::from_millis(500));
+    f.niri().advance_animations();
+    let mid_mirror1 = tile_geometry_for(f.niri(), mirror1_id);
+    let mid_mirror2 = tile_geometry_for(f.niri(), mirror2_id);
+
+    set_time(f.niri(), Duration::from_millis(1000));
+    f.niri().advance_animations();
 
     let working_area = f.niri().layout.active_workspace().unwrap().working_area();
     let area_x = working_area.loc.x.round() as i32;
@@ -263,6 +286,19 @@ fn mirror_consume_into_column_snaps_to_final_positions() {
 
     let (mirror1_pos, mirror1_size) = tile_geometry_for(f.niri(), mirror1_id);
     let (mirror2_pos, mirror2_size) = tile_geometry_for(f.niri(), mirror2_id);
+
+    assert!(mid_mirror1.1.h < before_mirror1.1.h);
+    assert!(mid_mirror1.1.h > mirror1_size.h);
+    assert!(between_inclusive(
+        mid_mirror2.0.x,
+        before_mirror2.0.x,
+        mirror2_pos.x
+    ));
+    assert!(between_inclusive(
+        mid_mirror2.1.h,
+        before_mirror2.1.h,
+        mirror2_size.h
+    ));
 
     assert_eq!(mirror1_pos.x, mirror2_pos.x);
     assert_eq!(mirror1_size.w, mirror2_size.w);
@@ -316,8 +352,21 @@ fn mirror_maximize_to_edges_stays_within_viewport() {
     let mirror_id = create_window_mirror_next_to(&mut f, source_id, source_id);
     f.niri_complete_animations();
     f.niri().layout.activate_window(&mirror_id);
-    f.niri().layout.set_maximized(&mirror_id, true);
     f.niri_complete_animations();
+    set_time(f.niri(), Duration::ZERO);
+
+    let before = tile_geometry_for(f.niri(), mirror_id);
+    f.niri().layout.set_maximized(&mirror_id, true);
+
+    let start = tile_geometry_for(f.niri(), mirror_id);
+    assert_eq!(start, before);
+
+    set_time(f.niri(), Duration::from_millis(500));
+    f.niri().advance_animations();
+    let mid = tile_geometry_for(f.niri(), mirror_id);
+
+    set_time(f.niri(), Duration::from_millis(1000));
+    f.niri().advance_animations();
 
     let ws = f.niri().layout.active_workspace().unwrap();
     let area = ws.scrolling().parent_area();
@@ -327,6 +376,10 @@ fn mirror_maximize_to_edges_stays_within_viewport() {
     let area_h = area.size.h.round() as i32;
 
     let (mirror_pos, mirror_size) = tile_geometry_for(f.niri(), mirror_id);
+    assert!(between_inclusive(mid.0.x, before.0.x, mirror_pos.x));
+    assert!(between_inclusive(mid.0.y, before.0.y, mirror_pos.y));
+    assert!(between_inclusive(mid.1.w, before.1.w, mirror_size.w));
+    assert!(between_inclusive(mid.1.h, before.1.h, mirror_size.h));
     assert_eq!(mirror_pos.x, area_x);
     assert_eq!(mirror_pos.y, area_y);
     assert!(mirror_pos.x + mirror_size.w <= area_x + area_w);

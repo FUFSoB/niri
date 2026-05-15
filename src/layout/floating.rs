@@ -449,33 +449,38 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // Restore the previous floating window size, and in case the tile is fullscreen,
         // unfullscreen it.
         let floating_size = tile.floating_window_size;
-        let win = tile.window_mut();
-        let mut size = if !win.pending_sizing_mode().is_normal() {
-            // If the window was fullscreen or maximized without a floating size, ask for (0, 0).
-            floating_size.unwrap_or_default()
-        } else {
-            // If the window wasn't fullscreen without a floating size (e.g. it was tiled before),
-            // ask for the current size. If the current size is unknown (the window was only ever
-            // fullscreen until now), fall back to (0, 0).
-            floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
+        let size = {
+            let win = tile.window();
+            let mut size = if !win.pending_sizing_mode().is_normal() {
+                // If the window was fullscreen or maximized without a floating size, ask for (0,
+                // 0).
+                floating_size.unwrap_or_default()
+            } else {
+                // If the window wasn't fullscreen without a floating size (e.g. it was tiled
+                // before), ask for the current size. If the current size is unknown
+                // (the window was only ever fullscreen until now), fall back to (0,
+                // 0).
+                floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
+            };
+
+            // Apply min/max size window rules. If requesting a concrete size, apply completely; if
+            // requesting (0, 0), apply only when min/max results in a fixed size.
+            let min_size = win.min_size();
+            let max_size = win.max_size();
+            size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+            size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+            size
         };
 
-        // Apply min/max size window rules. If requesting a concrete size, apply completely; if
-        // requesting (0, 0), apply only when min/max results in a fixed size.
-        let min_size = win.min_size();
-        let max_size = win.max_size();
-        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
-
-        win.request_size_once(size, true);
+        tile.request_window_size_once(size, true);
 
         if activate || self.tiles.is_empty() {
-            self.active_window_id = Some(win.id().clone());
+            self.active_window_id = Some(tile.window().id().clone());
         }
 
         // Make sure the tile isn't inserted below its parent.
         for (i, tile_above) in self.tiles.iter().enumerate().take(idx) {
-            if win.is_child_of(tile_above.window()) {
+            if tile.window().is_child_of(tile_above.window()) {
                 idx = i;
                 break;
             }
@@ -836,7 +841,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         };
         let win_width = win_width.round().clamp(1., MAX_PX) as i32;
 
-        let win = tile.window_mut();
+        let win = tile.window();
         let min_size = win.min_size();
         let max_size = win.max_size();
 
@@ -846,7 +851,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let win_height = ensure_min_max_size(win_height, min_size.h, max_size.h);
 
         let win_size = Size::from((win_width, win_height));
-        win.request_size_once(win_size, animate);
+        let sync_resize_applied = tile.request_window_size_once(win_size, animate);
+        if sync_resize_applied {
+            self.data[idx].update(tile);
+        }
     }
 
     pub fn set_window_height(&mut self, id: Option<&W::Id>, change: SizeChange, animate: bool) {
@@ -883,7 +891,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         };
         let win_height = win_height.round().clamp(1., MAX_PX) as i32;
 
-        let win = tile.window_mut();
+        let win = tile.window();
         let min_size = win.min_size();
         let max_size = win.max_size();
 
@@ -893,7 +901,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let win_width = ensure_min_max_size(win_width, min_size.w, max_size.w);
 
         let win_size = Size::from((win_width, win_height));
-        win.request_size_once(win_size, animate);
+        let sync_resize_applied = tile.request_window_size_once(win_size, animate);
+        if sync_resize_applied {
+            self.data[idx].update(tile);
+        }
     }
 
     fn focus_directional(
@@ -1208,13 +1219,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.set_window_height(Some(window), SizeChange::SetFixed(window_height), false);
         }
 
-        // Mirrors apply size updates synchronously and never commit, so mirror the update_window()
-        // path now to keep geometry and edge-anchored resizing correct.
         if self.tiles[idx].window().size() != prev_window_size {
-            let tile = &mut self.tiles[idx];
             let data = &mut self.data[idx];
-            tile.update_window();
-            data.update(tile);
 
             let mut offset = Point::from((0., 0.));
             if edges.contains(ResizeEdge::LEFT) {

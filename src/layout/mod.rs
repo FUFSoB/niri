@@ -62,6 +62,7 @@ use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
@@ -127,6 +128,7 @@ niri_render_elements! {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamespacedWayland = NamespacedElement<WaylandSurfaceRenderElement<R>>,
         MirrorScaledWayland = NamespacedScaledWaylandSurfaceRenderElement<R>,
+        MirrorScaledClippedWayland = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
     }
@@ -197,6 +199,23 @@ pub trait LayoutElement {
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
         let _ = (ctx, location, scale, alpha, push);
+    }
+
+    /// Renders the non-popup parts of the element as if its visual size were `size`.
+    ///
+    /// This is used for synchronous resize animations where the element can draw both the old and
+    /// the new size live without waiting for a client commit.
+    fn render_normal_with_size<R: NiriRenderer>(
+        &self,
+        ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        alpha: f32,
+        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
+        let _ = size;
+        self.render_normal(ctx, location, scale, alpha, push);
     }
 
     /// Renders the popups of the element.
@@ -3923,19 +3942,22 @@ impl<W: LayoutElement> Layout<W> {
                 // When going to floating, restore the floating window size.
                 if move_.is_floating {
                     let floating_size = move_.tile.floating_window_size;
-                    let win = move_.tile.window_mut();
-                    let mut size =
-                        floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default());
+                    let size = {
+                        let win = move_.tile.window();
+                        let mut size = floating_size
+                            .unwrap_or_else(|| win.expected_size().unwrap_or_default());
 
-                    // Apply min/max size window rules. If requesting a concrete size, apply
-                    // completely; if requesting (0, 0), apply only when min/max results in a fixed
-                    // size.
-                    let min_size = win.min_size();
-                    let max_size = win.max_size();
-                    size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-                    size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+                        // Apply min/max size window rules. If requesting a concrete size, apply
+                        // completely; if requesting (0, 0), apply only when min/max results in a
+                        // fixed size.
+                        let min_size = win.min_size();
+                        let max_size = win.max_size();
+                        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+                        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+                        size
+                    };
 
-                    win.request_size_once(size, true);
+                    move_.tile.request_window_size_once(size, true);
 
                     // Animate the tile back to opaque.
                     move_.tile.animate_alpha(
