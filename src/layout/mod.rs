@@ -4219,24 +4219,82 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_floating(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
             return;
         };
-        workspace.focus_floating();
+
+        let mon = &mut monitors[*active_monitor_idx];
+        if mon.sticky_is_active() {
+            return;
+        }
+
+        let workspace = &mut mon.workspaces[mon.active_workspace_idx];
+        if workspace.floating_is_active() {
+            return;
+        }
+
+        if workspace.has_floating_windows() {
+            workspace.focus_floating();
+            return;
+        }
+
+        let Some(window) = mon.sticky.active_window().map(|window| window.id().clone()) else {
+            return;
+        };
+        mon.activate_sticky_window_without_raising(&window);
     }
 
     pub fn focus_tiling(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
             return;
         };
+
+        let mon = &mut monitors[*active_monitor_idx];
+        if mon.sticky_is_active() {
+            mon.focus_workspace();
+        }
+
+        let workspace = &mut mon.workspaces[mon.active_workspace_idx];
         workspace.focus_tiling();
     }
 
     pub fn switch_focus_floating_tiling(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
             return;
         };
-        workspace.switch_focus_floating_tiling();
+
+        let mon = &mut monitors[*active_monitor_idx];
+        if mon.sticky_is_active() {
+            mon.focus_workspace();
+            mon.workspaces[mon.active_workspace_idx].focus_tiling();
+            return;
+        }
+
+        let workspace = &mut mon.workspaces[mon.active_workspace_idx];
+        if workspace.has_floating_windows() {
+            workspace.switch_focus_floating_tiling();
+            return;
+        }
+
+        let Some(window) = mon.sticky.active_window().map(|window| window.id().clone()) else {
+            return;
+        };
+        mon.activate_sticky_window_without_raising(&window);
     }
 
     pub fn move_floating_window(
@@ -6645,6 +6703,12 @@ impl<W: LayoutElement> Layout<W> {
         iter_normal.chain(iter_no_outputs)
     }
 
+    fn workspace_for_window(&self, window: &W::Id) -> Option<&Workspace<W>> {
+        self.workspaces()
+            .find(|(_, _, ws)| ws.has_window(window))
+            .map(|(_, _, ws)| ws)
+    }
+
     fn workspace_for_window_mut(&mut self, window: &W::Id) -> Option<&mut Workspace<W>> {
         self.workspaces_mut().find(|ws| ws.has_window(window))
     }
@@ -6676,6 +6740,13 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn is_sticky_window(&self, window: &W::Id) -> bool {
         self.monitors().any(|mon| mon.sticky_has_window(window))
+    }
+
+    pub fn is_floating_or_sticky_window(&self, window: &W::Id) -> bool {
+        self.is_sticky_window(window)
+            || self
+                .workspace_for_window(window)
+                .is_some_and(|ws| ws.is_floating(window))
     }
 
     pub fn is_overview_open(&self) -> bool {

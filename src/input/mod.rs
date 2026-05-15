@@ -2810,18 +2810,24 @@ impl State {
 
         // Handle confined pointer.
         if let Some((focus_surface, region)) = pointer_confined {
+            let entering_floating_or_sticky = under
+                .window
+                .as_ref()
+                .is_some_and(|(window, _)| self.niri.layout.is_floating_or_sticky_window(window));
             let mut prevent = false;
 
-            // Prevent the pointer from leaving the focused surface.
-            if Some(&focus_surface.0) != under.surface.as_ref().map(|(s, _)| s) {
-                prevent = true;
-            }
-
-            // Prevent the pointer from leaving the confine region, if any.
-            if let Some(region) = region {
-                let new_pos_within_surface = new_pos - focus_surface.1;
-                if !region.contains(new_pos_within_surface.to_i32_round()) {
+            if !entering_floating_or_sticky {
+                // Prevent the pointer from leaving the focused surface.
+                if Some(&focus_surface.0) != under.surface.as_ref().map(|(s, _)| s) {
                     prevent = true;
+                }
+
+                // Prevent the pointer from leaving the confine region, if any.
+                if let Some(region) = region {
+                    let new_pos_within_surface = new_pos - focus_surface.1;
+                    if !region.contains(new_pos_within_surface.to_i32_round()) {
+                        prevent = true;
+                    }
                 }
             }
 

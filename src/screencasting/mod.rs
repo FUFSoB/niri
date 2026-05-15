@@ -533,17 +533,36 @@ impl State {
 }
 
 impl Niri {
-    pub fn refresh_mapped_cast_window_rules(&mut self) {
-        // O(N^2) but should be fine since there aren't many casts usually.
+    pub fn refresh_mapped_cast_targets(&mut self) {
+        let mut window_targets = HashSet::new();
+        let mut workspace_targets = HashSet::new();
+
+        // Find regardless of cast.is_active.
+        for cast in &self.casting.casts {
+            match cast.target {
+                CastTarget::Window { id } => {
+                    window_targets.insert(id);
+                }
+                CastTarget::Workspace { id, .. } => {
+                    workspace_targets.insert(id);
+                }
+                CastTarget::Nothing | CastTarget::Output { .. } => (),
+            }
+        }
+
+        let mut screen_targets = HashSet::new();
+        self.layout.with_windows(|mapped, _, workspace_id, _| {
+            if workspace_id.is_some_and(|id| workspace_targets.contains(&id)) {
+                screen_targets.insert(mapped.id());
+            }
+        });
+
         self.layout.with_windows_mut(|mapped, _| {
-            let id = mapped.id().get();
-            // Find regardless of cast.is_active.
-            let value = self
-                .casting
-                .casts
-                .iter()
-                .any(|cast| cast.target == (CastTarget::Window { id }));
-            mapped.set_is_window_cast_target(value);
+            let is_window_target = window_targets.contains(&mapped.id().get());
+            let is_screen_target = is_window_target || screen_targets.contains(&mapped.id());
+
+            mapped.set_is_window_cast_target(is_window_target);
+            mapped.set_is_screen_cast_target(is_screen_target);
         });
     }
 

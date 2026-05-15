@@ -125,6 +125,9 @@ pub struct Mapped {
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
 
+    /// Whether this window must keep receiving frame callbacks for screencasting.
+    is_screen_cast_target: bool,
+
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
 
@@ -412,6 +415,7 @@ impl Mapped {
             is_floating: false,
             is_sticky: false,
             is_window_cast_target: false,
+            is_screen_cast_target: false,
             ignore_opacity_window_rule: false,
             invert_block_out_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
@@ -468,6 +472,7 @@ impl Mapped {
             is_floating: source.is_floating,
             is_sticky: false,
             is_window_cast_target: false,
+            is_screen_cast_target: false,
             ignore_opacity_window_rule: source.ignore_opacity_window_rule,
             invert_block_out_window_rule: source.invert_block_out_window_rule,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
@@ -765,6 +770,10 @@ impl Mapped {
         self.is_window_cast_target
     }
 
+    pub fn is_screen_cast_target(&self) -> bool {
+        self.is_screen_cast_target
+    }
+
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
         self.ignore_opacity_window_rule = !self.ignore_opacity_window_rule;
     }
@@ -806,6 +815,10 @@ impl Mapped {
 
         self.is_window_cast_target = value;
         self.need_to_recompute_rules = true;
+    }
+
+    pub fn set_is_screen_cast_target(&mut self, value: bool) {
+        self.is_screen_cast_target = value;
     }
 
     /// Renders a snapshot of the window without popups.

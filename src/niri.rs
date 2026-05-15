@@ -938,7 +938,7 @@ impl State {
         // Should happen before refresh_window_rules(), but after anything that can start or stop
         // screencasts.
         #[cfg(feature = "xdp-gnome-screencast")]
-        self.niri.refresh_mapped_cast_window_rules();
+        self.niri.refresh_mapped_cast_targets();
         self.ipc_refresh_casts();
 
         self.niri.refresh_window_rules();
@@ -5790,7 +5790,7 @@ impl Niri {
 
         for mapped in self.layout.windows_for_output_mut(output) {
             // Check if the surface should be forced to render.
-            if mapped.rules().force_render == Some(true) || mapped.is_window_cast_target() {
+            if mapped.rules().force_render == Some(true) || mapped.is_screen_cast_target() {
                 // Calculate delay time.
                 let interval = if let Some(force_render_fps) = mapped.rules().force_render_fps {
                     if force_render_fps == 0 {

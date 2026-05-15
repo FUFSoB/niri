@@ -2045,6 +2045,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating_is_active.get()
     }
 
+    pub fn has_floating_windows(&self) -> bool {
+        !self.floating.is_empty()
+    }
+
     pub fn floating_logical_to_size_frac(
         &self,
         logical_pos: Point<f64, Logical>,

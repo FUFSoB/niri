@@ -1780,6 +1780,109 @@ fn toggle_sticky_restores_window_to_original_workspace() {
 }
 
 #[test]
+fn focus_floating_switches_to_sticky_when_workspace_has_no_floating() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    layout.toggle_window_sticky(Some(&1));
+    layout.verify_invariants();
+    layout.activate_window(&2);
+    layout.verify_invariants();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+    assert!(!monitors[*active_monitor_idx].sticky_is_active());
+    assert_eq!(
+        *monitors[*active_monitor_idx].active_window().unwrap().id(),
+        2
+    );
+
+    layout.focus_floating();
+    layout.verify_invariants();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+    assert!(monitors[*active_monitor_idx].sticky_is_active());
+    assert_eq!(
+        *monitors[*active_monitor_idx].active_window().unwrap().id(),
+        1
+    );
+}
+
+#[test]
+fn switch_focus_floating_tiling_toggles_sticky_and_tiling() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    layout.toggle_window_sticky(Some(&1));
+    layout.verify_invariants();
+    layout.activate_window(&2);
+    layout.verify_invariants();
+
+    layout.switch_focus_floating_tiling();
+    layout.verify_invariants();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+    assert!(monitors[*active_monitor_idx].sticky_is_active());
+    assert_eq!(
+        *monitors[*active_monitor_idx].active_window().unwrap().id(),
+        1
+    );
+
+    layout.switch_focus_floating_tiling();
+    layout.verify_invariants();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+    assert!(!monitors[*active_monitor_idx].sticky_is_active());
+    assert_eq!(
+        *monitors[*active_monitor_idx].active_window().unwrap().id(),
+        2
+    );
+}
+
+#[test]
 fn operations_dont_panic() {
     if std::env::var_os("RUN_SLOW_TESTS").is_none() {
         eprintln!("ignoring slow test");

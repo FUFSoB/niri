@@ -1499,6 +1499,12 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
+        if self.active_space == ActiveSpace::Sticky {
+            if let Some(rect) = self.sticky.active_window_visual_rectangle() {
+                return Some(rect);
+            }
+        }
+
         self.active_workspace_ref().active_window_visual_rectangle()
     }
 
