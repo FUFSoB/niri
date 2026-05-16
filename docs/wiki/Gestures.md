@@ -12,6 +12,7 @@ Also see the [gestures configuration](./Configuration:-Gestures.md) wiki page.
 
 By default, you can move windows by holding <kbd>Mod</kbd> and the left mouse button.
 This is a regular bind now, so you can reassign it to a different mouse button or modifier combination with `move-window-interactively`.
+The overview keeps its historical bare left-button move/select behavior unless you set `overview { mouse-drag-behavior "binds" }`.
 
 You can customize the look of the window insertion preview in the [`insert-hint` layout config](./Configuration:-Layout.md#insert-hint).
 
@@ -46,6 +47,7 @@ This works with both window-initiated resizes (when using client-side decoration
 
 Move the view horizontally by default with <kbd>Mod</kbd> + middle mouse button (or the wheel) and dragging the mouse horizontally.
 The mouse drag bind can be reassigned with `move-view-or-switch-workspace-interactively`.
+In the overview, bare right drag remains the legacy horizontal pan by default; `mouse-drag-behavior "binds"` makes the bound button work there without <kbd>Mod</kbd>.
 
 #### Workspace Switch
 

@@ -27,6 +27,7 @@ cursor {
 overview {
     zoom 0.5
     backdrop-color "#262626"
+    // mouse-drag-behavior "legacy"
 
     workspace-shadow {
         // off
@@ -245,6 +246,21 @@ overview {
     workspace-shadow {
         off
     }
+}
+```
+
+#### `mouse-drag-behavior`
+
+Control how bare mouse drag gestures work in the overview.
+
+- `"legacy"` (default): keeps the historical overview mouse behavior. Bare left click selects windows and left drag moves them; bare right drag pans the overview horizontally.
+- `"binds"`: uses the same mouse buttons as your `move-window-interactively` and `move-view-or-switch-workspace-interactively` binds, but without requiring their modifiers while the overview is open.
+
+`resize-window-interactively` does not have an overview equivalent.
+
+```kdl
+overview {
+    mouse-drag-behavior "binds"
 }
 ```
 

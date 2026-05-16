@@ -681,6 +681,16 @@ mod tests {
     }
 
     #[test]
+    fn default_overview_mouse_drag_behavior_is_legacy() {
+        let config = Config::load_default();
+
+        assert_eq!(
+            config.overview.mouse_drag_behavior,
+            OverviewMouseDragBehavior::Legacy
+        );
+    }
+
+    #[test]
     fn parse_mouse_drag_bind_actions() {
         let config = do_parse(
             r#"
@@ -707,6 +717,22 @@ mod tests {
         assert_eq!(
             config.binds.0[4].action,
             Action::ZoomWindowMirrorInteractively
+        );
+    }
+
+    #[test]
+    fn parse_overview_mouse_drag_behavior() {
+        let config = do_parse(
+            r#"
+            overview {
+                mouse-drag-behavior "binds"
+            }
+            "#,
+        );
+
+        assert_eq!(
+            config.overview.mouse_drag_behavior,
+            OverviewMouseDragBehavior::Binds
         );
     }
 
@@ -1781,6 +1807,7 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+                mouse_drag_behavior: Legacy,
             },
             environment: Environment(
                 [

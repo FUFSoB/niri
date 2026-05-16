@@ -14,9 +14,11 @@ https://github.com/user-attachments/assets/379a5d1f-acdb-4c11-b36c-e85fd91f0995
 Open it with the `toggle-overview` bind, via the top-left hot corner, or using a touchpad four-finger swipe up.
 While in the overview, all keyboard shortcuts keep working, while pointing devices get easier:
 
-- Mouse: left click and drag windows to move them, right click and drag to scroll workspaces left/right, scroll to switch workspaces (no holding Mod required).
+- Mouse: by default, left click selects windows and left drag moves them; right drag scrolls workspaces left/right; scroll switches workspaces.
 - Touchpad: two-finger scrolling that matches the normal three-finger gestures.
 - Touchscreen: one-finger scrolling, or one-finger long press to move a window.
+
+Set `overview { mouse-drag-behavior "binds" }` if you want overview mouse drags to follow your configured `move-window-interactively` and `move-view-or-switch-workspace-interactively` buttons without holding their modifiers.
 
 > [!TIP]
 > The overview needs to draw a background under every workspace.

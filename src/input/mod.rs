@@ -6,8 +6,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
-    ZoomIncrementType,
+    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, OverviewMouseDragBehavior,
+    SwitchBinds, Trigger, ZoomIncrementType,
 };
 use niri_ipc::{LayoutSwitchTarget, PositionChange};
 use smithay::backend::input::{
@@ -336,6 +336,72 @@ impl State {
                 .cursor_manager
                 .set_cursor_image(CursorImageStatus::Named(icon));
         }
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_overview_move_window_interactively(
+        &mut self,
+        button_code: u32,
+        serial: Serial,
+    ) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let Some(window) = self.niri.window_under_cursor().map(|mapped| mapped.id()) else {
+            return false;
+        };
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location: pointer.current_location(),
+        };
+        let start_data = PointerOrTouchStartData::Pointer(start_data);
+        let Some(grab) = MoveGrab::new(self, start_data, window, false, None) else {
+            return false;
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_legacy_overview_spatial_movement(
+        &mut self,
+        button_code: u32,
+        serial: Serial,
+    ) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let Some((output, ws)) = self.niri.workspace_under_cursor(true) else {
+            return false;
+        };
+        let ws_id = ws.id();
+        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
+
+        self.niri.layout.focus_output(&output);
+
+        let location = pointer.current_location();
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location,
+        };
+        self.niri
+            .layout
+            .pointer_view_offset_gesture_begin(&output, Some(ws_idx));
+        let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+
         self.niri.queue_redraw_all();
         true
     }
@@ -3518,6 +3584,8 @@ impl State {
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
         let modifiers = modifiers_from_state(mods);
         let mod_down = modifiers.contains(mod_key.to_modifiers());
+        let is_overview_open = self.niri.layout.is_overview_open();
+        let overview_mouse_drag_behavior = self.niri.config.borrow().overview.mouse_drag_behavior;
 
         if ButtonState::Pressed == button_state {
             let mut is_mru_open = false;
@@ -3543,6 +3611,22 @@ impl State {
             }
 
             let mut started_drag_bind = false;
+            if is_overview_open
+                && overview_mouse_drag_behavior == OverviewMouseDragBehavior::Legacy
+                && !self.niri.screenshot_ui.is_open()
+                && modifiers.is_empty()
+            {
+                started_drag_bind = match button {
+                    Some(MouseButton::Left) => {
+                        self.try_start_overview_move_window_interactively(button_code, serial)
+                    }
+                    Some(MouseButton::Right) => {
+                        self.try_start_legacy_overview_spatial_movement(button_code, serial)
+                    }
+                    _ => false,
+                };
+            }
+
             if is_mru_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = mouse_trigger(button)
                     .and_then(|trigger| {
@@ -3557,8 +3641,13 @@ impl State {
                     })
                 {
                     if is_mouse_drag_action(&bind.action) {
-                        started_drag_bind =
-                            self.try_start_mouse_drag_action(&bind.action, button_code, serial);
+                        started_drag_bind = if is_overview_open
+                            && matches!(bind.action, Action::MoveWindowInteractively)
+                        {
+                            self.try_start_overview_move_window_interactively(button_code, serial)
+                        } else {
+                            self.try_start_mouse_drag_action(&bind.action, button_code, serial)
+                        };
                     } else {
                         self.niri.suppressed_buttons.insert(button_code);
                         self.handle_bind(bind.clone());
@@ -3567,40 +3656,48 @@ impl State {
                 };
             }
 
+            if !started_drag_bind
+                && is_overview_open
+                && overview_mouse_drag_behavior == OverviewMouseDragBehavior::Binds
+                && !self.niri.screenshot_ui.is_open()
+            {
+                if let Some(trigger) = mouse_trigger(button) {
+                    let (should_start_overview_window_move, should_start_overview_view_move) = {
+                        let config = self.niri.config.borrow();
+                        (
+                            overview_drag_bind_matches(
+                                &config.binds.0,
+                                mod_key,
+                                trigger,
+                                mods,
+                                &Action::MoveWindowInteractively,
+                            ),
+                            overview_drag_bind_matches(
+                                &config.binds.0,
+                                mod_key,
+                                trigger,
+                                mods,
+                                &Action::MoveViewOrSwitchWorkspaceInteractively,
+                            ),
+                        )
+                    };
+                    if should_start_overview_window_move {
+                        started_drag_bind =
+                            self.try_start_overview_move_window_interactively(button_code, serial);
+                    } else if should_start_overview_view_move {
+                        started_drag_bind = self
+                            .try_start_move_view_or_switch_workspace_interactively(
+                                button_code,
+                                serial,
+                            );
+                    }
+                }
+            }
+
             if !started_drag_bind {
                 // We received an event for the regular pointer, so show it now.
                 self.niri.pointer_visibility = PointerVisibility::Visible;
                 self.niri.tablet_cursor_location = None;
-
-                let is_overview_open = self.niri.layout.is_overview_open();
-
-                if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
-                    if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
-                        let ws_id = ws.id();
-                        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
-
-                        self.niri.layout.focus_output(&output);
-
-                        let location = pointer.current_location();
-                        let start_data = PointerGrabStartData {
-                            focus: None,
-                            button: button_code,
-                            location,
-                        };
-                        self.niri
-                            .layout
-                            .pointer_view_offset_gesture_begin(&output, Some(ws_idx));
-                        let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
-                        pointer.set_grab(self, grab, serial, Focus::Clear);
-                        self.niri
-                            .cursor_manager
-                            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
-
-                        // FIXME: granular.
-                        self.niri.queue_redraw_all();
-                        return;
-                    }
-                }
 
                 if let Some(mapped) = self.niri.window_under_cursor() {
                     let window = mapped.id();
@@ -5435,6 +5532,25 @@ fn is_mouse_drag_action(action: &Action) -> bool {
     )
 }
 
+fn overview_drag_bind_matches(
+    bindings: &[Bind],
+    mod_key: ModKey,
+    trigger: Trigger,
+    mods: ModifiersState,
+    action: &Action,
+) -> bool {
+    find_configured_bind(
+        bindings.iter().filter(|bind| &bind.action == action),
+        mod_key,
+        trigger,
+        mods,
+    )
+    .is_some()
+        || bindings
+            .iter()
+            .any(|bind| bind.key.trigger == trigger && &bind.action == action)
+}
+
 fn allowed_when_locked(action: &Action) -> bool {
     matches!(
         action,
@@ -6368,6 +6484,105 @@ mod tests {
             None,
             false,
             false,
+        ));
+    }
+
+    #[test]
+    fn overview_drag_bind_matches_exact_bind() {
+        let bindings = vec![Bind {
+            key: Key {
+                trigger: Trigger::MouseLeft,
+                modifiers: Modifiers::COMPOSITOR,
+            },
+            action: Action::MoveWindowInteractively,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        }];
+
+        assert!(overview_drag_bind_matches(
+            &bindings,
+            ModKey::Super,
+            Trigger::MouseLeft,
+            ModifiersState {
+                logo: true,
+                ..Default::default()
+            },
+            &Action::MoveWindowInteractively,
+        ));
+    }
+
+    #[test]
+    fn overview_drag_bind_matches_same_button_without_modifiers() {
+        let bindings = vec![Bind {
+            key: Key {
+                trigger: Trigger::MouseLeft,
+                modifiers: Modifiers::COMPOSITOR,
+            },
+            action: Action::MoveWindowInteractively,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        }];
+
+        assert!(overview_drag_bind_matches(
+            &bindings,
+            ModKey::Super,
+            Trigger::MouseLeft,
+            ModifiersState::default(),
+            &Action::MoveWindowInteractively,
+        ));
+    }
+
+    #[test]
+    fn overview_drag_bind_does_not_match_other_drag_actions() {
+        let bindings = vec![Bind {
+            key: Key {
+                trigger: Trigger::MouseLeft,
+                modifiers: Modifiers::COMPOSITOR,
+            },
+            action: Action::ResizeWindowInteractively,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        }];
+
+        assert!(!overview_drag_bind_matches(
+            &bindings,
+            ModKey::Super,
+            Trigger::MouseLeft,
+            ModifiersState::default(),
+            &Action::MoveWindowInteractively,
+        ));
+    }
+
+    #[test]
+    fn overview_drag_bind_matches_move_view_on_same_button_without_modifiers() {
+        let bindings = vec![Bind {
+            key: Key {
+                trigger: Trigger::MouseMiddle,
+                modifiers: Modifiers::COMPOSITOR,
+            },
+            action: Action::MoveViewOrSwitchWorkspaceInteractively,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        }];
+
+        assert!(overview_drag_bind_matches(
+            &bindings,
+            ModKey::Super,
+            Trigger::MouseMiddle,
+            ModifiersState::default(),
+            &Action::MoveViewOrSwitchWorkspaceInteractively,
         ));
     }
 }

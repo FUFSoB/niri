@@ -143,6 +143,7 @@ binds {
 ```
 
 You can rebind them to other modifier and mouse button combinations.
+Overview mouse drags stay on the historical bare left/right buttons by default; set `overview { mouse-drag-behavior "binds" }` if you want the same drag buttons to work there without their modifiers.
 
 Mirror windows also have dedicated drag actions:
 

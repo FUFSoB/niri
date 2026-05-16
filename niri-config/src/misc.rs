@@ -1,3 +1,7 @@
+use std::str::FromStr;
+
+use miette::miette;
+
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
@@ -185,6 +189,7 @@ pub struct Overview {
     pub zoom: f64,
     pub backdrop_color: Color,
     pub workspace_shadow: WorkspaceShadow,
+    pub mouse_drag_behavior: OverviewMouseDragBehavior,
 }
 
 impl Default for Overview {
@@ -193,6 +198,28 @@ impl Default for Overview {
             zoom: 0.5,
             backdrop_color: DEFAULT_BACKDROP_COLOR,
             workspace_shadow: WorkspaceShadow::default(),
+            mouse_drag_behavior: OverviewMouseDragBehavior::Legacy,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewMouseDragBehavior {
+    #[default]
+    Legacy,
+    Binds,
+}
+
+impl FromStr for OverviewMouseDragBehavior {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "legacy" => Ok(Self::Legacy),
+            "binds" => Ok(Self::Binds),
+            _ => Err(miette!(
+                r#"invalid overview mouse-drag-behavior, can be "legacy" or "binds""#
+            )),
         }
     }
 }
@@ -205,11 +232,14 @@ pub struct OverviewPart {
     pub backdrop_color: Option<Color>,
     #[knuffel(child)]
     pub workspace_shadow: Option<WorkspaceShadowPart>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub mouse_drag_behavior: Option<OverviewMouseDragBehavior>,
 }
 
 impl MergeWith<OverviewPart> for Overview {
     fn merge_with(&mut self, part: &OverviewPart) {
         merge!((self, part), zoom, workspace_shadow);
+        merge_clone!((self, part), mouse_drag_behavior);
         merge_clone!((self, part), backdrop_color);
     }
 }
