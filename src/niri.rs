@@ -3961,34 +3961,49 @@ impl Niri {
             .tablet_cursor_location
             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
         let contents = self.contents_under_with_niri_ui(pointer_pos, true);
-        let window_id = contents
-            .window
-            .map(|(id, _)| id)
-            .or_else(|| self.draw_cursor_transition_window(pointer_pos, &contents))?;
+        let window_id = if self.tablet_cursor_location.is_some() {
+            contents.window.map(|(id, _)| id)
+        } else if self.draw_cursor_transition_active(&contents) {
+            self.pointer_contents
+                .window
+                .map(|(id, _)| id)
+                .or_else(|| contents.window.map(|(id, _)| id))
+                .or_else(|| self.draw_cursor_transition_fallback_window(pointer_pos, &contents))
+        } else {
+            contents.window.map(|(id, _)| id)
+        }?;
 
+        self.draw_cursor_rule_for_window(window_id)
+    }
+
+    fn draw_cursor_rule_for_window(&self, window_id: MappedId) -> Option<DrawCursor> {
         self.layout
             .windows()
             .find(|(_, mapped)| mapped.id() == window_id)
             .and_then(|(_, mapped)| mapped.rules().draw_cursor)
     }
 
-    fn draw_cursor_transition_window(
+    fn draw_cursor_transition_active(&self, contents: &PointContents) -> bool {
+        if self.tablet_cursor_location.is_some() {
+            return false;
+        }
+
+        contents
+            .output
+            .as_ref()
+            .and_then(|output| self.layout.monitor_for_output(output))
+            .is_some_and(|mon| mon.are_transitions_ongoing())
+    }
+
+    fn draw_cursor_transition_fallback_window(
         &self,
         pointer_pos: Point<f64, Logical>,
         contents: &PointContents,
     ) -> Option<MappedId> {
-        if self.tablet_cursor_location.is_some() {
-            return None;
-        }
-
         let output = contents.output.as_ref()?;
         let mon = self.layout.monitor_for_output(output)?;
         if !mon.are_transitions_ongoing() {
             return None;
-        }
-
-        if let Some((window_id, _)) = self.pointer_contents.window {
-            return Some(window_id);
         }
 
         // During workspace switch animations, the pointer can temporarily pass through the gap
@@ -4023,10 +4038,22 @@ impl Niri {
             .map(|(mapped, _)| mapped.id())
     }
 
-    fn cursor_image_for_target(&self, target: RenderTarget) -> CursorImageStatus {
+    fn cursor_image_for_target(
+        &self,
+        target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+    ) -> CursorImageStatus {
         let cursor_image = self.cursor_manager.cursor_image().clone();
+        let draw_cursor_rule = cursor_owner
+            .and_then(|window_id| self.draw_cursor_rule_for_window(window_id))
+            .or_else(|| {
+                cursor_owner
+                    .is_none()
+                    .then(|| self.draw_cursor_rule_under_pointer())
+                    .flatten()
+            });
 
-        match self.draw_cursor_rule_under_pointer() {
+        match draw_cursor_rule {
             Some(DrawCursor::AlwaysHidden) => CursorImageStatus::Hidden,
             Some(DrawCursor::AlwaysShown) => match cursor_image {
                 CursorImageStatus::Hidden => CursorImageStatus::default_named(),
@@ -4039,8 +4066,13 @@ impl Niri {
         }
     }
 
-    fn render_cursor_for_target(&self, target: RenderTarget, scale: i32) -> RenderCursor {
-        let cursor_image = self.cursor_image_for_target(target);
+    fn render_cursor_for_target(
+        &self,
+        target: RenderTarget,
+        scale: i32,
+        cursor_owner: Option<MappedId>,
+    ) -> RenderCursor {
+        let cursor_image = self.cursor_image_for_target(target, cursor_owner);
         self.cursor_manager
             .get_render_cursor_for_image(cursor_image, scale)
     }
@@ -4323,6 +4355,7 @@ impl Niri {
         renderer: &mut R,
         output: &Output,
         target: RenderTarget,
+        cursor_owner: Option<MappedId>,
         push: &mut dyn FnMut(PointerRenderElements<R>),
     ) {
         let _span = tracy_client::span!("Niri::render_pointer");
@@ -4349,7 +4382,7 @@ impl Niri {
         };
         // Get the render cursor to draw.
         let cursor_scale = output_scale.integer_scale();
-        let render_cursor = self.render_cursor_for_target(target, cursor_scale);
+        let render_cursor = self.render_cursor_for_target(target, cursor_scale, cursor_owner);
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
@@ -4845,7 +4878,7 @@ impl Niri {
                     None
                 } else {
                     let cursor_scale = output.current_scale().integer_scale();
-                    match self.render_cursor_for_target(target, cursor_scale) {
+                    match self.render_cursor_for_target(target, cursor_scale, None) {
                         RenderCursor::Hidden => None,
                         RenderCursor::Surface { hotspot, .. } => {
                             Some(hotspot.to_physical_precise_round(output_scale))
@@ -5076,7 +5109,7 @@ impl Niri {
 
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
-            self.render_pointer(ctx.renderer, output, ctx.target, &mut |elem| {
+            self.render_pointer(ctx.renderer, output, ctx.target, None, &mut |elem| {
                 push(elem.into())
             });
         }
@@ -6552,6 +6585,7 @@ impl Niri {
                         renderer,
                         &output,
                         RenderTarget::ScreenCapture,
+                        None,
                         &mut |elem| pointer.push(elem),
                     );
                 }
@@ -6656,10 +6690,17 @@ impl Niri {
                 // Pointer elements are at output-local physical coords.
                 // Relocate by -win_pos to make them window-relative.
                 let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
-                self.render_pointer(renderer, output, RenderTarget::ScreenCapture, &mut |elem| {
-                    let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                    elements.push(elem.into());
-                });
+                self.render_pointer(
+                    renderer,
+                    output,
+                    RenderTarget::ScreenCapture,
+                    Some(mapped.id()),
+                    &mut |elem| {
+                        let elem =
+                            RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                        elements.push(elem.into());
+                    },
+                );
             }
         }
         let pointer_count = elements.len();

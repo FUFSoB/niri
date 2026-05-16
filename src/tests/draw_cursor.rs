@@ -12,7 +12,9 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 
 use super::*;
-use crate::niri::PointerVisibility;
+use crate::layout::LayoutElement;
+use crate::niri::{PointerVisibility, WindowScreenshotRenderElement};
+use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{
     encompassing_geo, render_to_vec as render_pixels, RenderCtx, RenderTarget,
 };
@@ -69,6 +71,10 @@ fn move_cursor_to_window(f: &mut Fixture, id: MappedId) {
     state.niri.pointer_visibility = PointerVisibility::Visible;
     state.niri.tablet_cursor_location = None;
     state.move_cursor(point);
+}
+
+fn cursor_pos(f: &mut Fixture) -> Point<f64, Logical> {
+    f.niri().seat.get_pointer().unwrap().current_location()
 }
 
 fn render_output_pixels(
@@ -142,17 +148,107 @@ fn render_window_screencast_pixels(
                         .window_cast_buffer_pos(win_pos, scale)
                         .to_physical_precise_round(scale)
                         .upscale(-1);
-                    niri.render_pointer(renderer, &output, RenderTarget::Screencast, &mut |elem| {
-                        let elem =
-                            RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                        elements.push(CastRenderElement::from(elem));
-                    });
+                    niri.render_pointer(
+                        renderer,
+                        &output,
+                        RenderTarget::Screencast,
+                        Some(id),
+                        &mut |elem| {
+                            let elem =
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                            elements.push(CastRenderElement::from(elem));
+                        },
+                    );
                 }
             }
 
             mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
                 elements.push(CastRenderElement::from(elem))
             });
+
+            let geo = encompassing_geo(scale, elements.iter());
+            let pixels = render_pixels(
+                renderer,
+                geo.size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev().map(|elem| {
+                    RelocateRenderElement::from_element(
+                        elem,
+                        geo.loc.upscale(-1),
+                        Relocate::Relative,
+                    )
+                }),
+            )
+            .unwrap();
+
+            (geo.size, pixels)
+        })
+        .unwrap()
+}
+
+fn render_window_screen_capture_pixels(
+    f: &mut Fixture,
+    output: &Output,
+    id: MappedId,
+    include_pointer: bool,
+) -> (Size<i32, Physical>, Vec<u8>) {
+    let output = output.clone();
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+
+    backend
+        .with_primary_renderer(|renderer| {
+            niri.update_render_elements(Some(&output));
+
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let mapped = niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == id)
+                .map(|(_, mapped)| mapped)
+                .unwrap();
+            let alpha = if mapped.sizing_mode().is_fullscreen()
+                || mapped.is_ignoring_opacity_window_rule()
+            {
+                1.
+            } else {
+                mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+            };
+
+            let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+
+            if include_pointer {
+                if let Some((_, win_pos)) = niri.pointer_pos_for_window_cast(mapped) {
+                    let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
+                    niri.render_pointer(
+                        renderer,
+                        &output,
+                        RenderTarget::ScreenCapture,
+                        Some(id),
+                        &mut |elem| {
+                            let elem =
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                            elements.push(elem.into());
+                        },
+                    );
+                }
+            }
+
+            mapped.render(
+                RenderCtx {
+                    renderer,
+                    target: RenderTarget::ScreenCapture,
+                    block_out_enabled: niri.block_out_enabled,
+                    xray: None,
+                },
+                mapped.window.geometry().loc.to_f64(),
+                scale,
+                alpha,
+                XrayPos::default(),
+                &mut |elem| elements.push(elem.into()),
+            );
 
             let geo = encompassing_geo(scale, elements.iter());
             let pixels = render_pixels(
@@ -354,7 +450,7 @@ fn draw_cursor_always_hidden_stays_hidden_on_screencast_during_workspace_switch(
         return;
     };
     let hidden = create_window(&mut f, "hidden", (40, 30));
-    let _visible = create_window(&mut f, "visible", (40, 30));
+    let visible = create_window(&mut f, "visible", (40, 30));
     f.niri().layout.move_to_workspace_down(true);
     f.niri().layout.activate_window(&hidden);
 
@@ -364,8 +460,88 @@ fn draw_cursor_always_hidden_stays_hidden_on_screencast_during_workspace_switch(
     let output = f.niri_output(1);
     start_workspace_switch(&mut f, &output);
 
+    let pointer_owner = f.niri().pointer_contents.window.map(|(id, _)| id);
+    assert_eq!(pointer_owner, Some(hidden));
+
+    let cursor = cursor_pos(&mut f);
+    let live_window_under_cursor = f.niri().contents_under(cursor).window.map(|(id, _)| id);
+    assert_eq!(live_window_under_cursor, Some(visible));
+    assert_ne!(live_window_under_cursor, pointer_owner);
+
     let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Screencast, false);
     let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Screencast, true);
 
     assert_eq!(with_pointer, without_pointer);
+}
+
+#[test]
+fn draw_cursor_always_hidden_stays_hidden_on_window_captures_after_workspace_switch() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^hidden$").unwrap()),
+            ..Default::default()
+        }],
+        draw_cursor: Some(DrawCursor::AlwaysHidden),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let hidden = create_window(&mut f, "hidden", (40, 30));
+    let visible = create_window(&mut f, "visible", (40, 30));
+    f.niri().layout.move_to_workspace_down(true);
+    f.niri().layout.activate_window(&hidden);
+
+    move_cursor_to_window(&mut f, hidden);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+
+    let output = f.niri_output(1);
+    start_workspace_switch(&mut f, &output);
+    let _ = f.niri().layout.workspace_switch_gesture_end(Some(true));
+
+    assert!(f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .are_transitions_ongoing());
+
+    let active_window_ids = f
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles_with_render_positions()
+        .map(|(tile, _, _)| tile.window().id())
+        .collect::<Vec<_>>();
+    assert!(active_window_ids.contains(&visible));
+    assert!(!active_window_ids.contains(&hidden));
+
+    let pointer_still_belongs_to_hidden = {
+        let niri = f.niri();
+        let hidden_mapped = niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == hidden)
+            .map(|(_, mapped)| mapped)
+            .unwrap();
+        niri.pointer_pos_for_window_cast(hidden_mapped).is_some()
+    };
+    assert!(pointer_still_belongs_to_hidden);
+
+    let cursor = cursor_pos(&mut f);
+    let live_window_under_cursor = f.niri().contents_under(cursor).window.map(|(id, _)| id);
+    assert_ne!(live_window_under_cursor, Some(hidden));
+
+    let screencast_without_pointer =
+        render_window_screencast_pixels(&mut f, &output, hidden, false);
+    let screencast_with_pointer = render_window_screencast_pixels(&mut f, &output, hidden, true);
+    assert_eq!(screencast_with_pointer, screencast_without_pointer);
+
+    let capture_without_pointer =
+        render_window_screen_capture_pixels(&mut f, &output, hidden, false);
+    let capture_with_pointer = render_window_screen_capture_pixels(&mut f, &output, hidden, true);
+    assert_eq!(capture_with_pointer, capture_without_pointer);
 }

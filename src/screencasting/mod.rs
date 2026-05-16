@@ -252,6 +252,7 @@ impl State {
                             renderer,
                             output,
                             RenderTarget::Screencast,
+                            Some(mapped.id()),
                             &mut |elem| {
                                 let elem = RelocateRenderElement::from_element(
                                     elem,
@@ -771,6 +772,7 @@ impl Niri {
                             renderer,
                             output,
                             RenderTarget::Screencast,
+                            None,
                             &mut |elem| elements.push(elem.into()),
                         );
                     }
@@ -829,6 +831,7 @@ impl Niri {
                             renderer,
                             output,
                             RenderTarget::Screencast,
+                            None,
                             &mut |elem| elements.push(elem.into()),
                         );
                     }
@@ -925,11 +928,17 @@ impl Niri {
                     pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
 
                     let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                    self.render_pointer(renderer, output, RenderTarget::Screencast, &mut |elem| {
-                        let elem =
-                            RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                        elements.push(CastRenderElement::from(elem));
-                    });
+                    self.render_pointer(
+                        renderer,
+                        output,
+                        RenderTarget::Screencast,
+                        Some(mapped.id()),
+                        &mut |elem| {
+                            let elem =
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                            elements.push(CastRenderElement::from(elem));
+                        },
+                    );
                 }
             }
 
