@@ -50,6 +50,10 @@
           name = "capture-cursor";
           pr = null;
         }
+        {
+          name = "virtual-outputs";
+          pr = 3800;
+        }
       ];
       niri-package =
         {
