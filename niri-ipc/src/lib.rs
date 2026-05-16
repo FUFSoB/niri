@@ -335,6 +335,114 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Set the zoom level of a mirror window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Set the zoom level of the focused mirror window")
+    )]
+    SetWindowMirrorZoom {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+
+        /// Zoom level to set (absolute like "2.0" or relative like "+0.25", "-0.25").
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        level: String,
+    },
+    /// Change the horizontal center point of a mirror window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Change the horizontal center point of the focused mirror window")
+    )]
+    SetWindowMirrorCenterX {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+
+        /// How to change the center point on the X axis.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        change: PositionChange,
+    },
+    /// Change the vertical center point of a mirror window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Change the vertical center point of the focused mirror window")
+    )]
+    SetWindowMirrorCenterY {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+
+        /// How to change the center point on the Y axis.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        change: PositionChange,
+    },
+    /// Reset a mirror window back to the full-window view.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Reset the focused mirror window back to the full-window view")
+    )]
+    ResetWindowMirrorView {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Pan a mirror window view to the left.
+    MoveWindowMirrorViewLeft {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Pan a mirror window view to the right.
+    MoveWindowMirrorViewRight {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Pan a mirror window view upward.
+    MoveWindowMirrorViewUp {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Pan a mirror window view downward.
+    MoveWindowMirrorViewDown {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Zoom the focused mirror window in.
+    ZoomWindowMirrorIn {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Zoom the focused mirror window out.
+    ZoomWindowMirrorOut {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Toggle fullscreen on a window.
     #[cfg_attr(
         feature = "clap",

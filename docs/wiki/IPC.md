@@ -59,6 +59,37 @@ $ env NIRI_SOCKET=./temp.sock niri msg action focus-workspace 2
 
 You can find all available requests and response types in the [niri-ipc sub-crate documentation](https://niri-wm.github.io/niri/niri_ipc/).
 
+### Mirror Window View Actions
+
+<sup>Since: own-patches</sup>
+
+Mirror windows can now show a cropped, zoomed view of another window instead of always fitting the full source.
+This is useful for workflows like mirroring only the chat area of a livestream window into a separate floating window.
+
+For example:
+
+```sh
+niri msg action create-window-mirror
+niri msg action set-window-mirror-zoom 2.0
+niri msg action set-window-mirror-center-x 75%
+niri msg action set-window-mirror-center-y 20%
+```
+
+Directional helpers pan by 10% of the currently visible source region:
+
+```sh
+niri msg action move-window-mirror-view-right
+niri msg action move-window-mirror-view-down
+niri msg action zoom-window-mirror-in
+niri msg action reset-window-mirror-view
+```
+
+To target a specific mirror window instead of the focused one, use `--id`:
+
+```sh
+niri msg action set-window-mirror-zoom --id 123 2.0
+```
+
 ### Backwards Compatibility
 
 The JSON output *should* remain stable, as in:

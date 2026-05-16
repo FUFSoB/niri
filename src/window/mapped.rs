@@ -4,6 +4,7 @@ use std::convert::TryInto;
 use std::time::Duration;
 
 use niri_config::{BlockOutFrom, Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_ipc::PositionChange;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Kind, NamespacedElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
@@ -73,6 +74,9 @@ pub struct Mapped {
 
     /// Pending sizing mode for mirror entries.
     mirror_pending_sizing_mode: SizingMode,
+
+    /// View state for mirror entries.
+    mirror_view: MirrorViewState,
 
     /// Credentials of the process that created the Wayland connection.
     credentials: Option<Credentials>,
@@ -373,6 +377,23 @@ enum RequestSizeOnce {
     UseWindowSize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MirrorViewState {
+    zoom: f64,
+    center_x: f64,
+    center_y: f64,
+}
+
+impl Default for MirrorViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.,
+            center_x: 0.5,
+            center_y: 0.5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MirrorContentTransform {
     source_geometry: Rectangle<f64, Logical>,
@@ -404,6 +425,7 @@ impl Mapped {
             mirror_size: Size::from((1, 1)),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
+            mirror_view: MirrorViewState::default(),
             credentials,
             pre_commit_hook: Some(hook),
             rules,
@@ -462,6 +484,7 @@ impl Mapped {
             mirror_size: source.size(),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
+            mirror_view: source.mirror_view,
             credentials: source.credentials.clone(),
             pre_commit_hook: None,
             rules,
@@ -568,6 +591,39 @@ impl Mapped {
         self.mirror_transform_for_size(self.mirror_size.to_f64())
     }
 
+    fn mirror_source_geometry(&self) -> Rectangle<f64, Logical> {
+        let mut source_geometry = self.window.geometry().to_f64();
+        source_geometry.size.w = source_geometry.size.w.max(1.);
+        source_geometry.size.h = source_geometry.size.h.max(1.);
+        source_geometry
+    }
+
+    fn mirror_zoom_level(&self) -> f64 {
+        let zoom = self.mirror_view.zoom;
+        if zoom.is_finite() {
+            zoom.max(1.)
+        } else {
+            1.
+        }
+    }
+
+    fn mirror_focus_point(&self, source_geometry: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+        let center_x = self.mirror_view.center_x.clamp(0., 1.);
+        let center_y = self.mirror_view.center_y.clamp(0., 1.);
+        Point::from((
+            source_geometry.loc.x + source_geometry.size.w * center_x,
+            source_geometry.loc.y + source_geometry.size.h * center_y,
+        ))
+    }
+
+    fn clamp_mirror_content_axis(offset: f64, dst: f64, rendered: f64) -> f64 {
+        if rendered <= dst {
+            (dst - rendered) / 2.
+        } else {
+            offset.clamp(dst - rendered, 0.)
+        }
+    }
+
     fn mirror_content_rect_for_scale(
         &self,
         dst: Size<f64, Logical>,
@@ -575,7 +631,15 @@ impl Mapped {
         scale: f64,
     ) -> MirrorContentTransform {
         let rendered = source_geometry.size.upscale(scale);
-        let offset = Point::from(((dst.w - rendered.w) / 2., (dst.h - rendered.h) / 2.));
+        let focus = self.mirror_focus_point(source_geometry);
+        let desired_offset: Point<f64, Logical> = Point::from((
+            dst.w / 2. - (focus.x - source_geometry.loc.x) * scale,
+            dst.h / 2. - (focus.y - source_geometry.loc.y) * scale,
+        ));
+        let offset = Point::from((
+            Self::clamp_mirror_content_axis(desired_offset.x, dst.w, rendered.w),
+            Self::clamp_mirror_content_axis(desired_offset.y, dst.h, rendered.h),
+        ));
         let content_rect = Rectangle::new(offset, rendered);
         let visible_rect = content_rect
             .intersection(Rectangle::from_size(dst))
@@ -626,23 +690,25 @@ impl Mapped {
     }
 
     fn mirror_transform_for_size(&self, dst: Size<f64, Logical>) -> MirrorContentTransform {
-        let mut source_geometry = self.window.geometry().to_f64();
-        source_geometry.size.w = source_geometry.size.w.max(1.);
-        source_geometry.size.h = source_geometry.size.h.max(1.);
+        let source_geometry = self.mirror_source_geometry();
+        let zoom = self.mirror_zoom_level();
 
         // Mirrors look crisper when the viewport is effectively asking for an integer upscale or
         // reciprocal downscale. If the contain-fit size differs by at most one logical pixel on
         // the constraining axis, prefer that nearest-neighbour-friendly scale and clip/pad the
         // remainder instead of resampling the whole window.
-        if let Some(scale) = self.mirror_nearest_scale_candidate(dst, source_geometry) {
-            return self.mirror_content_rect_for_scale(dst, source_geometry, scale);
+        if zoom <= 1. + f64::EPSILON {
+            if let Some(scale) = self.mirror_nearest_scale_candidate(dst, source_geometry) {
+                return self.mirror_content_rect_for_scale(dst, source_geometry, scale);
+            }
         }
 
         let scale = f64::min(
             dst.w / source_geometry.size.w,
             dst.h / source_geometry.size.h,
         )
-        .max(0.0001);
+        .max(0.0001)
+            * zoom;
         self.mirror_content_rect_for_scale(dst, source_geometry, scale)
     }
 
@@ -735,6 +801,140 @@ impl Mapped {
     pub fn mirror_content_transform(&self) -> (Point<f64, Logical>, f64) {
         let transform = self.mirror_transform();
         (transform.content_rect.loc, transform.scale)
+    }
+
+    pub fn mirror_zoom(&self) -> f64 {
+        self.mirror_zoom_level()
+    }
+
+    pub fn set_mirror_zoom(&mut self, zoom: f64) {
+        if !self.is_mirror || !zoom.is_finite() {
+            return;
+        }
+
+        self.mirror_view.zoom = zoom.max(1.);
+    }
+
+    fn set_mirror_center_component(current: &mut f64, axis_size: f64, change: PositionChange) {
+        if axis_size <= f64::EPSILON {
+            return;
+        }
+
+        let current_value = current.clamp(0., 1.);
+        let new_value = match change {
+            PositionChange::SetFixed(value) => value / axis_size,
+            PositionChange::SetProportion(prop) => prop / 100.,
+            PositionChange::AdjustFixed(delta) => current_value + delta / axis_size,
+            PositionChange::AdjustProportion(delta) => current_value + delta / 100.,
+        };
+
+        if new_value.is_finite() {
+            *current = new_value.clamp(0., 1.);
+        }
+    }
+
+    pub fn set_mirror_center_x(&mut self, change: PositionChange) {
+        if !self.is_mirror {
+            return;
+        }
+
+        let source_geometry = self.mirror_source_geometry();
+        Self::set_mirror_center_component(
+            &mut self.mirror_view.center_x,
+            source_geometry.size.w,
+            change,
+        );
+    }
+
+    pub fn set_mirror_center_y(&mut self, change: PositionChange) {
+        if !self.is_mirror {
+            return;
+        }
+
+        let source_geometry = self.mirror_source_geometry();
+        Self::set_mirror_center_component(
+            &mut self.mirror_view.center_y,
+            source_geometry.size.h,
+            change,
+        );
+    }
+
+    fn pan_mirror_axis_by_visible_fraction(&mut self, x_axis: bool, delta_fraction: f64) {
+        if !self.is_mirror || !delta_fraction.is_finite() {
+            return;
+        }
+
+        let transform = self.mirror_transform();
+        let source_geometry = transform.source_geometry;
+        let visible_source = transform.visible_rect.size.downscale(transform.scale);
+        let (source_size, visible_size, current, target) = if x_axis {
+            (
+                source_geometry.size.w,
+                visible_source.w,
+                source_geometry.loc.x
+                    + (self.mirror_size.w as f64 / 2. - transform.content_rect.loc.x)
+                        / transform.scale,
+                &mut self.mirror_view.center_x,
+            )
+        } else {
+            (
+                source_geometry.size.h,
+                visible_source.h,
+                source_geometry.loc.y
+                    + (self.mirror_size.h as f64 / 2. - transform.content_rect.loc.y)
+                        / transform.scale,
+                &mut self.mirror_view.center_y,
+            )
+        };
+
+        if source_size <= f64::EPSILON {
+            return;
+        }
+
+        let movable = (source_size - visible_size).max(0.);
+        let current = if movable <= f64::EPSILON {
+            source_size / 2.
+        } else {
+            current
+                - if x_axis {
+                    source_geometry.loc.x
+                } else {
+                    source_geometry.loc.y
+                }
+        };
+        let current = if movable <= f64::EPSILON {
+            source_size / 2.
+        } else {
+            current
+        };
+        let min_center = if movable <= f64::EPSILON {
+            source_size / 2.
+        } else {
+            visible_size / 2.
+        };
+        let max_center = if movable <= f64::EPSILON {
+            source_size / 2.
+        } else {
+            source_size - visible_size / 2.
+        };
+        let new_center = (current + visible_size * delta_fraction).clamp(min_center, max_center);
+        *target = (new_center / source_size).clamp(0., 1.);
+    }
+
+    pub fn pan_mirror_view_x_by_visible_fraction(&mut self, delta_fraction: f64) {
+        self.pan_mirror_axis_by_visible_fraction(true, delta_fraction);
+    }
+
+    pub fn pan_mirror_view_y_by_visible_fraction(&mut self, delta_fraction: f64) {
+        self.pan_mirror_axis_by_visible_fraction(false, delta_fraction);
+    }
+
+    pub fn reset_mirror_view(&mut self) {
+        if !self.is_mirror {
+            return;
+        }
+
+        self.mirror_view = MirrorViewState::default();
     }
 
     pub fn mirror_point_to_source(

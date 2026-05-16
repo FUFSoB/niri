@@ -404,6 +404,42 @@ binds {
 }
 ```
 
+#### `create-window-mirror`, mirror view actions
+
+<sup>Since: own-patches</sup>
+
+`create-window-mirror` creates a mirror of the focused window.
+After that, you can resize the mirror window independently, then zoom and pan the mirrored contents to show only a specific region of the source window.
+
+The mirror view actions operate on the focused mirror window:
+
+- `set-window-mirror-zoom`: set the mirror zoom, for example `2.0`, `+0.25`, `-0.25`;
+- `set-window-mirror-center-x`, `set-window-mirror-center-y`: set or adjust the viewport center inside the source window, for example `75%`, `+10%`, `-100`;
+- `move-window-mirror-view-left`, `move-window-mirror-view-right`, `move-window-mirror-view-up`, `move-window-mirror-view-down`: pan by 10% of the currently visible source region;
+- `zoom-window-mirror-in`, `zoom-window-mirror-out`: zoom by the configured zoom increment type using `+0.25` or `-0.25`;
+- `reset-window-mirror-view`: reset the mirror back to the full-window view.
+
+Example binds:
+
+```kdl
+binds {
+    Mod+Shift+M { create-window-mirror; }
+
+    Mod+BracketRight { zoom-window-mirror-in; }
+    Mod+BracketLeft  { zoom-window-mirror-out; }
+
+    Mod+Ctrl+Left  { move-window-mirror-view-left; }
+    Mod+Ctrl+Right { move-window-mirror-view-right; }
+    Mod+Ctrl+Up    { move-window-mirror-view-up; }
+    Mod+Ctrl+Down  { move-window-mirror-view-down; }
+
+    // Jump the viewport center to 75% across the source window.
+    Mod+Ctrl+Shift+Right { set-window-mirror-center-x "75%"; }
+
+    Mod+Ctrl+R { reset-window-mirror-view; }
+}
+```
+
 #### `screenshot`, `screenshot-screen`, `screenshot-window`
 
 Actions for taking screenshots.

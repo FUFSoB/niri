@@ -9,7 +9,7 @@ use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
     ZoomIncrementType,
 };
-use niri_ipc::LayoutSwitchTarget;
+use niri_ipc::{LayoutSwitchTarget, PositionChange};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
@@ -74,6 +74,9 @@ pub mod touch_resize_grab;
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+const MIRROR_VIEW_STEP_FRACTION: f64 = 0.1;
+const MIRROR_ZOOM_STEP: &str = "+0.25";
+const MIRROR_UNZOOM_STEP: &str = "-0.25";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
@@ -161,6 +164,113 @@ impl State {
             .layout
             .has_zoom_for_output(&output)
             .then_some(output)
+    }
+
+    fn parse_zoom_level(&self, level: &str, current_level: f64) -> Option<f64> {
+        let factor_str = level.trim();
+        let is_relative = factor_str.starts_with('+') || factor_str.starts_with('-');
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        match factor_str.parse::<f64>() {
+            Ok(f) if !is_relative => Some(f.clamp(1.0, max_zoom)),
+            Ok(delta) => {
+                let increment_type = &self.niri.config.borrow().zoom.increment_type;
+                let new_level = match increment_type {
+                    ZoomIncrementType::Linear => current_level + delta,
+                    ZoomIncrementType::Exponential => (current_level.ln() + delta).exp(),
+                };
+                Some(new_level.clamp(1.0, max_zoom))
+            }
+            Err(_) => {
+                tracing::warn!("Failed to parse zoom level: {}", level);
+                None
+            }
+        }
+    }
+
+    fn target_mirror_window(&self, id: Option<u64>) -> Option<crate::window::mapped::MappedId> {
+        match id {
+            Some(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id().get() == id && mapped.is_mirror())
+                .map(|(_, mapped)| mapped.id()),
+            None => self
+                .niri
+                .layout
+                .focus()
+                .and_then(|mapped| mapped.is_mirror().then(|| mapped.id())),
+        }
+    }
+
+    fn with_target_mirror_window(
+        &mut self,
+        id: Option<u64>,
+        mut f: impl FnMut(&mut Mapped),
+    ) -> bool {
+        let Some(window) = self.target_mirror_window(id) else {
+            return false;
+        };
+
+        let mut updated = false;
+        self.niri.layout.with_windows_mut(|mapped, _| {
+            if mapped.id() == window {
+                f(mapped);
+                updated = true;
+            }
+        });
+        updated
+    }
+
+    fn set_window_mirror_zoom(&mut self, id: Option<u64>, level: &str) -> bool {
+        let Some(window) = self.target_mirror_window(id) else {
+            return false;
+        };
+        let Some(current_level) = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == window)
+            .map(|(_, mapped)| mapped.mirror_zoom())
+        else {
+            return false;
+        };
+        let Some(target_level) = self.parse_zoom_level(level, current_level) else {
+            return false;
+        };
+        self.with_target_mirror_window(Some(window.get()), |mapped| {
+            mapped.set_mirror_zoom(target_level);
+        })
+    }
+
+    fn set_window_mirror_center_x(&mut self, id: Option<u64>, change: PositionChange) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.set_mirror_center_x(change);
+        })
+    }
+
+    fn set_window_mirror_center_y(&mut self, id: Option<u64>, change: PositionChange) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.set_mirror_center_y(change);
+        })
+    }
+
+    fn pan_window_mirror_x(&mut self, id: Option<u64>, delta_fraction: f64) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.pan_mirror_view_x_by_visible_fraction(delta_fraction);
+        })
+    }
+
+    fn pan_window_mirror_y(&mut self, id: Option<u64>, delta_fraction: f64) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.pan_mirror_view_y_by_visible_fraction(delta_fraction);
+        })
+    }
+
+    fn reset_window_mirror_view(&mut self, id: Option<u64>) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.reset_mirror_view();
+        })
     }
 
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
@@ -921,6 +1031,106 @@ impl State {
             }
             Action::CreateWindowMirrorById(id) => {
                 self.create_window_mirror(Some(id));
+            }
+            Action::SetWindowMirrorZoom(level) => {
+                if self.set_window_mirror_zoom(None, &level) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorZoomById { id, level } => {
+                if self.set_window_mirror_zoom(Some(id), &level) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorCenterX(change) => {
+                if self.set_window_mirror_center_x(None, change) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorCenterXById { id, change } => {
+                if self.set_window_mirror_center_x(Some(id), change) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorCenterY(change) => {
+                if self.set_window_mirror_center_y(None, change) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorCenterYById { id, change } => {
+                if self.set_window_mirror_center_y(Some(id), change) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ResetWindowMirrorView => {
+                if self.reset_window_mirror_view(None) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ResetWindowMirrorViewById(id) => {
+                if self.reset_window_mirror_view(Some(id)) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewLeft => {
+                if self.pan_window_mirror_x(None, -MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewLeftById(id) => {
+                if self.pan_window_mirror_x(Some(id), -MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewRight => {
+                if self.pan_window_mirror_x(None, MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewRightById(id) => {
+                if self.pan_window_mirror_x(Some(id), MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewUp => {
+                if self.pan_window_mirror_y(None, -MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewUpById(id) => {
+                if self.pan_window_mirror_y(Some(id), -MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewDown => {
+                if self.pan_window_mirror_y(None, MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowMirrorViewDownById(id) => {
+                if self.pan_window_mirror_y(Some(id), MIRROR_VIEW_STEP_FRACTION) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ZoomWindowMirrorIn => {
+                if self.set_window_mirror_zoom(None, MIRROR_ZOOM_STEP) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ZoomWindowMirrorInById(id) => {
+                if self.set_window_mirror_zoom(Some(id), MIRROR_ZOOM_STEP) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ZoomWindowMirrorOut => {
+                if self.set_window_mirror_zoom(None, MIRROR_UNZOOM_STEP) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ZoomWindowMirrorOutById(id) => {
+                if self.set_window_mirror_zoom(Some(id), MIRROR_UNZOOM_STEP) {
+                    self.niri.queue_redraw_all();
+                }
             }
             Action::FullscreenWindow => {
                 let focus = self.niri.layout.focus().map(|m| m.id());
@@ -2583,28 +2793,8 @@ impl State {
             Action::SetZoomLevel(level, output) => {
                 if let Some(output) = self.active_zoom_output(output.as_deref()) {
                     let current_level = self.niri.layout.zoom_level_for_output(&output);
-                    let target_level = {
-                        let factor_str = level.trim();
-                        let is_relative =
-                            factor_str.starts_with('+') || factor_str.starts_with('-');
-                        match factor_str.parse::<f64>() {
-                            Ok(f) if !is_relative => f.max(1.0),
-                            Ok(delta) => {
-                                let increment_type = &self.niri.config.borrow().zoom.increment_type;
-                                let new_level = match increment_type {
-                                    ZoomIncrementType::Linear => current_level + delta,
-                                    ZoomIncrementType::Exponential => {
-                                        (current_level.ln() + delta).exp()
-                                    }
-                                };
-                                let max_zoom = self.niri.config.borrow().zoom.max_zoom;
-                                new_level.clamp(1.0, max_zoom)
-                            }
-                            Err(_) => {
-                                tracing::warn!("Failed to parse zoom level: {}", level);
-                                return;
-                            }
-                        }
+                    let Some(target_level) = self.parse_zoom_level(&level, current_level) else {
+                        return;
                     };
 
                     let cursor_pos = self.niri.seat.get_pointer().unwrap().current_location();

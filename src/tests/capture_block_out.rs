@@ -5,7 +5,7 @@ use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
 use niri_config::{Action, BlockOutFrom, Config, CornerRadius};
 use niri_ipc::state::EventStreamStatePart as _;
-use niri_ipc::{BlockOutFrom as IpcBlockOutFrom, Layer as IpcLayer, SizeChange};
+use niri_ipc::{BlockOutFrom as IpcBlockOutFrom, Layer as IpcLayer, PositionChange, SizeChange};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{
@@ -336,6 +336,16 @@ fn mirror_mapped_by_id(
         .map(|(_, mapped)| mapped)
         .unwrap();
     (mapped.pending_sizing_mode(), mapped.size())
+}
+
+fn tile_geometry_for(f: &mut Fixture, id: MappedId) -> (Point<i32, Logical>, Size<i32, Logical>) {
+    let ws = f.niri().layout.active_workspace().unwrap();
+    let (tile, pos, visible) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == id)
+        .unwrap();
+    assert!(visible);
+    (pos.to_i32_round(), tile.animated_tile_size().to_i32_round())
 }
 
 fn focused_window_ids(f: &mut Fixture) -> Vec<u64> {
@@ -789,6 +799,216 @@ fn mirror_non_integer_scale_keeps_contain_scaling() {
             );
         })
         .unwrap();
+}
+
+#[test]
+fn mirror_zoom_actions_crop_to_requested_region() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(
+        mapped.mirror_content_transform(),
+        (Point::from((-20., 0.)), 1.)
+    );
+    assert_eq!(
+        mapped.mirror_point_to_source(Point::from((10., 10.))),
+        Some(Point::from((30., 10.))),
+    );
+}
+
+#[test]
+fn mirror_directional_pan_actions_move_by_visible_fraction() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+
+    let center = Point::from((10., 10.));
+    let before = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped.mirror_point_to_source(center).unwrap())
+        .unwrap();
+
+    f.niri_state()
+        .do_action(Action::MoveWindowMirrorViewRight, false);
+
+    let after = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped.mirror_point_to_source(center).unwrap())
+        .unwrap();
+
+    assert_eq!(after, Point::from((before.x + 2., before.y)));
+}
+
+#[test]
+fn zoomed_mirror_hover_uses_source_surface_coords() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let source_surface = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| !mapped.is_mirror())
+        .map(|(_, mapped)| mapped.toplevel().wl_surface().clone())
+        .unwrap();
+    let (pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let point = Point::from((pos.x as f64 + 10., pos.y as f64 + 10.));
+    let under = f.niri().contents_under(point);
+
+    assert_eq!(under.window.map(|(id, _)| id), Some(mirror_id));
+    let (surface, surface_pos) = under.surface.unwrap();
+    assert_eq!(surface, source_surface);
+    assert_eq!(surface_pos, Point::from((pos.x as f64 - 20., pos.y as f64)));
+}
+
+#[test]
+fn mirror_created_from_mirror_inherits_view_state() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror1_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror1_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror1_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror1_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror1_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let mirror2_id = create_window_mirror_for(&mut f, mirror1_id);
+
+    let (transform1, transform2) = {
+        let mut transforms = f
+            .niri()
+            .layout
+            .windows()
+            .filter(|(_, mapped)| mapped.id() == mirror1_id || mapped.id() == mirror2_id)
+            .map(|(_, mapped)| (mapped.id(), mapped.mirror_content_transform()))
+            .collect::<Vec<_>>();
+        transforms.sort_by_key(|(id, _)| id.get());
+        (transforms[0].1, transforms[1].1)
+    };
+    assert_eq!(transform1, transform2);
+}
+
+#[test]
+fn mirror_view_tracks_source_resize_proportionally() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    let source = create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let window = f.client(id).window(&source);
+    window.attach_rgba_buffer(GREEN);
+    window.set_size(80, 40);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(
+        mapped.mirror_point_to_source(Point::from((10., 10.))),
+        Some(Point::from((60., 20.))),
+    );
 }
 
 #[test]

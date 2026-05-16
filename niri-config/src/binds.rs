@@ -151,6 +151,45 @@ pub enum Action {
     CreateWindowMirror,
     #[knuffel(skip)]
     CreateWindowMirrorById(u64),
+    SetWindowMirrorZoom(#[knuffel(argument)] String),
+    #[knuffel(skip)]
+    SetWindowMirrorZoomById {
+        id: u64,
+        level: String,
+    },
+    SetWindowMirrorCenterX(#[knuffel(argument, str)] PositionChange),
+    #[knuffel(skip)]
+    SetWindowMirrorCenterXById {
+        id: u64,
+        change: PositionChange,
+    },
+    SetWindowMirrorCenterY(#[knuffel(argument, str)] PositionChange),
+    #[knuffel(skip)]
+    SetWindowMirrorCenterYById {
+        id: u64,
+        change: PositionChange,
+    },
+    ResetWindowMirrorView,
+    #[knuffel(skip)]
+    ResetWindowMirrorViewById(u64),
+    MoveWindowMirrorViewLeft,
+    #[knuffel(skip)]
+    MoveWindowMirrorViewLeftById(u64),
+    MoveWindowMirrorViewRight,
+    #[knuffel(skip)]
+    MoveWindowMirrorViewRightById(u64),
+    MoveWindowMirrorViewUp,
+    #[knuffel(skip)]
+    MoveWindowMirrorViewUpById(u64),
+    MoveWindowMirrorViewDown,
+    #[knuffel(skip)]
+    MoveWindowMirrorViewDownById(u64),
+    ZoomWindowMirrorIn,
+    #[knuffel(skip)]
+    ZoomWindowMirrorInById(u64),
+    ZoomWindowMirrorOut,
+    #[knuffel(skip)]
+    ZoomWindowMirrorOutById(u64),
     FullscreenWindow,
     #[knuffel(skip)]
     FullscreenWindowById(u64),
@@ -455,6 +494,61 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::CreateWindowMirror { id: None } => Self::CreateWindowMirror,
             niri_ipc::Action::CreateWindowMirror { id: Some(id) } => {
                 Self::CreateWindowMirrorById(id)
+            }
+            niri_ipc::Action::SetWindowMirrorZoom { id: None, level } => {
+                Self::SetWindowMirrorZoom(level)
+            }
+            niri_ipc::Action::SetWindowMirrorZoom {
+                id: Some(id),
+                level,
+            } => Self::SetWindowMirrorZoomById { id, level },
+            niri_ipc::Action::SetWindowMirrorCenterX { id: None, change } => {
+                Self::SetWindowMirrorCenterX(change)
+            }
+            niri_ipc::Action::SetWindowMirrorCenterX {
+                id: Some(id),
+                change,
+            } => Self::SetWindowMirrorCenterXById { id, change },
+            niri_ipc::Action::SetWindowMirrorCenterY { id: None, change } => {
+                Self::SetWindowMirrorCenterY(change)
+            }
+            niri_ipc::Action::SetWindowMirrorCenterY {
+                id: Some(id),
+                change,
+            } => Self::SetWindowMirrorCenterYById { id, change },
+            niri_ipc::Action::ResetWindowMirrorView { id: None } => Self::ResetWindowMirrorView,
+            niri_ipc::Action::ResetWindowMirrorView { id: Some(id) } => {
+                Self::ResetWindowMirrorViewById(id)
+            }
+            niri_ipc::Action::MoveWindowMirrorViewLeft { id: None } => {
+                Self::MoveWindowMirrorViewLeft
+            }
+            niri_ipc::Action::MoveWindowMirrorViewLeft { id: Some(id) } => {
+                Self::MoveWindowMirrorViewLeftById(id)
+            }
+            niri_ipc::Action::MoveWindowMirrorViewRight { id: None } => {
+                Self::MoveWindowMirrorViewRight
+            }
+            niri_ipc::Action::MoveWindowMirrorViewRight { id: Some(id) } => {
+                Self::MoveWindowMirrorViewRightById(id)
+            }
+            niri_ipc::Action::MoveWindowMirrorViewUp { id: None } => Self::MoveWindowMirrorViewUp,
+            niri_ipc::Action::MoveWindowMirrorViewUp { id: Some(id) } => {
+                Self::MoveWindowMirrorViewUpById(id)
+            }
+            niri_ipc::Action::MoveWindowMirrorViewDown { id: None } => {
+                Self::MoveWindowMirrorViewDown
+            }
+            niri_ipc::Action::MoveWindowMirrorViewDown { id: Some(id) } => {
+                Self::MoveWindowMirrorViewDownById(id)
+            }
+            niri_ipc::Action::ZoomWindowMirrorIn { id: None } => Self::ZoomWindowMirrorIn,
+            niri_ipc::Action::ZoomWindowMirrorIn { id: Some(id) } => {
+                Self::ZoomWindowMirrorInById(id)
+            }
+            niri_ipc::Action::ZoomWindowMirrorOut { id: None } => Self::ZoomWindowMirrorOut,
+            niri_ipc::Action::ZoomWindowMirrorOut { id: Some(id) } => {
+                Self::ZoomWindowMirrorOutById(id)
             }
             niri_ipc::Action::FullscreenWindow { id: None } => Self::FullscreenWindow,
             niri_ipc::Action::FullscreenWindow { id: Some(id) } => Self::FullscreenWindowById(id),
