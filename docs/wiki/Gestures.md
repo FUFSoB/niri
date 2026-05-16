@@ -10,7 +10,8 @@ Also see the [gestures configuration](./Configuration:-Gestures.md) wiki page.
 
 <sup>Since: 0.1.10</sup>
 
-You can move windows by holding <kbd>Mod</kbd> and the left mouse button.
+By default, you can move windows by holding <kbd>Mod</kbd> and the left mouse button.
+This is a regular bind now, so you can reassign it to a different mouse button or modifier combination with `move-window-interactively`.
 
 You can customize the look of the window insertion preview in the [`insert-hint` layout config](./Configuration:-Layout.md#insert-hint).
 
@@ -20,7 +21,8 @@ You can customize the look of the window insertion preview in the [`insert-hint`
 
 <sup>Since: 0.1.6</sup>
 
-You can resize windows by holding <kbd>Mod</kbd> and the right mouse button.
+By default, you can resize windows by holding <kbd>Mod</kbd> and the right mouse button.
+This is a regular bind now, so you can reassign it with `resize-window-interactively`.
 
 #### Reset Window Height
 
@@ -42,13 +44,22 @@ This works with both window-initiated resizes (when using client-side decoration
 
 <sup>Since: 0.1.6</sup>
 
-Move the view horizontally by holding <kbd>Mod</kbd> and the middle mouse button (or the wheel) and dragging the mouse horizontally.
+Move the view horizontally by default with <kbd>Mod</kbd> + middle mouse button (or the wheel) and dragging the mouse horizontally.
+The mouse drag bind can be reassigned with `move-view-or-switch-workspace-interactively`.
 
 #### Workspace Switch
 
 <sup>Since: 0.1.7</sup>
 
-Switch workspaces by holding <kbd>Mod</kbd> and the middle mouse button (or the wheel) and dragging the mouse vertically.
+Switch workspaces by default with <kbd>Mod</kbd> + middle mouse button (or the wheel) and dragging the mouse vertically.
+The mouse drag bind can be reassigned with `move-view-or-switch-workspace-interactively`.
+
+#### Mirror Viewport Pan and Zoom
+
+<sup>Since: own-patches</sup>
+
+Mirror windows can also have mouse drag binds for viewport pan and zoom.
+Bind `pan-window-mirror-interactively` to drag the mirrored contents directly, and `zoom-window-mirror-interactively` to change zoom with vertical drag while keeping the pressed source point anchored.
 
 ### Touchpad
 

@@ -689,26 +689,34 @@ impl Mapped {
             .then_some(candidate)
     }
 
-    fn mirror_transform_for_size(&self, dst: Size<f64, Logical>) -> MirrorContentTransform {
-        let source_geometry = self.mirror_source_geometry();
-        let zoom = self.mirror_zoom_level();
-
+    fn mirror_scale_for_size_and_zoom(
+        &self,
+        dst: Size<f64, Logical>,
+        source_geometry: Rectangle<f64, Logical>,
+        zoom: f64,
+    ) -> f64 {
         // Mirrors look crisper when the viewport is effectively asking for an integer upscale or
         // reciprocal downscale. If the contain-fit size differs by at most one logical pixel on
         // the constraining axis, prefer that nearest-neighbour-friendly scale and clip/pad the
         // remainder instead of resampling the whole window.
         if zoom <= 1. + f64::EPSILON {
             if let Some(scale) = self.mirror_nearest_scale_candidate(dst, source_geometry) {
-                return self.mirror_content_rect_for_scale(dst, source_geometry, scale);
+                return scale;
             }
         }
 
-        let scale = f64::min(
+        f64::min(
             dst.w / source_geometry.size.w,
             dst.h / source_geometry.size.h,
         )
         .max(0.0001)
-            * zoom;
+            * zoom
+    }
+
+    fn mirror_transform_for_size(&self, dst: Size<f64, Logical>) -> MirrorContentTransform {
+        let source_geometry = self.mirror_source_geometry();
+        let zoom = self.mirror_zoom_level();
+        let scale = self.mirror_scale_for_size_and_zoom(dst, source_geometry, zoom);
         self.mirror_content_rect_for_scale(dst, source_geometry, scale)
     }
 
@@ -813,6 +821,83 @@ impl Mapped {
         }
 
         self.mirror_view.zoom = zoom.max(1.);
+    }
+
+    pub fn set_mirror_view_from_anchor(
+        &mut self,
+        zoom: f64,
+        mirror_point: Point<f64, Logical>,
+        source_point: Point<f64, Logical>,
+    ) {
+        if !self.is_mirror
+            || !zoom.is_finite()
+            || !mirror_point.x.is_finite()
+            || !mirror_point.y.is_finite()
+            || !source_point.x.is_finite()
+            || !source_point.y.is_finite()
+        {
+            return;
+        }
+
+        let source_geometry = self.mirror_source_geometry();
+        let source_size = source_geometry.size;
+        let source_point = Point::from((
+            source_point
+                .x
+                .clamp(source_geometry.loc.x, source_geometry.loc.x + source_size.w),
+            source_point
+                .y
+                .clamp(source_geometry.loc.y, source_geometry.loc.y + source_size.h),
+        ));
+        let source_local = source_point - source_geometry.loc;
+        let dst = self.mirror_size.to_f64();
+        let zoom = zoom.max(1.);
+        let scale = self.mirror_scale_for_size_and_zoom(dst, source_geometry, zoom);
+        let visible_source: Size<f64, Logical> = Size::from((
+            (dst.w / scale).min(source_size.w),
+            (dst.h / scale).min(source_size.h),
+        ));
+
+        let anchor_center = |source_size: f64,
+                             visible_size: f64,
+                             source_coord: f64,
+                             dst: f64,
+                             mirror_coord: f64| {
+            if source_size <= f64::EPSILON {
+                return 0.5;
+            }
+
+            let center = source_coord - (mirror_coord - dst / 2.) / scale;
+            let min_center = if visible_size >= source_size - f64::EPSILON {
+                source_size / 2.
+            } else {
+                visible_size / 2.
+            };
+            let max_center = if visible_size >= source_size - f64::EPSILON {
+                source_size / 2.
+            } else {
+                source_size - visible_size / 2.
+            };
+            (center.clamp(min_center, max_center) / source_size).clamp(0., 1.)
+        };
+
+        self.mirror_view = MirrorViewState {
+            zoom,
+            center_x: anchor_center(
+                source_size.w,
+                visible_source.w,
+                source_local.x,
+                dst.w,
+                mirror_point.x,
+            ),
+            center_y: anchor_center(
+                source_size.h,
+                visible_source.h,
+                source_local.y,
+                dst.h,
+                mirror_point.y,
+            ),
+        };
     }
 
     fn set_mirror_center_component(current: &mut f64, axis_size: f64, change: PositionChange) {

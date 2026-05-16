@@ -650,6 +650,66 @@ mod tests {
         assert_eq!(config.input.keyboard.repeat_rate, 25);
     }
 
+    #[test]
+    fn default_config_contains_mouse_drag_binds() {
+        let config = Config::load_default();
+
+        assert!(config.binds.0.iter().any(|bind| {
+            bind.key
+                == Key {
+                    trigger: Trigger::MouseLeft,
+                    modifiers: Modifiers::COMPOSITOR,
+                }
+                && bind.action == Action::MoveWindowInteractively
+        }));
+        assert!(config.binds.0.iter().any(|bind| {
+            bind.key
+                == Key {
+                    trigger: Trigger::MouseRight,
+                    modifiers: Modifiers::COMPOSITOR,
+                }
+                && bind.action == Action::ResizeWindowInteractively
+        }));
+        assert!(config.binds.0.iter().any(|bind| {
+            bind.key
+                == Key {
+                    trigger: Trigger::MouseMiddle,
+                    modifiers: Modifiers::COMPOSITOR,
+                }
+                && bind.action == Action::MoveViewOrSwitchWorkspaceInteractively
+        }));
+    }
+
+    #[test]
+    fn parse_mouse_drag_bind_actions() {
+        let config = do_parse(
+            r#"
+            binds {
+                Mod+MouseLeft { move-window-interactively; }
+                Mod+MouseRight { resize-window-interactively; }
+                Mod+MouseMiddle { move-view-or-switch-workspace-interactively; }
+                Mod+Shift+MouseBack { pan-window-mirror-interactively; }
+                Mod+Shift+MouseForward { zoom-window-mirror-interactively; }
+            }
+            "#,
+        );
+
+        assert_eq!(config.binds.0[0].action, Action::MoveWindowInteractively);
+        assert_eq!(config.binds.0[1].action, Action::ResizeWindowInteractively);
+        assert_eq!(
+            config.binds.0[2].action,
+            Action::MoveViewOrSwitchWorkspaceInteractively
+        );
+        assert_eq!(
+            config.binds.0[3].action,
+            Action::PanWindowMirrorInteractively
+        );
+        assert_eq!(
+            config.binds.0[4].action,
+            Action::ZoomWindowMirrorInteractively
+        );
+    }
+
     #[track_caller]
     fn do_parse(text: &str) -> Config {
         Config::parse_mem(text)

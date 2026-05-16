@@ -29,6 +29,7 @@ pub struct MoveGrab {
     gesture: GestureState,
     enable_view_offset: bool,
     move_icon: CursorIcon,
+    toggle_floating_button: Option<u32>,
 
     // Accumulated and applied in frame().
     new_location: Point<f64, Logical>,
@@ -53,6 +54,14 @@ impl MoveGrab {
     ) -> Option<Self> {
         let location = start_data.location();
         let (output, pos_within_output) = state.niri.output_under(location)?;
+        let toggle_floating_button = match &start_data {
+            PointerOrTouchStartData::Pointer(start_data) => match start_data.button {
+                0x110 => Some(0x111),
+                0x111 => Some(0x110),
+                _ => None,
+            },
+            PointerOrTouchStartData::Touch(_) => None,
+        };
 
         Some(Self {
             last_location: location,
@@ -64,6 +73,7 @@ impl MoveGrab {
             enable_view_offset,
             // Moving windows by their titlebars uses the default cursor by default.
             move_icon: move_icon.unwrap_or(CursorIcon::Default),
+            toggle_floating_button,
             new_location: location,
             event_timestamp: None,
             relative_delta: None,
@@ -359,11 +369,8 @@ impl PointerGrab<State> for MoveGrab {
             return;
         }
 
-        // When moving with the left button, right toggles floating, and vice versa.
-        let toggle_floating_button = if start_data.button == 0x110 {
-            0x111
-        } else {
-            0x110
+        let Some(toggle_floating_button) = self.toggle_floating_button else {
+            return;
         };
         if event.state != ButtonState::Pressed || event.button != toggle_floating_button {
             return;

@@ -1012,6 +1012,80 @@ fn mirror_view_tracks_source_resize_proportionally() {
 }
 
 #[test]
+fn mirror_view_anchor_preserves_source_point_when_panned() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+
+    let source_point = Point::from((30., 10.));
+    f.niri().layout.with_windows_mut(|mapped, _| {
+        if mapped.id() == mirror_id {
+            mapped.set_mirror_view_from_anchor(2., Point::from((10., 10.)), source_point);
+            mapped.set_mirror_view_from_anchor(2., Point::from((6., 10.)), source_point);
+        }
+    });
+
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(
+        mapped.mirror_point_to_source(Point::from((6., 10.))),
+        Some(source_point),
+    );
+}
+
+#[test]
+fn mirror_view_anchor_preserves_source_point_when_zoomed() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+
+    let anchor = Point::from((15., 10.));
+    let source_point = Point::from((30., 10.));
+    f.niri().layout.with_windows_mut(|mapped, _| {
+        if mapped.id() == mirror_id {
+            mapped.set_mirror_view_from_anchor(2., anchor, source_point);
+        }
+    });
+
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(mapped.mirror_zoom(), 2.);
+    assert_eq!(mapped.mirror_point_to_source(anchor), Some(source_point));
+}
+
+#[test]
 fn mirror_window_cast_bbox_matches_mirror_viewport() {
     let Some(mut f) = set_up(Config::default()) else {
         return;

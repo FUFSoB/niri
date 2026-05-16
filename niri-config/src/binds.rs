@@ -97,7 +97,7 @@ pub struct SwitchAction {
     pub spawn: Vec<String>,
 }
 
-// Remember to add new actions to the CLI enum too.
+// Remember to add new IPC-backed actions to the CLI enum too.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
@@ -145,6 +145,11 @@ pub enum Action {
         path: Option<String>,
     },
     ToggleKeyboardShortcutsInhibit,
+    MoveWindowInteractively,
+    ResizeWindowInteractively,
+    MoveViewOrSwitchWorkspaceInteractively,
+    PanWindowMirrorInteractively,
+    ZoomWindowMirrorInteractively,
     CloseWindow,
     #[knuffel(skip)]
     CloseWindowById(u64),

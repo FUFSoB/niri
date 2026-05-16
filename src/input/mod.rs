@@ -34,13 +34,16 @@ use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Transform, SERIAL_COUNTER};
+use smithay::utils::{
+    Logical, Physical, Point, Rectangle, Scale, Serial, Transform, SERIAL_COUNTER,
+};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::mirror_click_grab::MirrorClickGrab;
+use self::mirror_view_grab::{MirrorViewGrab, MirrorViewGrabMode};
 use self::move_grab::MoveGrab;
 use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
@@ -49,7 +52,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
+use crate::layout::{ActivateWindow, AddWindowTarget, HitType, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
@@ -60,6 +63,7 @@ use crate::window::Mapped;
 
 pub mod backend_ext;
 pub mod mirror_click_grab;
+pub mod mirror_view_grab;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
@@ -271,6 +275,253 @@ impl State {
         self.with_target_mirror_window(id, |mapped| {
             mapped.reset_mirror_view();
         })
+    }
+
+    fn current_mirror_drag_target(
+        &self,
+    ) -> Option<(
+        crate::window::mapped::MappedId,
+        Point<f64, Logical>,
+        Point<f64, Logical>,
+        f64,
+    )> {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+        let (_, pos_within_output) = self.niri.output_under(location)?;
+        let contents = self.niri.contents_under(location);
+        let Some((window, HitType::Input { win_pos })) = contents.window else {
+            return None;
+        };
+        let mapped = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == window && mapped.is_mirror())
+            .map(|(_, mapped)| mapped)?;
+        let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
+        let source_point = mapped.mirror_point_to_source(mirror_local)?;
+        Some((window, mirror_local, source_point, mapped.mirror_zoom()))
+    }
+
+    fn try_start_move_window_interactively(&mut self, button_code: u32, serial: Serial) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let Some(window) = self.niri.window_under_cursor().map(|mapped| mapped.id()) else {
+            return false;
+        };
+        let is_overview_open = self.niri.layout.is_overview_open();
+        let location = pointer.current_location();
+
+        if !is_overview_open {
+            self.niri.layout.activate_window(&window);
+        }
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location,
+        };
+        let start_data = PointerOrTouchStartData::Pointer(start_data);
+        let icon = CursorIcon::Grabbing;
+        let Some(grab) = MoveGrab::new(self, start_data, window, false, Some(icon)) else {
+            return false;
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        if !is_overview_open {
+            self.niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(icon));
+        }
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_resize_window_interactively(&mut self, button_code: u32, serial: Serial) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let Some(mapped) = self.niri.window_under_cursor() else {
+            return false;
+        };
+        let window = mapped.id();
+        let is_floating = mapped.is_floating();
+        let last = (!is_floating)
+            .then(|| mapped.last_interactive_resize_start().get())
+            .flatten();
+        let location = pointer.current_location();
+        let (output, pos_within_output) = match self.niri.output_under(location) {
+            Some(rv) => rv,
+            None => return false,
+        };
+        let edges = self
+            .niri
+            .layout
+            .resize_edges_under(output, pos_within_output)
+            .unwrap_or(ResizeEdge::empty());
+        if edges.is_empty() {
+            return false;
+        }
+        let time = get_monotonic_time();
+        if let Some((last_time, last_edges)) = last {
+            if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
+                let intersection = edges.intersection(last_edges);
+                if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
+                    self.niri.layout.activate_window(&window);
+                    self.niri.layout.toggle_full_width();
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.last_interactive_resize_start().set(None);
+                        }
+                    });
+                    self.niri.queue_redraw_all();
+                    return true;
+                }
+                if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
+                    self.niri.layout.activate_window(&window);
+                    self.niri.layout.reset_window_height(Some(&window));
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.last_interactive_resize_start().set(None);
+                        }
+                    });
+                    self.niri.queue_redraw_all();
+                    return true;
+                }
+            }
+        }
+
+        self.niri.layout.activate_window(&window);
+        if !self.niri.layout.interactive_resize_begin(window, edges) {
+            return false;
+        }
+
+        self.niri.layout.with_windows_mut(|mapped, _| {
+            if mapped.id() == window {
+                if is_floating {
+                    mapped.last_interactive_resize_start().set(None);
+                } else {
+                    mapped
+                        .last_interactive_resize_start()
+                        .set(Some((time, edges)));
+                }
+            }
+        });
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location,
+        };
+        let grab = ResizeGrab::new(start_data, window);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_move_view_or_switch_workspace_interactively(
+        &mut self,
+        button_code: u32,
+        serial: Serial,
+    ) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let is_overview_open = self.niri.layout.is_overview_open();
+        let output_ws = if is_overview_open {
+            self.niri.workspace_under_cursor(true)
+        } else {
+            self.niri.output_under_cursor().and_then(|output| {
+                let mon = self.niri.layout.monitor_for_output(&output)?;
+                Some((output, mon.active_workspace_ref()))
+            })
+        };
+        let Some((output, ws)) = output_ws else {
+            return false;
+        };
+        let ws_id = ws.id();
+
+        self.niri.layout.focus_output(&output);
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location: pointer.current_location(),
+        };
+        let grab = SpatialMovementGrab::new(start_data, output, ws_id, false);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_window_mirror_view_grab(
+        &mut self,
+        button_code: u32,
+        serial: Serial,
+        mode: MirrorViewGrabMode,
+    ) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return false;
+        }
+
+        let Some((window, mirror_local, source_point, zoom)) = self.current_mirror_drag_target()
+        else {
+            return false;
+        };
+
+        self.niri.layout.activate_window(&window);
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location: pointer.current_location(),
+        };
+        let grab = MirrorViewGrab::new(start_data, window, mode, mirror_local, source_point, zoom);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    fn try_start_mouse_drag_action(
+        &mut self,
+        action: &Action,
+        button_code: u32,
+        serial: Serial,
+    ) -> bool {
+        match action {
+            Action::MoveWindowInteractively => {
+                self.try_start_move_window_interactively(button_code, serial)
+            }
+            Action::ResizeWindowInteractively => {
+                self.try_start_resize_window_interactively(button_code, serial)
+            }
+            Action::MoveViewOrSwitchWorkspaceInteractively => {
+                self.try_start_move_view_or_switch_workspace_interactively(button_code, serial)
+            }
+            Action::PanWindowMirrorInteractively => {
+                self.try_start_window_mirror_view_grab(button_code, serial, MirrorViewGrabMode::Pan)
+            }
+            Action::ZoomWindowMirrorInteractively => self.try_start_window_mirror_view_grab(
+                button_code,
+                serial,
+                MirrorViewGrabMode::Zoom,
+            ),
+            _ => false,
+        }
     }
 
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
@@ -869,6 +1120,11 @@ impl State {
             Action::PowerOnMonitors => {
                 self.niri.activate_monitors(&mut self.backend);
             }
+            Action::MoveWindowInteractively
+            | Action::ResizeWindowInteractively
+            | Action::MoveViewOrSwitchWorkspaceInteractively
+            | Action::PanWindowMirrorInteractively
+            | Action::ZoomWindowMirrorInteractively => {}
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.niri.queue_redraw_all();
@@ -3286,225 +3542,92 @@ impl State {
                 }
             }
 
+            let mut started_drag_bind = false;
             if is_mru_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
-                if let Some(bind) = match button {
-                    Some(MouseButton::Left) => Some(Trigger::MouseLeft),
-                    Some(MouseButton::Right) => Some(Trigger::MouseRight),
-                    Some(MouseButton::Middle) => Some(Trigger::MouseMiddle),
-                    Some(MouseButton::Back) => Some(Trigger::MouseBack),
-                    Some(MouseButton::Forward) => Some(Trigger::MouseForward),
-                    _ => None,
-                }
-                .and_then(|trigger| {
-                    let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
-                    find_configured_bind(bindings, mod_key, trigger, mods)
-                })
-                .filter(|bind| {
-                    !self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
-                }) {
-                    self.niri.suppressed_buttons.insert(button_code);
-                    self.handle_bind(bind.clone());
-                    return;
-                };
-            }
-
-            // We received an event for the regular pointer, so show it now.
-            self.niri.pointer_visibility = PointerVisibility::Visible;
-            self.niri.tablet_cursor_location = None;
-
-            let is_overview_open = self.niri.layout.is_overview_open();
-
-            if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
-                if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
-                    let ws_id = ws.id();
-                    let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
-
-                    self.niri.layout.focus_output(&output);
-
-                    let location = pointer.current_location();
-                    let start_data = PointerGrabStartData {
-                        focus: None,
-                        button: button_code,
-                        location,
-                    };
-                    self.niri
-                        .layout
-                        .pointer_view_offset_gesture_begin(&output, Some(ws_idx));
-                    let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
-                    pointer.set_grab(self, grab, serial, Focus::Clear);
-                    self.niri
-                        .cursor_manager
-                        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
-
-                    // FIXME: granular.
-                    self.niri.queue_redraw_all();
-                    return;
-                }
-            }
-
-            if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
-                let output_ws = if is_overview_open {
-                    self.niri.workspace_under_cursor(true)
-                } else {
-                    // We don't want to accidentally "catch" the wrong workspace during
-                    // animations.
-                    self.niri.output_under_cursor().and_then(|output| {
-                        let mon = self.niri.layout.monitor_for_output(&output)?;
-                        Some((output, mon.active_workspace_ref()))
+                if let Some(bind) = mouse_trigger(button)
+                    .and_then(|trigger| {
+                        let config = self.niri.config.borrow();
+                        let bindings =
+                            make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                        find_configured_bind(bindings, mod_key, trigger, mods)
                     })
+                    .filter(|bind| {
+                        !self.niri.screenshot_ui.is_open()
+                            || allowed_during_screenshot(&bind.action)
+                    })
+                {
+                    if is_mouse_drag_action(&bind.action) {
+                        started_drag_bind =
+                            self.try_start_mouse_drag_action(&bind.action, button_code, serial);
+                    } else {
+                        self.niri.suppressed_buttons.insert(button_code);
+                        self.handle_bind(bind.clone());
+                        return;
+                    }
                 };
-
-                if let Some((output, ws)) = output_ws {
-                    let ws_id = ws.id();
-
-                    self.niri.layout.focus_output(&output);
-
-                    let location = pointer.current_location();
-                    let start_data = PointerGrabStartData {
-                        focus: None,
-                        button: button_code,
-                        location,
-                    };
-                    let grab = SpatialMovementGrab::new(start_data, output, ws_id, false);
-                    pointer.set_grab(self, grab, serial, Focus::Clear);
-                    self.niri
-                        .cursor_manager
-                        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
-
-                    // FIXME: granular.
-                    self.niri.queue_redraw_all();
-
-                    // Don't activate the window under the cursor to avoid unnecessary
-                    // scrolling when e.g. Mod+MMB clicking on a partially off-screen window.
-                    return;
-                }
             }
 
-            if let Some(mapped) = self.niri.window_under_cursor() {
-                let window = mapped.id();
+            if !started_drag_bind {
+                // We received an event for the regular pointer, so show it now.
+                self.niri.pointer_visibility = PointerVisibility::Visible;
+                self.niri.tablet_cursor_location = None;
 
-                // Check if we need to start an interactive move.
-                if button == Some(MouseButton::Left) && !pointer.is_grabbed() {
-                    if is_overview_open || mod_down {
+                let is_overview_open = self.niri.layout.is_overview_open();
+
+                if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
+                    if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+                        let ws_id = ws.id();
+                        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
+
+                        self.niri.layout.focus_output(&output);
+
                         let location = pointer.current_location();
-
-                        if !is_overview_open {
-                            self.niri.layout.activate_window(&window);
-                        }
-
                         let start_data = PointerGrabStartData {
                             focus: None,
                             button: button_code,
                             location,
                         };
-                        let start_data = PointerOrTouchStartData::Pointer(start_data);
-                        let icon = CursorIcon::Grabbing;
-                        if let Some(grab) =
-                            MoveGrab::new(self, start_data, window, false, Some(icon))
-                        {
-                            pointer.set_grab(self, grab, serial, Focus::Clear);
+                        self.niri
+                            .layout
+                            .pointer_view_offset_gesture_begin(&output, Some(ws_idx));
+                        let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
+                        pointer.set_grab(self, grab, serial, Focus::Clear);
+                        self.niri
+                            .cursor_manager
+                            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
-                            // Set the cursor to Grabbing right away for Mod+LMB since it doesn't
-                            // do any other gesture.
-                            //
-                            // In the overview, we click to activate window and close the overview,
-                            // in this case setting the cursor right away would be distracting.
-                            if !is_overview_open {
-                                self.niri
-                                    .cursor_manager
-                                    .set_cursor_image(CursorImageStatus::Named(icon));
-                            }
-                        }
+                        // FIXME: granular.
+                        self.niri.queue_redraw_all();
+                        return;
                     }
                 }
-                // Check if we need to start an interactive resize.
-                else if button == Some(MouseButton::Right) && !pointer.is_grabbed() && mod_down {
-                    let location = pointer.current_location();
-                    let (output, pos_within_output) = self.niri.output_under(location).unwrap();
-                    let edges = self
-                        .niri
-                        .layout
-                        .resize_edges_under(output, pos_within_output)
-                        .unwrap_or(ResizeEdge::empty());
 
-                    if !edges.is_empty() {
-                        // See if we got a double resize-click gesture.
-                        // FIXME: deduplicate with resize_request in xdg-shell somehow.
-                        let time = get_monotonic_time();
-                        let last_cell = mapped.last_interactive_resize_start();
-                        let mut last = last_cell.get();
-                        last_cell.set(Some((time, edges)));
+                if let Some(mapped) = self.niri.window_under_cursor() {
+                    let window = mapped.id();
 
-                        // Floating windows don't have either of the double-resize-click
-                        // gestures, so just allow it to resize.
-                        if mapped.is_floating() {
-                            last = None;
-                            last_cell.set(None);
-                        }
-
-                        if let Some((last_time, last_edges)) = last {
-                            if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
-                                // Allow quick resize after a triple click.
-                                last_cell.set(None);
-
-                                let intersection = edges.intersection(last_edges);
-                                if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
-                                    // FIXME: don't activate once we can pass specific windows
-                                    // to actions.
-                                    self.niri.layout.activate_window(&window);
-                                    self.niri.layout.toggle_full_width();
-                                }
-                                if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                                    self.niri.layout.activate_window(&window);
-                                    self.niri.layout.reset_window_height(Some(&window));
-                                }
-                                // FIXME: granular.
-                                self.niri.queue_redraw_all();
-                                return;
-                            }
-                        }
-
+                    if !is_overview_open {
                         self.niri.layout.activate_window(&window);
-
-                        if self.niri.layout.interactive_resize_begin(window, edges) {
-                            let start_data = PointerGrabStartData {
-                                focus: None,
-                                button: button_code,
-                                location,
-                            };
-                            let grab = ResizeGrab::new(start_data, window);
-                            pointer.set_grab(self, grab, serial, Focus::Clear);
-                            self.niri
-                                .cursor_manager
-                                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
-                        }
                     }
+
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
+                } else if let Some((output, ws)) = is_overview_open
+                    .then(|| self.niri.workspace_under_cursor(false))
+                    .flatten()
+                {
+                    let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+
+                    self.niri.layout.focus_output(&output);
+                    self.niri.layout.toggle_overview_to_workspace(ws_idx);
+
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
+                } else if let Some(output) = self.niri.output_under_cursor() {
+                    self.niri.layout.focus_output(&output);
+
+                    // FIXME: granular.
+                    self.niri.queue_redraw_all();
                 }
-
-                if !is_overview_open {
-                    self.niri.layout.activate_window(&window);
-                }
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
-            } else if let Some((output, ws)) = is_overview_open
-                .then(|| self.niri.workspace_under_cursor(false))
-                .flatten()
-            {
-                let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-
-                self.niri.layout.focus_output(&output);
-                self.niri.layout.toggle_overview_to_workspace(ws_idx);
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
-            } else if let Some(output) = self.niri.output_under_cursor() {
-                self.niri.layout.focus_output(&output);
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
             }
         };
 
@@ -5290,6 +5413,28 @@ fn should_reset_pointer_inactivity_timer<I: InputBackend>(event: &InputEvent<I>)
     )
 }
 
+fn mouse_trigger(button: Option<MouseButton>) -> Option<Trigger> {
+    match button {
+        Some(MouseButton::Left) => Some(Trigger::MouseLeft),
+        Some(MouseButton::Right) => Some(Trigger::MouseRight),
+        Some(MouseButton::Middle) => Some(Trigger::MouseMiddle),
+        Some(MouseButton::Back) => Some(Trigger::MouseBack),
+        Some(MouseButton::Forward) => Some(Trigger::MouseForward),
+        _ => None,
+    }
+}
+
+fn is_mouse_drag_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::MoveWindowInteractively
+            | Action::ResizeWindowInteractively
+            | Action::MoveViewOrSwitchWorkspaceInteractively
+            | Action::PanWindowMirrorInteractively
+            | Action::ZoomWindowMirrorInteractively
+    )
+}
+
 fn allowed_when_locked(action: &Action) -> bool {
     matches!(
         action,
@@ -5740,7 +5885,7 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     // - DnDGrab allows hot corner to DnD across workspaces.
     // - ClickGrab keeps pointer focus on the window, so the hot corner doesn't trigger.
     // - Touch grabs: touch doesn't trigger the hot corner.
-    if grab.is::<ResizeGrab>() || grab.is::<SpatialMovementGrab>() {
+    if grab.is::<MirrorViewGrab>() || grab.is::<ResizeGrab>() || grab.is::<SpatialMovementGrab>() {
         return false;
     }
 

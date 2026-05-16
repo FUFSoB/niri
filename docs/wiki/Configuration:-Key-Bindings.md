@@ -128,7 +128,32 @@ binds {
 
 Mouse clicks operate on the window that was focused at the time of the click, not the window you're clicking.
 
-Note that binding `Mod+MouseLeft` or `Mod+MouseRight` will override the corresponding gesture (moving or resizing the window).
+### Mouse Drag Bindings
+
+Mouse drag actions are configured in the same `binds {}` section, but unlike regular mouse clicks they act on the window or mirror under the pointer and start a compositor grab.
+
+The built-in config binds these by default:
+
+```kdl
+binds {
+    Mod+MouseLeft   { move-window-interactively; }
+    Mod+MouseRight  { resize-window-interactively; }
+    Mod+MouseMiddle { move-view-or-switch-workspace-interactively; }
+}
+```
+
+You can rebind them to other modifier and mouse button combinations.
+
+Mirror windows also have dedicated drag actions:
+
+```kdl
+binds {
+    Mod+Shift+MouseLeft  { pan-window-mirror-interactively; }
+    Mod+Shift+MouseRight { zoom-window-mirror-interactively; }
+}
+```
+
+These drag actions are config-only and are not available through `niri msg action`.
 
 ### Custom Hotkey Overlay Titles
 
@@ -171,7 +196,8 @@ binds {
 
 ### Actions
 
-Every action that you can bind is also available for programmatic invocation via `niri msg action`.
+Almost every action that you can bind is also available for programmatic invocation via `niri msg action`.
+The exception is pointer drag actions like `move-window-interactively` and `zoom-window-mirror-interactively`, which require live pointer and button state and therefore only work as binds.
 Run `niri msg action` to get a full list of actions along with their short descriptions.
 
 Here are a few actions that benefit from more explanation.
@@ -432,6 +458,8 @@ binds {
     Mod+Ctrl+Right { move-window-mirror-view-right; }
     Mod+Ctrl+Up    { move-window-mirror-view-up; }
     Mod+Ctrl+Down  { move-window-mirror-view-down; }
+    Mod+Shift+MouseLeft  { pan-window-mirror-interactively; }
+    Mod+Shift+MouseRight { zoom-window-mirror-interactively; }
 
     // Jump the viewport center to 75% across the source window.
     Mod+Ctrl+Shift+Right { set-window-mirror-center-x "75%"; }

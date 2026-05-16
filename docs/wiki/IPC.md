@@ -59,6 +59,9 @@ $ env NIRI_SOCKET=./temp.sock niri msg action focus-workspace 2
 
 You can find all available requests and response types in the [niri-ipc sub-crate documentation](https://niri-wm.github.io/niri/niri_ipc/).
 
+Pointer drag actions such as `move-window-interactively`, `resize-window-interactively`, `move-view-or-switch-workspace-interactively`, `pan-window-mirror-interactively`, and `zoom-window-mirror-interactively` are config-only bind actions.
+They are not available over IPC because they require a live pointer/button grab context.
+
 ### Mirror Window View Actions
 
 <sup>Since: own-patches</sup>
