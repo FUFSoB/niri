@@ -1,7 +1,7 @@
 use std::cmp::{max, min};
 
 use niri_config::utils::MergeWith as _;
-use niri_config::window_rule::{Match, WindowRule};
+use niri_config::window_rule::{DrawCursor, Match, WindowRule};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
     ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
@@ -113,6 +113,11 @@ pub struct ResolvedWindowRules {
 
     /// Whether to block out this window from certain render targets.
     pub block_out_from: Option<BlockOutFrom>,
+
+    /// How to draw the cursor while it is over this window.
+    ///
+    /// `Some(DrawCursor::Default)` means an explicit reset to the default behavior.
+    pub draw_cursor: Option<DrawCursor>,
 
     /// Whether this window should capture the cursor.
     pub cursor_capture: Option<bool>,
@@ -315,6 +320,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.block_out_from {
                     resolved.block_out_from = Some(x);
+                }
+                if let Some(x) = rule.draw_cursor {
+                    resolved.draw_cursor = Some(x);
                 }
                 if let Some(x) = rule.cursor_capture {
                     resolved.cursor_capture = Some(x);

@@ -53,6 +53,10 @@ window-rule {
 
     // Properties that apply continuously.
     draw-border-with-background false
+    // draw-cursor "default"
+    draw-cursor "always-hidden"
+    // draw-cursor "always-shown"
+    // draw-cursor "hidden-on-capture"
     opacity 0.5
     block-out-from "screencast"
     // block-out-from "screen-capture"
@@ -658,6 +662,36 @@ window-rule {
     match app-id="^my-game$"
 
     cursor-capture true
+}
+```
+
+#### `draw-cursor`
+
+Control whether niri draws the cursor while it is over this window.
+
+Supported values:
+
+- `"default"`: use the normal behavior.
+- `"always-hidden"`: never draw the cursor on this window.
+- `"always-shown"`: always draw the cursor on this window.
+- `"hidden-on-capture"`: draw it locally, but hide it in screenshots and screencasts.
+
+If a later matching rule sets `draw-cursor "default"`, it restores the normal behavior even if an
+earlier rule set a different `draw-cursor` value.
+
+If `"always-shown"` overrides a client-hidden cursor, niri draws the default arrow cursor.
+
+```kdl
+window-rule {
+    match app-id="^my-game$"
+
+    draw-cursor "always-shown"
+}
+
+window-rule {
+    match app-id="^secret-app$"
+
+    draw-cursor "hidden-on-capture"
 }
 ```
 

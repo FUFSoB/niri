@@ -68,6 +68,8 @@ pub struct WindowRule {
     #[knuffel(child, unwrap(argument))]
     pub block_out_from: Option<BlockOutFrom>,
     #[knuffel(child, unwrap(argument))]
+    pub draw_cursor: Option<DrawCursor>,
+    #[knuffel(child, unwrap(argument))]
     pub cursor_capture: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub variable_refresh_rate: Option<bool>,
@@ -123,6 +125,15 @@ impl MergeWith<PopupsRule> for ResolvedPopupsRules {
         }
         self.background_effect.merge_with(&part.background_effect);
     }
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DrawCursor {
+    #[default]
+    Default,
+    AlwaysHidden,
+    AlwaysShown,
+    HiddenOnCapture,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

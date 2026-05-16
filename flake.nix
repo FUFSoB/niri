@@ -62,6 +62,10 @@
           name = "pointer-gestures";
           pr = null;
         }
+        {
+          name = "draw-cursor";
+          pr = null;
+        }
       ];
       niri-package =
         {

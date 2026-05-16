@@ -142,6 +142,7 @@ enum CastState {
         damage_tracker: Option<OutputDamageTracker>,
         cursor_damage_tracker: Option<OutputDamageTracker>,
         last_cursor_location: Option<Point<i32, Physical>>,
+        last_cursor_visible: Option<bool>,
     },
 }
 
@@ -202,6 +203,23 @@ impl<'a, E: Element> CursorData<'a, E> {
             scale,
         }
     }
+
+    fn is_visible(&self) -> bool {
+        self.size.w > 0 && self.size.h > 0
+    }
+}
+
+fn compute_cursor_metadata_update(
+    last_cursor_location: Option<Point<i32, Physical>>,
+    last_cursor_visible: Option<bool>,
+    cursor_location: Point<i32, Physical>,
+    cursor_visible: bool,
+    cursor_damaged: bool,
+) -> (bool, bool) {
+    let visibility_changed = last_cursor_visible != Some(cursor_visible);
+    let redraw_cursor = cursor_damaged || visibility_changed;
+    let has_cursor_update = redraw_cursor || last_cursor_location != Some(cursor_location);
+    (has_cursor_update, redraw_cursor)
 }
 
 macro_rules! make_params {
@@ -573,6 +591,7 @@ impl PipeWire {
                                 damage_tracker,
                                 cursor_damage_tracker,
                                 last_cursor_location: None,
+                                last_cursor_visible: None,
                             };
 
                             plane_count
@@ -608,6 +627,7 @@ impl PipeWire {
                                 damage_tracker: None,
                                 cursor_damage_tracker: None,
                                 last_cursor_location: None,
+                                last_cursor_visible: None,
                             };
 
                             plane_count as i32
@@ -1073,6 +1093,7 @@ impl Cast {
             damage_tracker,
             cursor_damage_tracker,
             last_cursor_location,
+            last_cursor_visible,
             ..
         } = &mut inner.state
         else {
@@ -1116,9 +1137,13 @@ impl Cast {
             let (damage, _states) = cursor_damage_tracker
                 .damage_output(1, &cursor_data.relocated)
                 .unwrap();
-            redraw_cursor = damage.is_some();
-            has_cursor_update =
-                redraw_cursor || *last_cursor_location != Some(cursor_data.location);
+            (has_cursor_update, redraw_cursor) = compute_cursor_metadata_update(
+                *last_cursor_location,
+                *last_cursor_visible,
+                cursor_data.location,
+                cursor_data.is_visible(),
+                damage.is_some(),
+            );
         }
 
         if damage.is_none() && !has_cursor_update {
@@ -1126,6 +1151,7 @@ impl Cast {
             return false;
         }
         *last_cursor_location = Some(cursor_data.location);
+        *last_cursor_visible = Some(cursor_data.is_visible());
         drop(inner);
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
@@ -1180,11 +1206,15 @@ impl Cast {
         if let CastState::Ready {
             damage_tracker,
             cursor_damage_tracker,
+            last_cursor_location,
+            last_cursor_visible,
             ..
         } = &mut inner.state
         {
             *damage_tracker = None;
             *cursor_damage_tracker = None;
+            *last_cursor_location = None;
+            *last_cursor_visible = None;
         };
         drop(inner);
 
@@ -1582,5 +1612,42 @@ unsafe fn add_cursor_metadata(
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Physical, Point};
+
+    use super::compute_cursor_metadata_update;
+
+    #[test]
+    fn cursor_metadata_same_visible_location_without_damage_has_no_update() {
+        let location: Point<i32, Physical> = (10, 20).into();
+        let (has_update, redraw) =
+            compute_cursor_metadata_update(Some(location), Some(true), location, true, false);
+
+        assert!(!has_update);
+        assert!(!redraw);
+    }
+
+    #[test]
+    fn cursor_metadata_visibility_flip_to_hidden_forces_update_and_redraw() {
+        let location: Point<i32, Physical> = (10, 20).into();
+        let (has_update, redraw) =
+            compute_cursor_metadata_update(Some(location), Some(true), location, false, false);
+
+        assert!(has_update);
+        assert!(redraw);
+    }
+
+    #[test]
+    fn cursor_metadata_visibility_flip_to_visible_forces_update_and_redraw() {
+        let location: Point<i32, Physical> = (10, 20).into();
+        let (has_update, redraw) =
+            compute_cursor_metadata_update(Some(location), Some(false), location, true, false);
+
+        assert!(has_update);
+        assert!(redraw);
     }
 }

@@ -60,7 +60,15 @@ impl CursorManager {
 
     /// Get the current rendering cursor.
     pub fn get_render_cursor(&self, scale: i32) -> RenderCursor {
-        match self.current_cursor.clone() {
+        self.get_render_cursor_for_image(self.current_cursor.clone(), scale)
+    }
+
+    pub fn get_render_cursor_for_image(
+        &self,
+        cursor_image: CursorImageStatus,
+        scale: i32,
+    ) -> RenderCursor {
+        match cursor_image {
             CursorImageStatus::Hidden => RenderCursor::Hidden,
             CursorImageStatus::Surface(surface) => {
                 let hotspot = with_states(&surface, |states| {
