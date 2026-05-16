@@ -10,6 +10,7 @@ mod cursor_capture;
 mod draw_cursor;
 mod floating;
 mod fullscreen;
+mod keyboard_focus;
 mod layer_shell;
 mod remove_output;
 mod transactions;

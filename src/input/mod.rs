@@ -867,6 +867,43 @@ impl State {
             .is_some_and(KeyboardShortcutsInhibitor::is_active)
     }
 
+    pub(crate) fn flush_lost_keyboard_state(&mut self) {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let mut pressed_keys = keyboard.pressed_keys().into_iter().collect::<Vec<_>>();
+        pressed_keys.sort_unstable();
+
+        let time = get_monotonic_time().as_millis() as u32;
+        for keycode in pressed_keys {
+            let serial = SERIAL_COUNTER.next_serial();
+            let (_, mods_changed) =
+                keyboard.input_intercept(self, keycode, KeyState::Released, |_, _, _| ());
+
+            // Only forward releases for keys that were forwarded on press.
+            if !self.niri.suppressed_keys.contains(&keycode) {
+                keyboard.input_forward(
+                    self,
+                    keycode,
+                    KeyState::Released,
+                    serial,
+                    time,
+                    mods_changed,
+                );
+            }
+        }
+
+        self.niri.suppressed_keys.clear();
+
+        if let Some(token) = self.niri.bind_repeat_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+
+        self.niri.screenshot_ui.set_space_down(false);
+
+        if self.niri.window_mru_ui.is_open() {
+            self.niri.cancel_mru();
+        }
+    }
+
     fn on_keyboard<I: InputBackend>(
         &mut self,
         event: I::KeyboardKeyEvent,
@@ -1172,13 +1209,13 @@ impl State {
             }
             Action::ChangeVt(vt) => {
                 self.backend.change_vt(vt);
-                // Changing VT may not deliver the key releases, so clear the state.
-                self.niri.suppressed_keys.clear();
+                // Changing VT may not deliver the key releases.
+                self.flush_lost_keyboard_state();
             }
             Action::Suspend => {
                 self.backend.suspend();
-                // Suspend may not deliver the key releases, so clear the state.
-                self.niri.suppressed_keys.clear();
+                // Suspend may not deliver the key releases.
+                self.flush_lost_keyboard_state();
             }
             Action::PowerOffMonitors => {
                 self.niri.deactivate_monitors(&mut self.backend);
