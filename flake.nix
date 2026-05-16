@@ -54,6 +54,14 @@
           name = "virtual-outputs";
           pr = 3800;
         }
+        {
+          name = "mirror-viewport";
+          pr = null;
+        }
+        {
+          name = "pointer-gestures";
+          pr = null;
+        }
       ];
       niri-package =
         {
