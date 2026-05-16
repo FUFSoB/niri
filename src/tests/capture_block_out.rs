@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use niri_config::input::FocusFollowsMouse;
 use niri_config::layer_rule::{LayerRule, Match as LayerMatch};
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
@@ -24,7 +25,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::{ClientId, LayerConfigureProps};
 use super::*;
 use crate::layout::{
-    ActivateWindow, AddWindowTarget, LayoutElement as _, LayoutElementRenderElement,
+    ActivateWindow, AddWindowTarget, HitType, LayoutElement as _, LayoutElementRenderElement,
 };
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{
@@ -926,6 +927,195 @@ fn zoomed_mirror_hover_uses_source_surface_coords() {
     let (surface, surface_pos) = under.surface.unwrap();
     assert_eq!(surface, source_surface);
     assert_eq!(surface_pos, Point::from((pos.x as f64 - 20., pos.y as f64)));
+}
+
+#[test]
+fn zoomed_mirror_does_not_take_input_outside_window_bounds() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let (pos, size) = tile_geometry_for(&mut f, mirror_id);
+    let outside = Point::from((pos.x as f64 - 1., pos.y as f64 + size.h as f64 / 2.));
+    let under = f.niri().contents_under(outside);
+
+    assert_ne!(under.window.map(|(id, _)| id), Some(mirror_id));
+    let mapped = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == mirror_id)
+        .map(|(_, mapped)| mapped)
+        .unwrap();
+    assert_eq!(mapped.mirror_point_to_source(Point::from((-1., 10.))), None);
+}
+
+#[test]
+fn mirror_padding_is_activate_only() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+
+    let (pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let padding_point = Point::from((pos.x as f64 + 10., pos.y as f64 + 1.));
+    let under = f.niri().contents_under(padding_point);
+
+    assert!(matches!(
+        under.window,
+        Some((
+            id,
+            HitType::Activate {
+                is_tab_indicator: false
+            }
+        )) if id == mirror_id
+    ));
+    assert!(under.surface.is_none());
+}
+
+#[test]
+fn zoomed_mirror_hover_keeps_source_surface_origin_at_left_edge() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let source_surface = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| !mapped.is_mirror())
+        .map(|(_, mapped)| mapped.toplevel().wl_surface().clone())
+        .unwrap();
+    let (pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let center = Point::from((pos.x as f64 + 10., pos.y as f64 + 10.));
+    let left_edge = Point::from((pos.x as f64 + 1., pos.y as f64 + 10.));
+
+    let center_under = f.niri().contents_under(center);
+    let left_under = f.niri().contents_under(left_edge);
+
+    assert_eq!(center_under.window.map(|(id, _)| id), Some(mirror_id));
+    assert_eq!(left_under.window.map(|(id, _)| id), Some(mirror_id));
+
+    let (center_surface, center_pos) = center_under.surface.unwrap();
+    let (left_surface, left_pos) = left_under.surface.unwrap();
+    assert_eq!(center_surface, source_surface);
+    assert_eq!(left_surface, source_surface);
+    assert_eq!(center_pos, Point::from((pos.x as f64 - 20., pos.y as f64)));
+    assert_eq!(left_pos, center_pos);
+}
+
+#[test]
+fn focus_follows_mouse_switches_from_zoomed_mirror_to_source_window() {
+    let mut config = Config::default();
+    config.input.focus_follows_mouse = Some(FocusFollowsMouse {
+        max_scroll_amount: None,
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| !mapped.is_mirror())
+        .map(|(_, mapped)| mapped.id())
+        .unwrap();
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
+        false,
+    );
+
+    let (source_pos, source_size) = tile_geometry_for(&mut f, source_id);
+    let (mirror_pos, mirror_size) = tile_geometry_for(&mut f, mirror_id);
+    let (old_point, new_point) = if mirror_pos.x > source_pos.x {
+        (
+            Point::from((mirror_pos.x as f64 + 1., mirror_pos.y as f64 + 10.)),
+            Point::from((
+                source_pos.x as f64 + source_size.w as f64 - 1.,
+                source_pos.y as f64 + source_size.h as f64 / 2.,
+            )),
+        )
+    } else {
+        (
+            Point::from((
+                mirror_pos.x as f64 + mirror_size.w as f64 - 1.,
+                mirror_pos.y as f64 + 10.,
+            )),
+            Point::from((
+                source_pos.x as f64 + 1.,
+                source_pos.y as f64 + source_size.h as f64 / 2.,
+            )),
+        )
+    };
+
+    let old_focus = f.niri().contents_under(old_point);
+    let new_focus = f.niri().contents_under(new_point);
+    assert_eq!(old_focus.window.map(|(id, _)| id), Some(mirror_id));
+    assert_eq!(new_focus.window.map(|(id, _)| id), Some(source_id));
+
+    let pointer = f.niri().seat.get_pointer().unwrap();
+    pointer.set_location(new_point);
+    f.niri().pointer_contents = old_focus.clone();
+    f.niri().handle_focus_follows_mouse(&old_focus, &new_focus);
+
+    assert_eq!(
+        f.niri().layout.focus().map(|mapped| mapped.id()),
+        Some(source_id)
+    );
 }
 
 #[test]

@@ -3857,19 +3857,20 @@ impl Niri {
         let mapped_hit_data = |(mapped, hit): (&Mapped, HitType)| {
             let window = &mapped.window;
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
-                let win_pos_within_output = win_pos;
-                let source_buf_pos = if mapped.is_mirror() {
-                    let (_, scale) = mapped.mirror_content_transform();
-                    (pos_within_output - win_pos_within_output).downscale(scale)
+                let source_surface_pos = if mapped.is_mirror() {
+                    let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
+                    mapped.mirror_point_to_source(mirror_local)
                 } else {
-                    pos_within_output - win_pos_within_output
+                    Some(pos_within_output - win_pos)
                 };
-                window
-                    .surface_under(source_buf_pos, WindowSurfaceType::ALL)
-                    .map(|(s, surface_loc)| {
-                        let source_surface_local = source_buf_pos - surface_loc.to_f64();
-                        (s, pos_within_output - source_surface_local)
-                    })
+                source_surface_pos.and_then(|source_surface_pos| {
+                    window
+                        .surface_under(source_surface_pos, WindowSurfaceType::ALL)
+                        .map(|(s, surface_loc)| {
+                            let source_surface_local = source_surface_pos - surface_loc.to_f64();
+                            (s, pos_within_output - source_surface_local)
+                        })
+                })
             } else {
                 None
             };
@@ -7123,7 +7124,11 @@ impl Niri {
         }
     }
 
-    pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
+    pub fn handle_focus_follows_mouse(
+        &mut self,
+        previous_focus: &PointContents,
+        new_focus: &PointContents,
+    ) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
         };
@@ -7146,10 +7151,9 @@ impl Niri {
             }
         }
 
-        if let Some(window) = &new_focus.window {
-            if !self.layout.is_overview_open() && current_focus.window.as_ref() != Some(window) {
-                let (window, hit) = window;
-
+        if let Some((window, hit)) = &new_focus.window {
+            let previous_window = previous_focus.window.as_ref().map(|(id, _)| *id);
+            if !self.layout.is_overview_open() && previous_window != Some(*window) {
                 // Don't trigger focus-follows-mouse over the tab indicator.
                 if matches!(
                     hit,

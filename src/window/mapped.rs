@@ -1027,6 +1027,9 @@ impl Mapped {
         point: Point<f64, Logical>,
     ) -> Option<Point<f64, Logical>> {
         let transform = self.mirror_transform();
+        if !transform.visible_rect.contains(point) {
+            return None;
+        }
         let point = (point - transform.content_rect.loc).downscale(transform.scale)
             + transform.source_geometry.loc;
         transform.source_geometry.contains(point).then_some(point)
