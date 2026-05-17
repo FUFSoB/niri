@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{DrawCursor, Match as WindowMatch, WindowRule};
-use niri_config::Config;
+use niri_config::{Action, Config};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -71,6 +71,19 @@ fn move_cursor_to_window(f: &mut Fixture, id: MappedId) {
     state.niri.pointer_visibility = PointerVisibility::Visible;
     state.niri.tablet_cursor_location = None;
     state.move_cursor(point);
+}
+
+fn move_cursor_to_output_center(f: &mut Fixture) {
+    let state = f.niri_state();
+    state.niri.pointer_visibility = PointerVisibility::Visible;
+    state.niri.tablet_cursor_location = None;
+    state.move_cursor(Point::from((50.0, 50.0)));
+}
+
+fn zoom_output(f: &mut Fixture, level: &str) {
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(level.into(), None), false);
+    f.niri_complete_animations();
 }
 
 fn cursor_pos(f: &mut Fixture) -> Point<f64, Logical> {
@@ -544,4 +557,41 @@ fn draw_cursor_always_hidden_stays_hidden_on_window_captures_after_workspace_swi
         render_window_screen_capture_pixels(&mut f, &output, hidden, false);
     let capture_with_pointer = render_window_screen_capture_pixels(&mut f, &output, hidden, true);
     assert_eq!(capture_with_pointer, capture_without_pointer);
+}
+
+#[test]
+fn output_zoom_renders_pointer_on_empty_output() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    move_cursor_to_output_center(&mut f);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+    zoom_output(&mut f, "+0.25");
+
+    let output = f.niri_output(1);
+    assert!(f.niri().layout.zoom_level_for_output(&output) > 1.0);
+
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
+
+    assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn output_zoom_renders_pointer_over_window() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+    zoom_output(&mut f, "+0.25");
+
+    let output = f.niri_output(1);
+    assert!(f.niri().layout.zoom_level_for_output(&output) > 1.0);
+
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
+
+    assert_ne!(with_pointer, without_pointer);
 }

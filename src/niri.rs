@@ -4385,6 +4385,7 @@ impl Niri {
         let render_cursor = self.render_cursor_for_target(target, cursor_scale, cursor_owner);
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
+        let cursor_hotspot_pos = pointer_pos.to_physical_precise_round(output_scale);
 
         match render_cursor {
             RenderCursor::Hidden => (),
@@ -4399,7 +4400,11 @@ impl Niri {
                     output_scale,
                     1.,
                     Kind::Cursor,
-                    &mut |elem| push(elem.into()),
+                    &mut |elem| {
+                        let hotspot_in_element =
+                            cursor_hotspot_pos - elem.geometry(output_scale).loc;
+                        push(PointerRenderElement::new(elem, hotspot_in_element).into());
+                    },
                 );
             }
             RenderCursor::Named {
@@ -4423,7 +4428,11 @@ impl Niri {
                     None,
                     Kind::Cursor,
                 ) {
-                    Ok(element) => push(element.into()),
+                    Ok(element) => {
+                        let hotspot_in_element =
+                            cursor_hotspot_pos - element.geometry(output_scale).loc;
+                        push(PointerRenderElement::new(element, hotspot_in_element).into());
+                    }
                     Err(err) => {
                         warn!("error importing a cursor texture: {err:?}");
                     }
@@ -4441,7 +4450,10 @@ impl Niri {
                 output_scale,
                 1.,
                 Kind::ScanoutCandidate,
-                &mut |elem| push(elem.into()),
+                &mut |elem| {
+                    let hotspot_in_element = cursor_hotspot_pos - elem.geometry(output_scale).loc;
+                    push(PointerRenderElement::new(elem, hotspot_in_element).into());
+                },
             );
         }
     }
@@ -4832,13 +4844,8 @@ impl Niri {
         &self,
         element: OutputRenderElements<R>,
         output: &Output,
-        target: RenderTarget,
+        _target: RenderTarget,
     ) -> OutputRenderElements<R> {
-        let is_wayland_pointer = matches!(
-            &element,
-            OutputRenderElements::Pointer(PointerRenderElements::Wayland(_))
-        );
-
         // Apply zoom to the render elements when needed.
         if !self.layout.has_zoom_for_output(output) {
             return element;
@@ -4855,10 +4862,9 @@ impl Niri {
 
         let scale_with_zoom = self.config.borrow().cursor.scale_with_zoom;
 
-        // Compute cursor display position and hotspot on-demand for jitter-free
-        // pointer zoom. The f64 precision avoids i32 roundtrip errors that get
-        // amplified at high zoom levels. Only needed when actually zoomed.
-        let (cursor_logical_pos, cursor_hotspot) = if zoom_level > 1.0 {
+        // Compute cursor display position on-demand. Only needed when actually
+        // zoomed.
+        let cursor_logical_pos = if zoom_level > 1.0 {
             let output_pos = self.global_space.output_geometry(output).unwrap().loc;
             let pointer_pos = self
                 .tablet_cursor_location
@@ -4869,38 +4875,17 @@ impl Niri {
             let output_rect: Rectangle<f64, Logical> = Rectangle::from_size(output_sz);
 
             if output_rect.contains(pointer_local) {
-                let display_pos =
-                    zoom_display_cursor_logical(pointer_local, output_sz, zoom_level, zoom_focal);
-
-                // Use cursor theme hotspot — stable per icon, avoids oscillating
-                // hotspot_in_elem = cursor_f64 - elem_pos_i32 computation.
-                let hotspot = if is_wayland_pointer {
-                    None
-                } else {
-                    let cursor_scale = output.current_scale().integer_scale();
-                    match self.render_cursor_for_target(target, cursor_scale, None) {
-                        RenderCursor::Hidden => None,
-                        RenderCursor::Surface { hotspot, .. } => {
-                            Some(hotspot.to_physical_precise_round(output_scale))
-                        }
-                        RenderCursor::Named { scale, cursor, .. } => {
-                            let (_, frame) =
-                                cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                            Some(
-                                XCursor::hotspot(frame)
-                                    .to_logical(scale)
-                                    .to_physical_precise_round(output_scale),
-                            )
-                        }
-                    }
-                };
-
-                (Some(display_pos), hotspot)
+                Some(zoom_display_cursor_logical(
+                    pointer_local,
+                    output_sz,
+                    zoom_level,
+                    zoom_focal,
+                ))
             } else {
-                (None, None)
+                None
             }
         } else {
-            (None, None)
+            None
         };
 
         apply_zoom_to_render_element(
@@ -4910,7 +4895,6 @@ impl Niri {
             scale_with_zoom,
             zoom_focal,
             cursor_logical_pos,
-            cursor_hotspot,
             output_size_phys,
         )
     }
@@ -7603,7 +7587,6 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
     scale_with_zoom: bool,
     zoom_focal_point: Point<f64, Logical>,
     cursor_logical_pos: Option<Point<f64, Logical>>,
-    cursor_hotspot: Option<Point<i32, Physical>>,
     output_size_phys: Size<i32, Physical>,
 ) -> OutputRenderElements<R> {
     // Generate match arms for each OutputRenderElement variant.
@@ -7612,6 +7595,7 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
             match element {
                 OutputRenderElements::Pointer(pointer_elem) => {
                     let pointer_pos = pointer_elem.geometry(output_scale).loc;
+                    let hotspot = pointer_elem.hotspot_in_element();
 
                     // Use f64 cursor position to avoid the i32 roundtrip that
                     // causes jitter at high zoom. The elem position oscillates
@@ -7620,7 +7604,10 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
                     let cursor_pos_f64: Point<f64, Physical> = cursor_logical_pos
                         .map(|p| p.to_physical(output_scale))
                         .unwrap_or_else(|| {
-                            Point::from((pointer_pos.x as f64, pointer_pos.y as f64))
+                            Point::from((
+                                pointer_pos.x as f64 + hotspot.x as f64,
+                                pointer_pos.y as f64 + hotspot.y as f64,
+                            ))
                         });
 
                     // Ideal cursor hotspot position with f64 precision.
@@ -7637,17 +7624,6 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
                         target.x.round() as i32,
                         target.y.round() as i32,
                     ));
-
-                    // Use cursor theme hotspot (stable per-icon). Computing
-                    // hotspot = cursor_f64 - pointer_pos(i32) oscillates and
-                    // causes jitter.
-                    let hotspot: Point<i32, Physical> =
-                        cursor_hotspot.unwrap_or_else(|| {
-                            Point::from((
-                                (cursor_pos_f64.x - pointer_pos.x as f64).round() as i32,
-                                (cursor_pos_f64.y - pointer_pos.y as f64).round() as i32,
-                            ))
-                        });
 
                     // Place cursor hotspot at target. hotspot_scaled accounts
                     // for cursor scaling with zoom.
@@ -7788,10 +7764,158 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
     )
 }
 
+#[derive(Debug)]
+pub struct PointerRenderElement<E> {
+    element: E,
+    hotspot_in_element: Point<i32, Physical>,
+}
+
+impl<E> PointerRenderElement<E> {
+    pub fn new(element: E, hotspot_in_element: Point<i32, Physical>) -> Self {
+        Self {
+            element,
+            hotspot_in_element,
+        }
+    }
+
+    pub fn hotspot_in_element(&self) -> Point<i32, Physical> {
+        self.hotspot_in_element
+    }
+}
+
+impl<E: Element> Element for PointerRenderElement<E> {
+    fn id(&self) -> &Id {
+        self.element.id()
+    }
+
+    fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+        self.element.current_commit()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.geometry(scale)
+    }
+
+    fn transform(&self) -> Transform {
+        self.element.transform()
+    }
+
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        self.element.src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<smithay::backend::renderer::utils::CommitCounter>,
+    ) -> smithay::backend::renderer::utils::DamageSet<i32, Physical> {
+        self.element.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(
+        &self,
+        scale: Scale<f64>,
+    ) -> smithay::backend::renderer::utils::OpaqueRegions<i32, Physical> {
+        self.element.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.element.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.element.kind()
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.element.is_framebuffer_effect()
+    }
+}
+
+impl<E> RenderElement<GlesRenderer> for PointerRenderElement<E>
+where
+    E: RenderElement<GlesRenderer>,
+{
+    fn capture_framebuffer(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &smithay::utils::user_data::UserDataMap,
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        self.element.capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        self.element
+            .draw(frame, src, dst, damage, opaque_regions, cache)
+    }
+
+    fn underlying_storage(
+        &self,
+        renderer: &mut GlesRenderer,
+    ) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+        self.element.underlying_storage(renderer)
+    }
+}
+
+impl<'render, E> RenderElement<crate::backend::tty::TtyRenderer<'render>>
+    for PointerRenderElement<E>
+where
+    E: RenderElement<crate::backend::tty::TtyRenderer<'render>>,
+{
+    fn capture_framebuffer(
+        &self,
+        frame: &mut crate::backend::tty::TtyFrame<'render, '_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &smithay::utils::user_data::UserDataMap,
+    ) -> Result<(), crate::backend::tty::TtyRendererError<'render>> {
+        self.element.capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn draw(
+        &self,
+        frame: &mut crate::backend::tty::TtyFrame<'render, '_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), crate::backend::tty::TtyRendererError<'render>> {
+        self.element
+            .draw(frame, src, dst, damage, opaque_regions, cache)
+    }
+
+    fn underlying_storage(
+        &self,
+        renderer: &mut crate::backend::tty::TtyRenderer<'render>,
+    ) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+        self.element.underlying_storage(renderer)
+    }
+}
+
 niri_render_elements! {
     PointerRenderElements<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
-        NamedPointer = MemoryRenderBufferRenderElement<R>,
+        Wayland = PointerRenderElement<WaylandSurfaceRenderElement<R>>,
+        NamedPointer = PointerRenderElement<MemoryRenderBufferRenderElement<R>>,
+    }
+}
+
+impl<R: NiriRenderer> PointerRenderElements<R> {
+    fn hotspot_in_element(&self) -> Point<i32, Physical> {
+        match self {
+            PointerRenderElements::Wayland(elem) => elem.hotspot_in_element(),
+            PointerRenderElements::NamedPointer(elem) => elem.hotspot_in_element(),
+        }
     }
 }
 
