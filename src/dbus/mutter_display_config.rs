@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -73,7 +74,11 @@ impl DisplayConfig {
         let mut monitors = Vec::new();
         let mut logical_monitors = Vec::new();
 
-        for output in self.ipc_outputs.lock().unwrap().values() {
+        let ipc_outputs = self.ipc_outputs.lock().unwrap();
+        let mut outputs = ipc_outputs.values().collect::<Vec<_>>();
+        outputs.sort_unstable_by(|a, b| cmp_outputs_for_picker(a, b));
+
+        for output in outputs {
             // Loosely matches the check in Mutter.
             let c = &output.name;
             let is_laptop_panel = is_laptop_panel(c);
@@ -162,10 +167,6 @@ impl DisplayConfig {
                 properties,
             });
         }
-
-        // Sort by connector.
-        monitors.sort_unstable_by(|a, b| a.names.0.cmp(&b.names.0));
-        logical_monitors.sort_unstable_by(|a, b| a.monitors[0].0.cmp(&b.monitors[0].0));
 
         let properties = HashMap::from([(String::from("layout-mode"), OwnedValue::from(1u32))]);
         Ok((0, monitors, logical_monitors, properties))
@@ -328,6 +329,17 @@ fn make_display_name(output: &niri_ipc::Output, is_laptop_panel: bool) -> String
     }
 }
 
+fn cmp_outputs_for_picker(a: &niri_ipc::Output, b: &niri_ipc::Output) -> Ordering {
+    match (a.logical.as_ref(), b.logical.as_ref()) {
+        (Some(a_logical), Some(b_logical)) => {
+            (a_logical.x, a_logical.y, &a.name).cmp(&(b_logical.x, b_logical.y, &b.name))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    }
+}
+
 fn format_diagonal(diagonal_inches: f64) -> String {
     let known = [12.1, 13.3, 15.6];
     if let Some(d) = known.iter().find(|d| (*d - diagonal_inches).abs() < 0.1) {
@@ -350,5 +362,45 @@ mod tests {
         assert_snapshot!(format_diagonal(15.6), @"15.6″");
         assert_snapshot!(format_diagonal(23.2), @"23″");
         assert_snapshot!(format_diagonal(24.8), @"25″");
+    }
+
+    #[test]
+    fn picker_sorts_outputs_by_logical_position_before_name() {
+        fn output(name: &str, x: i32, y: i32) -> niri_ipc::Output {
+            niri_ipc::Output {
+                name: name.to_owned(),
+                make: String::new(),
+                model: String::new(),
+                serial: None,
+                physical_size: None,
+                modes: vec![],
+                current_mode: None,
+                is_custom_mode: false,
+                vrr_supported: false,
+                vrr_enabled: false,
+                logical: Some(niri_ipc::LogicalOutput {
+                    x,
+                    y,
+                    width: 1920,
+                    height: 1080,
+                    scale: 1.,
+                    transform: niri_ipc::Transform::Normal,
+                }),
+            }
+        }
+
+        let mut outputs = vec![
+            output("DP-2", 1920, 0),
+            output("HDMI-A-1", 0, 0),
+            output("DP-1", 0, 1080),
+        ];
+
+        outputs.sort_unstable_by(cmp_outputs_for_picker);
+
+        let names = outputs
+            .into_iter()
+            .map(|output| output.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["HDMI-A-1", "DP-1", "DP-2"]);
     }
 }

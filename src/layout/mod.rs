@@ -4232,17 +4232,17 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         let mon = &mut monitors[*active_monitor_idx];
-        if mon.sticky_is_active() {
+        let sticky_is_active = mon.sticky_is_active();
+        let active_workspace_idx = mon.active_workspace_idx;
+        if mon.workspaces[active_workspace_idx].floating_is_active() {
             return;
         }
 
-        let workspace = &mut mon.workspaces[mon.active_workspace_idx];
-        if workspace.floating_is_active() {
-            return;
-        }
-
-        if workspace.has_floating_windows() {
-            workspace.focus_floating();
+        if mon.workspaces[active_workspace_idx].has_floating_windows() {
+            if sticky_is_active {
+                mon.focus_workspace();
+            }
+            mon.workspaces[active_workspace_idx].focus_floating();
             return;
         }
 
@@ -4282,15 +4282,21 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         let mon = &mut monitors[*active_monitor_idx];
-        if mon.sticky_is_active() {
-            mon.focus_workspace();
-            mon.workspaces[mon.active_workspace_idx].focus_tiling();
+        let sticky_is_active = mon.sticky_is_active();
+        let active_workspace_idx = mon.active_workspace_idx;
+        if mon.workspaces[active_workspace_idx].has_floating_windows() {
+            if sticky_is_active {
+                mon.focus_workspace();
+                mon.workspaces[active_workspace_idx].focus_floating();
+            } else {
+                mon.workspaces[active_workspace_idx].switch_focus_floating_tiling();
+            }
             return;
         }
 
-        let workspace = &mut mon.workspaces[mon.active_workspace_idx];
-        if workspace.has_floating_windows() {
-            workspace.switch_focus_floating_tiling();
+        if sticky_is_active {
+            mon.focus_workspace();
+            mon.workspaces[mon.active_workspace_idx].focus_tiling();
             return;
         }
 

@@ -9,9 +9,13 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::output::Output;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 
+use super::client::LayerConfigureProps;
 use super::*;
+use crate::layout::workspace::WorkspaceId;
 use crate::layout::LayoutElement;
 use crate::niri::{PointerVisibility, WindowScreenshotRenderElement};
 use crate::render_helpers::xray::XrayPos;
@@ -78,6 +82,13 @@ fn move_cursor_to_output_center(f: &mut Fixture) {
     state.niri.pointer_visibility = PointerVisibility::Visible;
     state.niri.tablet_cursor_location = None;
     state.move_cursor(Point::from((50.0, 50.0)));
+}
+
+fn move_cursor_to_point(f: &mut Fixture, point: Point<f64, Logical>) {
+    let state = f.niri_state();
+    state.niri.pointer_visibility = PointerVisibility::Visible;
+    state.niri.tablet_cursor_location = None;
+    state.move_cursor(point);
 }
 
 fn zoom_output(f: &mut Fixture, level: &str) {
@@ -201,6 +212,69 @@ fn render_window_screencast_pixels(
         .unwrap()
 }
 
+fn render_workspace_screencast_pixels(
+    f: &mut Fixture,
+    output: &Output,
+    workspace_id: WorkspaceId,
+    include_pointer: bool,
+) -> (Size<i32, Physical>, Vec<u8>) {
+    let output = output.clone();
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+
+    backend
+        .with_primary_renderer(|renderer| {
+            niri.update_render_elements(Some(&output));
+
+            let size = output.current_mode().unwrap().size;
+            let transform = output.current_transform();
+            let size = transform.transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let workspace = niri.layout.find_workspace_by_id(workspace_id).unwrap().1;
+
+            let mut elements = Vec::new();
+            if include_pointer
+                && niri.should_render_pointer_for_target(RenderTarget::Screencast, None)
+                && niri
+                    .workspace_cast_pointer_pos(&output, workspace_id)
+                    .is_some()
+            {
+                niri.render_pointer(
+                    renderer,
+                    &output,
+                    RenderTarget::Screencast,
+                    None,
+                    &mut |elem| elements.push(elem.into()),
+                );
+            }
+
+            niri.render_workspace_for_screen_cast(
+                RenderCtx {
+                    renderer,
+                    target: RenderTarget::Screencast,
+                    block_out_enabled: niri.block_out_enabled,
+                    xray: None,
+                },
+                &output,
+                workspace,
+                &mut |elem| elements.push(elem),
+            );
+
+            let pixels = render_pixels(
+                renderer,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+            .unwrap();
+
+            (size, pixels)
+        })
+        .unwrap()
+}
+
 fn render_window_screen_capture_pixels(
     f: &mut Fixture,
     output: &Output,
@@ -289,6 +363,28 @@ fn set_cursor_image(f: &mut Fixture, image: CursorImageStatus) {
     f.niri().cursor_manager.set_cursor_image(image);
 }
 
+fn create_top_layer(f: &mut Fixture, size: (u16, u16)) {
+    let id = f.add_client();
+    let output = f.client(id).output("headless-1");
+    let layer = f
+        .client(id)
+        .create_layer(Some(&output), Layer::Top, "test-layer");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
+        size: Some((0, u32::from(size.1))),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(size.0, size.1);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+}
+
 fn start_workspace_switch(f: &mut Fixture, output: &Output) {
     f.niri().layout.workspace_switch_gesture_begin(output, true);
 
@@ -350,6 +446,23 @@ fn draw_cursor_always_shown_draws_hidden_cursor_on_output() {
     let window = create_window(&mut f, "test", (40, 30));
     move_cursor_to_window(&mut f, window);
     set_cursor_image(&mut f, CursorImageStatus::Hidden);
+
+    let output = f.niri_output(1);
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
+
+    assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn draw_cursor_always_shown_overrides_hidden_pointer_visibility() {
+    let Some(mut f) = set_up(config_with_draw_cursor(DrawCursor::AlwaysShown)) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+    f.niri().pointer_visibility = PointerVisibility::Hidden;
 
     let output = f.niri_output(1);
     let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
@@ -557,6 +670,53 @@ fn draw_cursor_always_hidden_stays_hidden_on_window_captures_after_workspace_swi
         render_window_screen_capture_pixels(&mut f, &output, hidden, false);
     let capture_with_pointer = render_window_screen_capture_pixels(&mut f, &output, hidden, true);
     assert_eq!(capture_with_pointer, capture_without_pointer);
+}
+
+#[test]
+fn workspace_screencast_keeps_cursor_over_sticky_window_on_inactive_workspace() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+
+    let output = f.niri_output(1);
+    let workspace_id = f.niri().layout.active_workspace().unwrap().id();
+    f.niri().layout.toggle_window_sticky(Some(&window));
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .add_workspace_bottom();
+    f.niri().layout.switch_workspace_down();
+
+    let without_pointer = render_workspace_screencast_pixels(&mut f, &output, workspace_id, false);
+    let with_pointer = render_workspace_screencast_pixels(&mut f, &output, workspace_id, true);
+
+    assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn workspace_screencast_keeps_cursor_over_layer_surface_on_inactive_workspace() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    create_top_layer(&mut f, (100, 20));
+
+    let output = f.niri_output(1);
+    let workspace_id = f.niri().layout.active_workspace().unwrap().id();
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .add_workspace_bottom();
+    f.niri().layout.switch_workspace_down();
+    move_cursor_to_point(&mut f, Point::from((10.0, 10.0)));
+
+    let without_pointer = render_workspace_screencast_pixels(&mut f, &output, workspace_id, false);
+    let with_pointer = render_workspace_screencast_pixels(&mut f, &output, workspace_id, true);
+
+    assert_ne!(with_pointer, without_pointer);
 }
 
 #[test]

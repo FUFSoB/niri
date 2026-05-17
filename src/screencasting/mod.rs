@@ -234,7 +234,10 @@ impl State {
                 let mut elements = Vec::new();
                 let mut pointer_location = Point::default();
 
-                if self.niri.pointer_visibility.is_visible() {
+                if self
+                    .niri
+                    .should_render_pointer_for_target(RenderTarget::Screencast, Some(mapped.id()))
+                {
                     if let Some((pointer_pos, win_pos)) =
                         self.niri.pointer_pos_for_window_cast(mapped)
                     {
@@ -753,21 +756,9 @@ impl Niri {
 
                 let mut elements = Vec::new();
                 let mut pointer_pos = Point::default();
-                if self.pointer_visibility.is_visible() {
-                    let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
-                    let pointer_loc = self
-                        .tablet_cursor_location
-                        .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
-                    let pointer_workspace_matches = self
-                        .output_under(pointer_loc)
-                        .and_then(|(pointer_output, pos_within_output)| {
-                            self.layout
-                                .workspace_under(false, pointer_output, pos_within_output)
-                        })
-                        .is_some_and(|pointer_workspace| pointer_workspace.id() == workspace.id());
-
-                    if pointer_workspace_matches && output_geo.contains(pointer_loc) {
-                        pointer_pos = pointer_loc - output_geo.loc;
+                if self.should_render_pointer_for_target(RenderTarget::Screencast, None) {
+                    if let Some(pos) = self.workspace_cast_pointer_pos(output, workspace.id()) {
+                        pointer_pos = pos;
                         self.render_pointer(
                             renderer,
                             output,
@@ -818,7 +809,7 @@ impl Niri {
 
             if cursor_data.is_none() {
                 let mut pointer_pos = Point::default();
-                if self.pointer_visibility.is_visible() {
+                if self.should_render_pointer_for_target(RenderTarget::Screencast, None) {
                     let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
                     let pointer_loc = self
                         .tablet_cursor_location
@@ -917,7 +908,7 @@ impl Niri {
             let mut elements = Vec::new();
             let mut pointer_location = Point::default();
 
-            if self.pointer_visibility.is_visible() {
+            if self.should_render_pointer_for_target(RenderTarget::Screencast, Some(mapped.id())) {
                 if let Some((pointer_pos, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
                     // Pointer location must be relative to the screencast buffer.
                     // - win_pos is the position of the main window surface in output-local

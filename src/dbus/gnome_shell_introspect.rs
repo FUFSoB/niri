@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-
+use serde::ser::{SerializeMap, Serializer};
+use serde::Serialize;
 use zbus::fdo::{self, RequestNameFlags};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -17,7 +17,7 @@ pub enum IntrospectToNiri {
 }
 
 pub enum NiriToIntrospect {
-    Windows(HashMap<u64, WindowProperties>),
+    Windows(OrderedWindowProperties),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,16 +41,59 @@ pub struct WindowProperties {
     pub app_id: String,
 }
 
+#[derive(Debug, Default, Type)]
+#[zvariant(signature = "a{ta{sv}}")]
+pub struct OrderedWindowProperties(pub Vec<(u64, WindowProperties)>);
+
+impl OrderedWindowProperties {
+    pub fn insert(&mut self, id: u64, props: WindowProperties) {
+        if let Some((_, existing)) = self
+            .0
+            .iter_mut()
+            .find(|(existing_id, _)| *existing_id == id)
+        {
+            *existing = props;
+        } else {
+            self.0.push((id, props));
+        }
+    }
+
+    pub fn get(&self, id: u64) -> Option<&WindowProperties> {
+        self.0
+            .iter()
+            .find(|(existing_id, _)| *existing_id == id)
+            .map(|(_, props)| props)
+    }
+}
+
+impl Serialize for OrderedWindowProperties {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (id, props) in &self.0 {
+            map.serialize_entry(id, props)?;
+        }
+        map.end()
+    }
+}
+
 pub fn workspace_cast_title(
     idx: u8,
     name: Option<&str>,
+    output_name: Option<&str>,
     active_window_id: Option<u64>,
     windows: &[WorkspaceWindow],
 ) -> String {
-    let base = match name.filter(|name| !name.is_empty()) {
+    let mut base = match name.filter(|name| !name.is_empty()) {
         Some(name) => format!("Workspace {idx} ({name})"),
         None => format!("Workspace {idx}"),
     };
+    if let Some(output_name) = output_name.filter(|name| !name.is_empty()) {
+        base.push_str(" on ");
+        base.push_str(output_name);
+    }
 
     let mut windows = windows.iter().collect::<Vec<_>>();
     if let Some(active_window_id) = active_window_id {
@@ -112,7 +155,7 @@ fn workspace_window_app_id_stem(app_id: &str) -> &str {
 
 #[interface(name = "org.gnome.Shell.Introspect")]
 impl Introspect {
-    async fn get_windows(&self) -> fdo::Result<HashMap<u64, WindowProperties>> {
+    async fn get_windows(&self) -> fdo::Result<OrderedWindowProperties> {
         if let Err(err) = self.to_niri.send(IntrospectToNiri::GetWindows) {
             warn!("error sending message to niri: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
@@ -166,6 +209,7 @@ mod tests {
         let title = workspace_cast_title(
             2,
             Some("web"),
+            Some("DP-1"),
             Some(9),
             &[
                 WorkspaceWindow {
@@ -186,19 +230,23 @@ mod tests {
             ],
         );
 
-        assert_eq!(title, "Workspace 2 (web) - Firefox, Terminal, Slack");
+        assert_eq!(
+            title,
+            "Workspace 2 (web) on DP-1 - Firefox, Terminal, Slack"
+        );
     }
 
     #[test]
     fn workspace_cast_title_handles_empty_workspaces() {
-        let title = workspace_cast_title(3, None, None, &[]);
-        assert_eq!(title, "Workspace 3 - empty");
+        let title = workspace_cast_title(3, None, Some("DP-2"), None, &[]);
+        assert_eq!(title, "Workspace 3 on DP-2 - empty");
     }
 
     #[test]
     fn workspace_cast_title_limits_the_summary() {
         let title = workspace_cast_title(
             5,
+            None,
             None,
             None,
             &[
@@ -234,6 +282,7 @@ mod tests {
             1,
             None,
             None,
+            None,
             &[WorkspaceWindow {
                 id: 7,
                 title: Some(String::from("  ")),
@@ -242,5 +291,11 @@ mod tests {
         );
 
         assert_eq!(title, "Workspace 1 - KeePassXC");
+    }
+
+    #[test]
+    fn workspace_cast_title_can_disambiguate_outputs_without_names() {
+        let title = workspace_cast_title(1, None, Some("HDMI-A-1"), None, &[]);
+        assert_eq!(title, "Workspace 1 on HDMI-A-1 - empty");
     }
 }

@@ -2407,9 +2407,11 @@ impl State {
         let IntrospectToNiri::GetWindows = msg;
         let _span = tracy_client::span!("GetWindows");
 
-        let mut windows = HashMap::new();
+        let mut windows = gnome_shell_introspect::OrderedWindowProperties::default();
         #[cfg(feature = "xdp-gnome-screencast")]
         let mut workspace_windows = HashMap::new();
+        #[cfg(feature = "xdp-gnome-screencast")]
+        let mut sticky_windows = HashMap::new();
 
         #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_portal_cast_sources();
@@ -2423,47 +2425,57 @@ impl State {
             },
         );
 
-        self.niri.layout.with_windows(|mapped, _, _, _| {
-            let id = mapped.id().get();
-            let props = with_toplevel_role(mapped.toplevel(), |role| {
-                gnome_shell_introspect::WindowProperties {
-                    title: role.title.clone().unwrap_or_default(),
-                    app_id: role
-                        .app_id
-                        .as_ref()
-                        // We don't do proper .desktop file tracking (it's quite involved), and
-                        // Wayland windows can set any app id they want. However, this seems to
-                        // work well enough in practice.
-                        .map(|app_id| format!("{app_id}.desktop"))
-                        .unwrap_or_default(),
+        self.niri
+            .layout
+            .with_windows(|mapped, output, workspace_id, _| {
+                let id = mapped.id().get();
+                let props = with_toplevel_role(mapped.toplevel(), |role| {
+                    gnome_shell_introspect::WindowProperties {
+                        title: role.title.clone().unwrap_or_default(),
+                        app_id: role
+                            .app_id
+                            .as_ref()
+                            // We don't do proper .desktop file tracking (it's quite involved), and
+                            // Wayland windows can set any app id they want. However, this seems to
+                            // work well enough in practice.
+                            .map(|app_id| format!("{app_id}.desktop"))
+                            .unwrap_or_default(),
+                    }
+                });
+
+                windows.insert(id, props);
+
+                #[cfg(feature = "xdp-gnome-screencast")]
+                {
+                    let summary = with_toplevel_role(mapped.toplevel(), |role| {
+                        gnome_shell_introspect::WorkspaceWindow {
+                            id,
+                            title: role.title.clone(),
+                            app_id: role.app_id.clone(),
+                        }
+                    });
+
+                    match workspace_id {
+                        Some(workspace_id) => workspace_windows
+                            .entry(workspace_id)
+                            .or_insert_with(Vec::new)
+                            .push(summary),
+                        None if mapped.is_sticky() => {
+                            let Some(output) = output else {
+                                return;
+                            };
+                            sticky_windows
+                                .entry(output.name())
+                                .or_insert_with(Vec::new)
+                                .push(summary);
+                        }
+                        None => (),
+                    }
                 }
             });
 
-            windows.insert(id, props);
-        });
-
         #[cfg(feature = "xdp-gnome-screencast")]
-        self.niri.layout.with_windows(|mapped, _, workspace_id, _| {
-            let Some(workspace_id) = workspace_id else {
-                return;
-            };
-
-            let id = mapped.id().get();
-            let summary = with_toplevel_role(mapped.toplevel(), |role| {
-                gnome_shell_introspect::WorkspaceWindow {
-                    id,
-                    title: role.title.clone(),
-                    app_id: role.app_id.clone(),
-                }
-            });
-            workspace_windows
-                .entry(workspace_id)
-                .or_insert_with(Vec::new)
-                .push(summary);
-        });
-
-        #[cfg(feature = "xdp-gnome-screencast")]
-        for (_, workspace_idx, workspace) in self.niri.layout.workspaces() {
+        for (monitor, workspace_idx, workspace) in self.niri.layout.workspaces() {
             if workspace.current_output().is_none() {
                 continue;
             }
@@ -2472,14 +2484,30 @@ impl State {
                 continue;
             };
 
+            let Some(monitor) = monitor else {
+                continue;
+            };
+
+            let mut summary_windows = sticky_windows
+                .get(monitor.output_name())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(workspace_entries) = workspace_windows.get(&workspace.id()) {
+                summary_windows.extend_from_slice(workspace_entries);
+            }
+
+            let active_window_id = if monitor.active_workspace_idx() == workspace_idx {
+                monitor.active_window().map(|window| window.id().get())
+            } else {
+                workspace.active_window().map(|window| window.id().get())
+            };
+
             let title = gnome_shell_introspect::workspace_cast_title(
                 u8::try_from(workspace_idx + 1).unwrap_or(u8::MAX),
                 workspace.name().map(String::as_str),
-                workspace.active_window().map(|window| window.id().get()),
-                workspace_windows
-                    .get(&workspace.id())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+                Some(monitor.output_name().as_str()),
+                active_window_id,
+                &summary_windows,
             );
 
             windows.insert(
@@ -3983,6 +4011,17 @@ impl Niri {
             .and_then(|(_, mapped)| mapped.rules().draw_cursor)
     }
 
+    fn draw_cursor_rule_for_target(&self, cursor_owner: Option<MappedId>) -> Option<DrawCursor> {
+        cursor_owner
+            .and_then(|window_id| self.draw_cursor_rule_for_window(window_id))
+            .or_else(|| {
+                cursor_owner
+                    .is_none()
+                    .then(|| self.draw_cursor_rule_under_pointer())
+                    .flatten()
+            })
+    }
+
     fn draw_cursor_transition_active(&self, contents: &PointContents) -> bool {
         if self.tablet_cursor_location.is_some() {
             return false;
@@ -4044,14 +4083,7 @@ impl Niri {
         cursor_owner: Option<MappedId>,
     ) -> CursorImageStatus {
         let cursor_image = self.cursor_manager.cursor_image().clone();
-        let draw_cursor_rule = cursor_owner
-            .and_then(|window_id| self.draw_cursor_rule_for_window(window_id))
-            .or_else(|| {
-                cursor_owner
-                    .is_none()
-                    .then(|| self.draw_cursor_rule_under_pointer())
-                    .flatten()
-            });
+        let draw_cursor_rule = self.draw_cursor_rule_for_target(cursor_owner);
 
         match draw_cursor_rule {
             Some(DrawCursor::AlwaysHidden) => CursorImageStatus::Hidden,
@@ -4064,6 +4096,70 @@ impl Niri {
             }
             Some(DrawCursor::Default) | Some(DrawCursor::HiddenOnCapture) | None => cursor_image,
         }
+    }
+
+    pub(crate) fn should_render_pointer_for_target(
+        &self,
+        _target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+    ) -> bool {
+        match self.pointer_visibility {
+            PointerVisibility::Visible => true,
+            PointerVisibility::Hidden => {
+                self.draw_cursor_rule_for_target(cursor_owner) == Some(DrawCursor::AlwaysShown)
+            }
+            PointerVisibility::Disabled => false,
+        }
+    }
+
+    pub(crate) fn workspace_cast_pointer_pos(
+        &self,
+        output: &Output,
+        workspace_id: WorkspaceId,
+    ) -> Option<Point<f64, Logical>> {
+        let output_geo = self.global_space.output_geometry(output)?.to_f64();
+        let pointer_loc = self
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        if !output_geo.contains(pointer_loc) {
+            return None;
+        }
+
+        let (pointer_output, pos_within_output) = self.output_under(pointer_loc)?;
+        if pointer_output != output {
+            return None;
+        }
+
+        if self
+            .layout
+            .workspace_under(false, pointer_output, pos_within_output)
+            .is_some_and(|workspace| workspace.id() == workspace_id)
+        {
+            return Some(pointer_loc - output_geo.loc);
+        }
+
+        let contents = self.contents_under(pointer_loc);
+        if contents.output.as_ref() != Some(output) {
+            return None;
+        }
+
+        if contents.layer.is_some() {
+            return Some(pointer_loc - output_geo.loc);
+        }
+
+        let window_id = contents.window.map(|(window_id, _)| window_id)?;
+        if self.layout.is_sticky_window(&window_id) {
+            return Some(pointer_loc - output_geo.loc);
+        }
+
+        self.layout
+            .workspaces()
+            .find(|(monitor, _, workspace)| {
+                workspace.id() == workspace_id
+                    && monitor.is_some_and(|monitor| monitor.output() == output)
+                    && workspace.has_window(&window_id)
+            })
+            .map(|_| pointer_loc - output_geo.loc)
     }
 
     fn render_cursor_for_target(
@@ -5092,7 +5188,7 @@ impl Niri {
         };
 
         // The pointer goes on the top.
-        if include_pointer && self.pointer_visibility.is_visible() {
+        if include_pointer && self.should_render_pointer_for_target(ctx.target, None) {
             self.render_pointer(ctx.renderer, output, ctx.target, None, &mut |elem| {
                 push(elem.into())
             });

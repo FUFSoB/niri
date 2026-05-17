@@ -1811,6 +1811,15 @@ fn focused_window_is_block_out(f: &mut Fixture) -> bool {
         .is_block_out
 }
 
+fn window_is_block_out(f: &mut Fixture, id: MappedId) -> bool {
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == id)
+        .map(|(_, mapped)| mapped.effective_block_out_from().is_some())
+        .unwrap()
+}
+
 fn block_out_state(f: &mut Fixture) -> niri_ipc::BlockOutState {
     f.niri().block_out_state()
 }
@@ -1995,6 +2004,33 @@ fn toggle_block_out_window_enables_and_disables_ruleless_window() {
         sample_pixel(size, &pixels, size.w / 2, size.h / 2),
         [0, 255, 0, 255]
     );
+}
+
+#[test]
+fn toggle_block_out_window_targets_focused_sticky_window() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "sticky", (40, 30), GREEN);
+    let sticky = f.niri().layout.focus().unwrap().id();
+
+    create_window(&mut f, id, "tiling", (40, 30), RED);
+    let tiling = f.niri().layout.focus().unwrap().id();
+
+    f.niri().layout.toggle_window_sticky(Some(&sticky));
+    f.niri().layout.focus_floating();
+
+    assert_eq!(f.niri().layout.focus().unwrap().id(), sticky);
+    assert!(!window_is_block_out(&mut f, sticky));
+    assert!(!window_is_block_out(&mut f, tiling));
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+
+    assert!(window_is_block_out(&mut f, sticky));
+    assert!(!window_is_block_out(&mut f, tiling));
 }
 
 #[test]

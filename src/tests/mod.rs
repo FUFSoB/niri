@@ -13,6 +13,7 @@ mod fullscreen;
 mod keyboard_focus;
 mod layer_shell;
 mod remove_output;
+mod screencast_portal;
 mod transactions;
 mod virtual_output;
 mod window_opening;

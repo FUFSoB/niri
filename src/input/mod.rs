@@ -2943,13 +2943,13 @@ impl State {
                 }
             }
             Action::ToggleBlockOutWindow => {
-                let active_window = self
-                    .niri
-                    .layout
-                    .active_workspace_mut()
-                    .and_then(|ws| ws.active_window_mut());
-                if let Some(window) = active_window {
-                    window.toggle_block_out_window_rule();
+                let focus = self.niri.layout.focus().map(|window| window.id());
+                if let Some(window) = focus {
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.toggle_block_out_window_rule();
+                        }
+                    });
                     self.niri.queue_redraw_all();
                 }
             }
@@ -2957,10 +2957,15 @@ impl State {
                 let window = self
                     .niri
                     .layout
-                    .workspaces_mut()
-                    .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
+                    .windows()
+                    .find(|(_, mapped)| mapped.id().get() == id)
+                    .map(|(_, mapped)| mapped.id());
                 if let Some(window) = window {
-                    window.toggle_block_out_window_rule();
+                    self.niri.layout.with_windows_mut(|mapped, _| {
+                        if mapped.id() == window {
+                            mapped.toggle_block_out_window_rule();
+                        }
+                    });
                     self.niri.queue_redraw_all();
                 }
             }
