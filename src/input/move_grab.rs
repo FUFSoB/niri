@@ -45,6 +45,13 @@ enum GestureState {
 }
 
 impl MoveGrab {
+    fn snap_enabled(data: &State) -> bool {
+        data.niri
+            .seat
+            .get_keyboard()
+            .is_some_and(|keyboard| keyboard.modifier_state().ctrl)
+    }
+
     pub fn new(
         state: &mut State,
         start_data: PointerOrTouchStartData<State>,
@@ -252,6 +259,7 @@ impl MoveGrab {
                     return true;
                 };
                 let output = output.clone();
+                let snap_enabled = Self::snap_enabled(data);
 
                 // Interactive move always uses absolute delta since the window must remain pinned
                 // to the cursor even when it's clamped to monitor bounds.
@@ -260,6 +268,7 @@ impl MoveGrab {
                     delta,
                     output,
                     pos_within_output,
+                    snap_enabled,
                 );
                 if ongoing {
                     // FIXME: only redraw the previous and the new output.
@@ -302,11 +311,13 @@ impl MoveGrab {
             }
 
             // Apply the delta accumulated during recognizing.
+            let snap_enabled = Self::snap_enabled(data);
             let ongoing = data.niri.layout.interactive_move_update(
                 &self.window,
                 self.last_location - self.start_data.location(),
                 output,
                 pos_within_output,
+                snap_enabled,
             );
             if !ongoing {
                 return false;

@@ -46,8 +46,9 @@ use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
-use smithay::backend::renderer::element::NamespacedElement;
+use smithay::backend::renderer::element::{Kind, NamespacedElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::Color32F;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -107,6 +108,16 @@ const INTERACTIVE_MOVE_START_THRESHOLD: f64 = 256. * 256.;
 /// Opacity of interactively moved tiles targeting the scrolling layout.
 const INTERACTIVE_MOVE_ALPHA: f64 = 0.75;
 
+/// Distance from the hinted position on each axis at which Ctrl enables snapping.
+const FLOATING_MOVE_SNAP_THRESHOLD: f64 = 32.;
+
+const FLOATING_MOVE_HINT_OUTLINE_WIDTH: f64 = 2.;
+const FLOATING_MOVE_HINT_CENTER_MARKER_LENGTH: f64 = 16.;
+const FLOATING_MOVE_HINT_CENTER_MARKER_WIDTH: f64 = 2.;
+
+const FLOATING_MOVE_HINT_OUTLINE_COLOR: Color32F = Color32F::new(0.72, 0.72, 0.72, 0.65);
+const FLOATING_MOVE_HINT_CENTER_COLOR: Color32F = Color32F::new(0.86, 0.86, 0.86, 0.75);
+
 /// Amount of touchpad movement to toggle the overview.
 const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
 
@@ -136,6 +147,13 @@ niri_render_elements! {
 
 pub type LayoutElementRenderSnapshot =
     RenderSnapshot<BakedBuffer<TextureBuffer<GlesTexture>>, BakedBuffer<SolidColorBuffer>>;
+
+niri_render_elements! {
+    InteractiveMoveRenderElement<R> => {
+        Tile = RescaleRenderElement<TileRenderElement<R>>,
+        SolidColor = SolidColorRenderElement,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizingMode {
@@ -488,6 +506,24 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    /// Whether Ctrl is currently held to enable snapping.
+    pub(self) snap_enabled: bool,
+    /// Optional floating and sticky hint state.
+    pub(self) floating_hint: Option<FloatingMoveHint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatingMoveHintGeometry {
+    target_rect: Rectangle<f64, Logical>,
+    center: Point<f64, Logical>,
+    snapped_tile_render_loc: Point<f64, Logical>,
+}
+
+#[derive(Debug)]
+struct FloatingMoveHint {
+    buffers: [SolidColorBuffer; 6],
+    rects: [Rectangle<f64, Logical>; 6],
+    snapped_tile_render_loc: Point<f64, Logical>,
 }
 
 #[derive(Debug)]
@@ -650,7 +686,7 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 }
 
 impl<W: LayoutElement> InteractiveMoveData<W> {
-    fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
+    fn raw_tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         let window_size = self.tile.window_size();
         let pointer_offset_within_window = Point::from((
@@ -658,10 +694,84 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
             window_size.h * self.pointer_ratio_within_window.1,
         ));
         let pos = self.pointer_pos_within_output
-            - (pointer_offset_within_window + self.tile.window_loc() - self.tile.render_offset())
-                .upscale(zoom);
+            - (pointer_offset_within_window + self.tile.window_loc()).upscale(zoom);
         // Round to physical pixels.
         pos.to_physical_precise_round(scale).to_logical(scale)
+    }
+
+    fn visual_tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
+        let raw = self.raw_tile_render_location(zoom);
+        if self.is_floating {
+            return raw;
+        }
+
+        let scale = Scale::from(self.output.current_scale().fractional_scale());
+        (raw + self.tile.render_offset().upscale(zoom))
+            .to_physical_precise_round(scale)
+            .to_logical(scale)
+    }
+
+    fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
+        self.floating_hint.as_ref().map_or_else(
+            || self.visual_tile_render_location(zoom),
+            |hint| hint.snapped_tile_render_loc,
+        )
+    }
+}
+
+impl Default for FloatingMoveHint {
+    fn default() -> Self {
+        Self {
+            buffers: Default::default(),
+            rects: [Rectangle::default(); 6],
+            snapped_tile_render_loc: Point::default(),
+        }
+    }
+}
+
+impl FloatingMoveHint {
+    fn update(&mut self, geometry: FloatingMoveHintGeometry) {
+        let outline_width = FLOATING_MOVE_HINT_OUTLINE_WIDTH;
+        let rect = geometry.target_rect;
+
+        self.rects[0] = Rectangle::new(rect.loc, Size::from((rect.size.w, outline_width)));
+        self.rects[1] = Rectangle::new(
+            Point::from((rect.loc.x, rect.loc.y + rect.size.h - outline_width)),
+            Size::from((rect.size.w, outline_width)),
+        );
+        self.rects[2] = Rectangle::new(rect.loc, Size::from((outline_width, rect.size.h)));
+        self.rects[3] = Rectangle::new(
+            Point::from((rect.loc.x + rect.size.w - outline_width, rect.loc.y)),
+            Size::from((outline_width, rect.size.h)),
+        );
+
+        let marker_half = FLOATING_MOVE_HINT_CENTER_MARKER_LENGTH / 2.;
+        let marker_width = FLOATING_MOVE_HINT_CENTER_MARKER_WIDTH;
+        let marker_origin = geometry.center - Point::from((marker_half, marker_width / 2.));
+        self.rects[4] = Rectangle::new(marker_origin, Size::from((marker_half * 2., marker_width)));
+        self.rects[5] = Rectangle::new(
+            geometry.center - Point::from((marker_width / 2., marker_half)),
+            Size::from((marker_width, marker_half * 2.)),
+        );
+
+        for (idx, (buffer, rect)) in self.buffers.iter_mut().zip(self.rects).enumerate() {
+            let color = if idx < 4 {
+                FLOATING_MOVE_HINT_OUTLINE_COLOR
+            } else {
+                FLOATING_MOVE_HINT_CENTER_COLOR
+            };
+            buffer.update(rect.size, color);
+        }
+
+        self.snapped_tile_render_loc = geometry.snapped_tile_render_loc;
+    }
+
+    fn render<R: NiriRenderer>(&self, push: &mut dyn FnMut(InteractiveMoveRenderElement<R>)) {
+        for (buffer, rect) in self.buffers.iter().zip(self.rects) {
+            let elem =
+                SolidColorRenderElement::from_buffer(buffer, rect.loc, 1., Kind::Unspecified);
+            push(elem.into());
+        }
     }
 }
 
@@ -1734,6 +1844,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
+        let mut refresh_hint = None;
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
                 // Do this before calling update_window() so it can get up-to-date info.
@@ -1742,8 +1853,12 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 move_.tile.update_window();
-                return;
+                refresh_hint = Some(move_.output.clone());
             }
+        }
+        if let Some(output) = refresh_hint.as_ref() {
+            self.refresh_interactive_move_hint(Some(output));
+            return;
         }
 
         match &mut self.monitor_set {
@@ -3530,10 +3645,97 @@ impl<W: LayoutElement> Layout<W> {
         );
     }
 
+    fn project_insert_workspace_render_geo(
+        mon: &Monitor<W>,
+        insert_ws: InsertWorkspace,
+        geo: Rectangle<f64, Logical>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        match insert_ws {
+            InsertWorkspace::Existing(_) => Some(geo),
+            InsertWorkspace::NewAt(ws_idx) => mon.workspaces_render_geo().nth(ws_idx),
+        }
+    }
+
+    fn compute_floating_move_hint_geometry(
+        &self,
+        move_: &InteractiveMoveData<W>,
+    ) -> Option<FloatingMoveHintGeometry> {
+        if !move_.is_floating {
+            return None;
+        }
+
+        let mon = self.monitor_for_output(&move_.output)?;
+        let zoom = mon.overview_zoom();
+        let raw_tile_render_loc = move_.raw_tile_render_location(zoom);
+        let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+        let ws_geo = Self::project_insert_workspace_render_geo(mon, insert_ws, geo)?;
+
+        let working_area = mon.working_area();
+        let scale = move_.output.current_scale().fractional_scale();
+        let hinted_pos = floating::default_tile_pos_in_area(
+            working_area,
+            move_.tile.tile_size(),
+            move_.tile.window().rules(),
+        );
+        let target_rect = Rectangle::new(
+            ws_geo.loc + hinted_pos.upscale(zoom),
+            move_.tile.tile_size().upscale(zoom),
+        )
+        .to_physical_precise_round(scale)
+        .to_logical(scale);
+
+        let center = working_area.loc + working_area.size.to_point().downscale(2.);
+        let center = (ws_geo.loc + center.upscale(zoom))
+            .to_physical_precise_round(scale)
+            .to_logical(scale);
+
+        let mut snapped_tile_render_loc = raw_tile_render_loc;
+        if move_.snap_enabled {
+            if (raw_tile_render_loc.x - target_rect.loc.x).abs() <= FLOATING_MOVE_SNAP_THRESHOLD {
+                snapped_tile_render_loc.x = target_rect.loc.x;
+            }
+            if (raw_tile_render_loc.y - target_rect.loc.y).abs() <= FLOATING_MOVE_SNAP_THRESHOLD {
+                snapped_tile_render_loc.y = target_rect.loc.y;
+            }
+        }
+
+        Some(FloatingMoveHintGeometry {
+            target_rect,
+            center,
+            snapped_tile_render_loc,
+        })
+    }
+
+    fn refresh_interactive_move_hint(&mut self, output: Option<&Output>) {
+        if !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
+            return;
+        }
+
+        let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
+            unreachable!()
+        };
+        if output.is_some_and(|out| &move_.output != out) {
+            self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+            return;
+        }
+
+        if let Some(geometry) = self.compute_floating_move_hint_geometry(&move_) {
+            move_
+                .floating_hint
+                .get_or_insert_with(FloatingMoveHint::default)
+                .update(geometry);
+        } else {
+            move_.floating_hint = None;
+        }
+
+        self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+    }
+
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
         let _span = tracy_client::span!("Layout::update_render_elements");
 
         self.update_render_elements_time = self.clock.now();
+        self.refresh_interactive_move_hint(output);
 
         let zoom = match &self.interactive_move {
             Some(InteractiveMoveState::Moving(move_)) => self
@@ -3624,6 +3826,11 @@ impl<W: LayoutElement> Layout<W> {
 
         let _span = tracy_client::span!("Layout::update_insert_hint::update");
 
+        if move_.is_floating {
+            self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+            return;
+        }
+
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
@@ -3636,11 +3843,7 @@ impl<W: LayoutElement> Layout<W> {
                         .unwrap();
                     let pos_within_workspace =
                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                    let position = if move_.is_floating {
-                        InsertPosition::Floating
-                    } else {
-                        ws.scrolling_insert_position(pos_within_workspace)
-                    };
+                    let position = ws.scrolling_insert_position(pos_within_workspace);
 
                     let border_width = move_.tile.effective_border_width().unwrap_or(0.);
                     let corner_radius = move_
@@ -3655,14 +3858,9 @@ impl<W: LayoutElement> Layout<W> {
                     });
                 }
                 InsertWorkspace::NewAt(_) => {
-                    let position = if move_.is_floating {
-                        InsertPosition::Floating
-                    } else {
-                        InsertPosition::NewColumn(0)
-                    };
                     mon.insert_hint = Some(InsertHint {
                         workspace: insert_ws,
-                        position,
+                        position: InsertPosition::NewColumn(0),
                         corner_radius: CornerRadius::default(),
                     });
                 }
@@ -3753,6 +3951,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.options = options;
+        self.refresh_interactive_move_hint(None);
     }
 
     pub fn toggle_width(&mut self, forwards: bool) {
@@ -3934,57 +4133,71 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_window_floating(&mut self, window: Option<&W::Id>) {
-        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-            if window.is_none() || window == Some(move_.tile.window().id()) {
-                if move_.is_sticky {
-                    return;
-                }
-
-                move_.is_floating = !move_.is_floating;
-
-                // When going to floating, restore the floating window size.
-                if move_.is_floating {
-                    let floating_size = move_.tile.floating_window_size;
-                    let size = {
-                        let win = move_.tile.window();
-                        let mut size = floating_size
-                            .unwrap_or_else(|| win.expected_size().unwrap_or_default());
-
-                        // Apply min/max size window rules. If requesting a concrete size, apply
-                        // completely; if requesting (0, 0), apply only when min/max results in a
-                        // fixed size.
-                        let min_size = win.min_size();
-                        let max_size = win.max_size();
-                        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-                        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
-                        size
-                    };
-
-                    move_.tile.request_window_size_once(size, true);
-
-                    // Animate the tile back to opaque.
-                    move_.tile.animate_alpha(
-                        INTERACTIVE_MOVE_ALPHA,
-                        1.,
-                        self.options.animations.window_movement.0,
-                    );
-
-                    // Unlock the view on the workspaces.
-                    for ws in self.workspaces_mut() {
-                        ws.dnd_scroll_gesture_end();
+        let mut refresh_hint = None;
+        if let Some(state) = self.interactive_move.take() {
+            match state {
+                InteractiveMoveState::Moving(mut move_)
+                    if window.is_none() || window == Some(move_.tile.window().id()) =>
+                {
+                    if move_.is_sticky {
+                        self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+                        return;
                     }
-                } else {
-                    // Animate the tile back to semitransparent.
-                    move_.tile.animate_alpha(
-                        1.,
-                        INTERACTIVE_MOVE_ALPHA,
-                        self.options.animations.window_movement.0,
-                    );
-                    move_.tile.hold_alpha_animation_after_done();
-                }
 
-                return;
+                    move_.is_floating = !move_.is_floating;
+
+                    // When going to floating, restore the floating window size.
+                    if move_.is_floating {
+                        let floating_size = move_.tile.floating_window_size;
+                        let size = {
+                            let win = move_.tile.window();
+                            let mut size = floating_size
+                                .unwrap_or_else(|| win.expected_size().unwrap_or_default());
+
+                            // Apply min/max size window rules. If requesting a concrete size,
+                            // apply completely; if requesting (0, 0), apply only when min/max
+                            // results in a fixed size.
+                            let min_size = win.min_size();
+                            let max_size = win.max_size();
+                            size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+                            size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+                            size
+                        };
+
+                        move_.tile.request_window_size_once(size, true);
+
+                        // Animate the tile back to opaque.
+                        move_.tile.animate_alpha(
+                            INTERACTIVE_MOVE_ALPHA,
+                            1.,
+                            self.options.animations.window_movement.0,
+                        );
+
+                        // Unlock the view on the workspaces.
+                        for ws in self.workspaces_mut() {
+                            ws.dnd_scroll_gesture_end();
+                        }
+                    } else {
+                        // Animate the tile back to semitransparent.
+                        move_.tile.animate_alpha(
+                            1.,
+                            INTERACTIVE_MOVE_ALPHA,
+                            self.options.animations.window_movement.0,
+                        );
+                        move_.tile.hold_alpha_animation_after_done();
+                    }
+
+                    refresh_hint = Some(move_.output.clone());
+                    self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+                }
+                state => {
+                    self.interactive_move = Some(state);
+                }
             }
+        }
+        if let Some(output) = refresh_hint.as_ref() {
+            self.refresh_interactive_move_hint(Some(output));
+            return;
         }
 
         if let Some(window) = window {
@@ -5418,7 +5631,9 @@ impl<W: LayoutElement> Layout<W> {
         delta: Point<f64, Logical>,
         output: Output,
         pointer_pos_within_output: Point<f64, Logical>,
+        snap_enabled: bool,
     ) -> bool {
+        let hint_output = output.clone();
         let Some(state) = self.interactive_move.take() else {
             return false;
         };
@@ -5604,6 +5819,8 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
+                    snap_enabled,
+                    floating_hint: None,
                 };
 
                 if let Some((tile_pos, overview_zoom)) = tile_pos {
@@ -5667,15 +5884,22 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 move_.pointer_pos_within_output = pointer_pos_within_output;
+                move_.snap_enabled = snap_enabled;
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(move_));
             }
         }
 
+        self.refresh_interactive_move_hint(Some(&hint_output));
+
         true
     }
 
     pub fn interactive_move_end(&mut self, window: &W::Id) {
+        if matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
+            self.refresh_interactive_move_hint(None);
+        }
+
         let Some(move_) = &self.interactive_move else {
             return;
         };
@@ -5788,9 +6012,8 @@ impl<W: LayoutElement> Layout<W> {
                         (mon, zoom)
                     };
 
-                    let ws_geo = mon
-                        .workspace_under(move_.pointer_pos_within_output)
-                        .map(|(_, geo)| geo)
+                    let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+                    let ws_geo = Self::project_insert_workspace_render_geo(mon, insert_ws, geo)
                         .unwrap_or_else(|| Rectangle::from_size(mon.view_size()));
 
                     let tile_render_loc = move_.tile_render_location(zoom);
@@ -5820,12 +6043,14 @@ impl<W: LayoutElement> Layout<W> {
                     return;
                 }
 
-                let (mon, insert_ws, position, offset, zoom) =
+                let (mon, insert_ws, position, workspace_geo, zoom) =
                     if let Some(mon) = monitors.iter_mut().find(|mon| mon.output == move_.output) {
                         let overview_zoom = mon.overview_zoom();
 
                         let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                        let (position, offset) = match insert_ws {
+                        let workspace_geo =
+                            Self::project_insert_workspace_render_geo(mon, insert_ws, geo);
+                        let position = match insert_ws {
                             InsertWorkspace::Existing(ws_id) => {
                                 let ws_idx = mon
                                     .workspaces
@@ -5842,21 +6067,18 @@ impl<W: LayoutElement> Layout<W> {
                                     let ws = &mut mon.workspaces[ws_idx];
                                     ws.scrolling_insert_position(pos_within_workspace)
                                 };
-
-                                (position, Some(geo.loc))
+                                position
                             }
                             InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
+                                if move_.is_floating {
                                     InsertPosition::Floating
                                 } else {
                                     InsertPosition::NewColumn(0)
-                                };
-
-                                (position, None)
+                                }
                             }
                         };
 
-                        (mon, insert_ws, position, offset, overview_zoom)
+                        (mon, insert_ws, position, workspace_geo, overview_zoom)
                     } else {
                         let mon = &mut monitors[*active_monitor_idx];
                         let overview_zoom = mon.overview_zoom();
@@ -5871,7 +6093,7 @@ impl<W: LayoutElement> Layout<W> {
                         };
 
                         let insert_ws = InsertWorkspace::Existing(ws.id());
-                        (mon, insert_ws, position, Some(ws_geo.loc), overview_zoom)
+                        (mon, insert_ws, position, Some(ws_geo), overview_zoom)
                     };
 
                 let win_id = move_.tile.window().id().clone();
@@ -5929,24 +6151,15 @@ impl<W: LayoutElement> Layout<W> {
                         let mut tile = move_.tile;
                         tile.floating_pos = None;
 
-                        match insert_ws {
-                            InsertWorkspace::Existing(_) => {
-                                if let Some(offset) = offset {
-                                    let pos = (tile_render_loc - offset).downscale(zoom);
-                                    let pos =
-                                        mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
-                                    tile.floating_pos = Some(pos);
-                                } else {
-                                    error!(
-                                        "offset unset for inserting a floating tile \
-                                         to existing workspace"
-                                    );
-                                }
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                // When putting a floating tile on a new workspace, we don't really
-                                // have a good pre-existing position.
-                            }
+                        if let Some(geo) = workspace_geo {
+                            let pos = (tile_render_loc - geo.loc).downscale(zoom);
+                            let pos = mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
+                            tile.floating_pos = Some(pos);
+                        } else {
+                            error!(
+                                "workspace geo unset for inserting a floating tile \
+                                 during interactive move"
+                            );
                         }
 
                         // Set the floating size so it takes into account any window resizing that
@@ -6531,7 +6744,7 @@ impl<W: LayoutElement> Layout<W> {
         &self,
         ctx: RenderCtx<R>,
         output: &Output,
-        push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement<R>>),
+        push: &mut dyn FnMut(InteractiveMoveRenderElement<R>),
     ) {
         if self.update_render_elements_time != self.clock.now() {
             error!("clock moved between updating render elements and rendering");
@@ -6552,14 +6765,21 @@ impl<W: LayoutElement> Layout<W> {
         let pos_in_backdrop = move_.tile_render_location(overview_zoom);
         let xray_pos = XrayPos::new(pos_in_backdrop, overview_zoom);
 
+        if let Some(hint) = &move_.floating_hint {
+            hint.render(push);
+        }
+
         move_
             .tile
             .render(ctx, pos_in_backdrop, xray_pos, true, &mut |elem| {
-                push(RescaleRenderElement::from_element(
-                    elem,
-                    pos_in_backdrop.to_physical_precise_round(scale),
-                    overview_zoom,
-                ));
+                push(
+                    RescaleRenderElement::from_element(
+                        elem,
+                        pos_in_backdrop.to_physical_precise_round(scale),
+                        overview_zoom,
+                    )
+                    .into(),
+                );
             });
     }
 

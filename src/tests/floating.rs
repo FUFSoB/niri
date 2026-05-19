@@ -448,6 +448,7 @@ fn interactive_move_unfullscreen_to_floating_restores_size() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        false,
     );
     f.double_roundtrip(id);
 
@@ -497,6 +498,7 @@ fn interactive_move_unmaximize_to_floating_restores_size() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        false,
     );
     f.double_roundtrip(id);
 
@@ -534,6 +536,7 @@ fn resize_during_interactive_move_propagates_to_floating() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        false,
     );
     f.double_roundtrip(id);
 
@@ -750,6 +753,7 @@ fn interactive_move_restores_floating_size_when_set_to_floating() {
         Point::from((1000., 0.)),
         output,
         Point::default(),
+        false,
     );
     f.double_roundtrip(id);
 

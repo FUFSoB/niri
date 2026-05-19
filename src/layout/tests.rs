@@ -1629,6 +1629,7 @@ impl Op {
                     Point::from((dx, dy)),
                     output,
                     Point::from((px, py)),
+                    false,
                 );
             }
             Op::InteractiveMoveEnd { window } => {
@@ -3312,6 +3313,134 @@ fn interactive_move_toggle_floating_ends_dnd_gesture() {
     ];
 
     check_ops(ops);
+}
+
+#[test]
+fn interactive_move_floating_snaps_per_axis_with_ctrl() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                is_floating: true,
+                ..TestWindowParams::new(1)
+            },
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    let output = layout.outputs().next().unwrap().clone();
+    let pointer = Point::from((612., 340.));
+
+    layout.interactive_move_begin(1, &output, Point::default());
+    layout.interactive_move_update(&1, Point::default(), output.clone(), pointer, false);
+
+    let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+        panic!("interactive move should be ongoing");
+    };
+    let hint = move_
+        .floating_hint
+        .as_ref()
+        .expect("floating hint should be active");
+    assert_eq!(hint.snapped_tile_render_loc, pointer);
+
+    layout.interactive_move_update(&1, Point::default(), output.clone(), pointer, true);
+
+    let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+        panic!("interactive move should still be ongoing");
+    };
+    let hint = move_
+        .floating_hint
+        .as_ref()
+        .expect("floating hint should still be active");
+    assert_eq!(hint.snapped_tile_render_loc, Point::from((590., 340.)));
+
+    layout.update_render_elements(Some(&output));
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert!(monitors[0].insert_hint.is_none());
+
+    layout.interactive_move_end(&1);
+
+    let ws = layout.active_workspace().unwrap();
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == &1)
+        .expect("window should remain on the active workspace");
+    assert_eq!(pos, Point::from((590., 340.)));
+}
+
+#[test]
+fn interactive_move_floating_to_new_workspace_preserves_position() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                is_floating: true,
+                ..TestWindowParams::new(1)
+            },
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    let output = layout.outputs().next().unwrap().clone();
+    let pointer = Point::from((300., 900.));
+
+    let projected_geo = layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspaces_render_geo()
+        .nth(1)
+        .expect("second workspace slot should be projectable");
+
+    layout.interactive_move_begin(1, &output, Point::default());
+    layout.interactive_move_update(&1, Point::default(), output, pointer, false);
+    layout.interactive_move_end(&1);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let ws = mon
+        .workspaces
+        .iter()
+        .find(|ws| ws.has_window(&1))
+        .expect("window should move to another workspace");
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == &1)
+        .expect("window should be present on the target workspace");
+    assert_eq!(pos, pointer - projected_geo.loc);
+}
+
+#[test]
+fn interactive_move_sticky_snaps_with_ctrl() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops(ops);
+    layout.toggle_window_sticky(Some(&1));
+
+    let output = layout.outputs().next().unwrap().clone();
+    let pointer = Point::from((612., 340.));
+
+    layout.interactive_move_begin(1, &output, Point::default());
+    layout.interactive_move_update(&1, Point::default(), output, pointer, true);
+
+    let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+        panic!("interactive move should be ongoing");
+    };
+    assert!(move_.is_sticky);
+    let hint = move_
+        .floating_hint
+        .as_ref()
+        .expect("sticky move should show a hint");
+    assert_eq!(hint.snapped_tile_render_loc, Point::from((590., 340.)));
 }
 
 #[test]

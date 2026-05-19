@@ -236,6 +236,7 @@ impl TouchGrab<State> for TouchOverviewGrab {
                         delta,
                         output,
                         pos_within_output,
+                        false,
                     )
                 } else {
                     false

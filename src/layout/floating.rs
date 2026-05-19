@@ -486,9 +486,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
         }
 
-        let pos = self.stored_or_default_tile_pos(&tile).unwrap_or_else(|| {
-            center_preferring_top_left_in_area(self.working_area, tile.tile_size())
-        });
+        let pos = self
+            .stored_or_default_tile_pos(&tile)
+            .unwrap_or_else(|| self.default_tile_pos(&tile));
 
         let data = Data::new(self.working_area, &tile, pos);
         self.data.insert(idx, data);
@@ -1361,36 +1361,17 @@ impl<W: LayoutElement> FloatingSpace<W> {
         Size::from((width, height))
     }
 
+    pub fn default_tile_pos(&self, tile: &Tile<W>) -> Point<f64, Logical> {
+        default_tile_pos_in_area(self.working_area, tile.tile_size(), tile.window().rules())
+    }
+
     pub fn stored_or_default_tile_pos(&self, tile: &Tile<W>) -> Option<Point<f64, Logical>> {
         let pos = tile.floating_pos.map(|pos| self.scale_by_working_area(pos));
         pos.or_else(|| {
-            tile.window().rules().default_floating_position.map(|pos| {
-                let relative_to = pos.relative_to;
-                let size = tile.tile_size();
-                let area = self.working_area;
-
-                let mut pos = Point::from((pos.x.0, pos.y.0));
-                if relative_to == RelativeTo::TopRight
-                    || relative_to == RelativeTo::BottomRight
-                    || relative_to == RelativeTo::Right
-                {
-                    pos.x = area.size.w - size.w - pos.x;
-                }
-                if relative_to == RelativeTo::BottomLeft
-                    || relative_to == RelativeTo::BottomRight
-                    || relative_to == RelativeTo::Bottom
-                {
-                    pos.y = area.size.h - size.h - pos.y;
-                }
-                if relative_to == RelativeTo::Top || relative_to == RelativeTo::Bottom {
-                    pos.x += area.size.w / 2.0 - size.w / 2.0
-                }
-                if relative_to == RelativeTo::Left || relative_to == RelativeTo::Right {
-                    pos.y += area.size.h / 2.0 - size.h / 2.0
-                }
-
-                pos + self.working_area.loc
-            })
+            tile.window()
+                .rules()
+                .default_floating_position
+                .map(|_| self.default_tile_pos(tile))
         })
     }
 
@@ -1475,6 +1456,41 @@ impl<W: LayoutElement> FloatingSpace<W> {
             );
         }
     }
+}
+
+pub fn default_tile_pos_in_area(
+    working_area: Rectangle<f64, Logical>,
+    tile_size: Size<f64, Logical>,
+    rules: &ResolvedWindowRules,
+) -> Point<f64, Logical> {
+    rules
+        .default_floating_position
+        .map(|pos| {
+            let relative_to = pos.relative_to;
+
+            let mut pos = Point::from((pos.x.0, pos.y.0));
+            if relative_to == RelativeTo::TopRight
+                || relative_to == RelativeTo::BottomRight
+                || relative_to == RelativeTo::Right
+            {
+                pos.x = working_area.size.w - tile_size.w - pos.x;
+            }
+            if relative_to == RelativeTo::BottomLeft
+                || relative_to == RelativeTo::BottomRight
+                || relative_to == RelativeTo::Bottom
+            {
+                pos.y = working_area.size.h - tile_size.h - pos.y;
+            }
+            if relative_to == RelativeTo::Top || relative_to == RelativeTo::Bottom {
+                pos.x += working_area.size.w / 2.0 - tile_size.w / 2.0
+            }
+            if relative_to == RelativeTo::Left || relative_to == RelativeTo::Right {
+                pos.y += working_area.size.h / 2.0 - tile_size.h / 2.0
+            }
+
+            pos + working_area.loc
+        })
+        .unwrap_or_else(|| center_preferring_top_left_in_area(working_area, tile_size))
 }
 
 fn compute_toplevel_bounds(

@@ -141,7 +141,8 @@ use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
-    HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
+    HitType, InteractiveMoveRenderElement, Layout, LayoutElement as _, LayoutElementRenderElement,
+    MonitorRenderElement,
 };
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
@@ -5340,8 +5341,14 @@ impl Niri {
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            self.layout.render_interactive_move_for_output(
+                ctx.r(),
+                output,
+                &mut |elem| match elem {
+                    InteractiveMoveRenderElement::Tile(elem) => push(elem.into()),
+                    InteractiveMoveRenderElement::SolidColor(elem) => push(elem.into()),
+                },
+            );
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
@@ -5363,8 +5370,14 @@ impl Niri {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            self.layout.render_interactive_move_for_output(
+                ctx.r(),
+                output,
+                &mut |elem| match elem {
+                    InteractiveMoveRenderElement::Tile(elem) => push(elem.into()),
+                    InteractiveMoveRenderElement::SolidColor(elem) => push(elem.into()),
+                },
+            );
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
