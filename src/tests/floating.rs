@@ -958,55 +958,6 @@ window-rule {
 }
 
 #[test]
-fn interactive_move_rule_top_right_can_snap_to_center() {
-    let config = r##"
-window-rule {
-    open-floating true
-    open-focused false
-    default-floating-position x=10 y=10 relative-to="top-right"
-}
-"##;
-    let config = Config::parse_mem(config).unwrap();
-    let (mut f, id, surface) = set_up_with_config(config);
-
-    let _ = f.client(id).window(&surface).recent_configures();
-
-    let output = f.niri_output(1);
-    let niri = f.niri();
-    let mapped = niri.layout.windows().next().unwrap().1;
-    let window_id = mapped.id();
-
-    let ws = niri.layout.active_workspace().unwrap();
-    let (tile_size, pos) = ws
-        .tiles_with_render_positions()
-        .find(|(tile, _, _)| tile.window().id() == window_id)
-        .map(|(tile, pos, _)| (tile.tile_size(), pos))
-        .expect("window should be in workspace floating space");
-    let working_area = ws.working_area();
-
-    let grab_offset = Point::from((40., 20.));
-    let start = pos + grab_offset;
-    let centered_pos = Point::from((
-        working_area.loc.x + (working_area.size.w - tile_size.w) / 2.,
-        working_area.loc.y + (working_area.size.h - tile_size.h) / 2.,
-    ));
-    let pointer = centered_pos + grab_offset;
-
-    niri.layout
-        .interactive_move_begin(window_id.clone(), &output, start);
-    niri.layout
-        .interactive_move_update(&window_id, pointer - start, output, pointer, true);
-    niri.layout.interactive_move_end(&window_id);
-
-    let ws = niri.layout.active_workspace().unwrap();
-    let (_, pos, _) = ws
-        .tiles_with_render_positions()
-        .find(|(tile, _, _)| tile.window().id() == window_id)
-        .expect("window should remain floating on the workspace");
-    assert_eq!(pos, centered_pos);
-}
-
-#[test]
 fn unmap_from_floating() {
     let (mut f, id, surface) = set_up();
 

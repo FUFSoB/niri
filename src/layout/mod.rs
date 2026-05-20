@@ -5918,24 +5918,6 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
-    pub fn interactive_move_set_snap_enabled(&mut self, snap_enabled: bool) -> bool {
-        let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
-            return false;
-        };
-
-        if move_.snap_enabled == snap_enabled {
-            self.interactive_move = Some(InteractiveMoveState::Moving(move_));
-            return false;
-        }
-
-        let output = move_.output.clone();
-        move_.snap_enabled = snap_enabled;
-        self.interactive_move = Some(InteractiveMoveState::Moving(move_));
-        self.refresh_interactive_move_hint(Some(&output));
-
-        true
-    }
-
     pub fn interactive_move_end(&mut self, window: &W::Id) {
         if matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
             self.refresh_interactive_move_hint(None);
