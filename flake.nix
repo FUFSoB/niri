@@ -66,6 +66,10 @@
           name = "draw-cursor";
           pr = null;
         }
+        {
+          name = "floating-snap";
+          pr = null;
+        }
       ];
       niri-package =
         {

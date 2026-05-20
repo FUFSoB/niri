@@ -959,6 +959,12 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
+        let old_ctrl = self
+            .niri
+            .seat
+            .get_keyboard()
+            .is_some_and(|keyboard| keyboard.modifier_state().ctrl);
+
         let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input(
             self,
             event.key_code(),
@@ -1087,8 +1093,26 @@ impl State {
                 res
             },
         ) else {
+            let new_ctrl = self
+                .niri
+                .seat
+                .get_keyboard()
+                .is_some_and(|keyboard| keyboard.modifier_state().ctrl);
+            if old_ctrl != new_ctrl && self.niri.layout.interactive_move_set_snap_enabled(new_ctrl)
+            {
+                self.niri.queue_redraw_all();
+            }
             return;
         };
+
+        let new_ctrl = self
+            .niri
+            .seat
+            .get_keyboard()
+            .is_some_and(|keyboard| keyboard.modifier_state().ctrl);
+        if old_ctrl != new_ctrl && self.niri.layout.interactive_move_set_snap_enabled(new_ctrl) {
+            self.niri.queue_redraw_all();
+        }
 
         if !pressed {
             return;

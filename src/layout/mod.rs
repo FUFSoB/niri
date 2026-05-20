@@ -108,7 +108,7 @@ const INTERACTIVE_MOVE_START_THRESHOLD: f64 = 256. * 256.;
 /// Opacity of interactively moved tiles targeting the scrolling layout.
 const INTERACTIVE_MOVE_ALPHA: f64 = 0.75;
 
-/// Distance from the hinted position on each axis at which Ctrl enables snapping.
+/// Distance from the hinted or centered position on each axis at which Ctrl enables snapping.
 const FLOATING_MOVE_SNAP_THRESHOLD: f64 = 32.;
 
 const FLOATING_MOVE_HINT_OUTLINE_WIDTH: f64 = 2.;
@@ -3656,6 +3656,14 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    fn snap_floating_move_axis(raw_pos: f64, targets: [f64; 2]) -> f64 {
+        targets
+            .into_iter()
+            .filter(|target| (raw_pos - *target).abs() <= FLOATING_MOVE_SNAP_THRESHOLD)
+            .min_by(|a, b| (raw_pos - *a).abs().total_cmp(&(raw_pos - *b).abs()))
+            .unwrap_or(raw_pos)
+    }
+
     fn compute_floating_move_hint_geometry(
         &self,
         move_: &InteractiveMoveData<W>,
@@ -3683,6 +3691,19 @@ impl<W: LayoutElement> Layout<W> {
         )
         .to_physical_precise_round(scale)
         .to_logical(scale);
+        let centered_tile_render_loc = Rectangle::new(
+            ws_geo.loc
+                + floating::default_tile_pos_in_area(
+                    working_area,
+                    move_.tile.tile_size(),
+                    &ResolvedWindowRules::default(),
+                )
+                .upscale(zoom),
+            move_.tile.tile_size().upscale(zoom),
+        )
+        .to_physical_precise_round(scale)
+        .to_logical(scale)
+        .loc;
 
         let center = working_area.loc + working_area.size.to_point().downscale(2.);
         let center = (ws_geo.loc + center.upscale(zoom))
@@ -3691,12 +3712,14 @@ impl<W: LayoutElement> Layout<W> {
 
         let mut snapped_tile_render_loc = raw_tile_render_loc;
         if move_.snap_enabled {
-            if (raw_tile_render_loc.x - target_rect.loc.x).abs() <= FLOATING_MOVE_SNAP_THRESHOLD {
-                snapped_tile_render_loc.x = target_rect.loc.x;
-            }
-            if (raw_tile_render_loc.y - target_rect.loc.y).abs() <= FLOATING_MOVE_SNAP_THRESHOLD {
-                snapped_tile_render_loc.y = target_rect.loc.y;
-            }
+            snapped_tile_render_loc.x = Self::snap_floating_move_axis(
+                raw_tile_render_loc.x,
+                [target_rect.loc.x, centered_tile_render_loc.x],
+            );
+            snapped_tile_render_loc.y = Self::snap_floating_move_axis(
+                raw_tile_render_loc.y,
+                [target_rect.loc.y, centered_tile_render_loc.y],
+            );
         }
 
         Some(FloatingMoveHintGeometry {
@@ -5891,6 +5914,24 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.refresh_interactive_move_hint(Some(&hint_output));
+
+        true
+    }
+
+    pub fn interactive_move_set_snap_enabled(&mut self, snap_enabled: bool) -> bool {
+        let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
+            return false;
+        };
+
+        if move_.snap_enabled == snap_enabled {
+            self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+            return false;
+        }
+
+        let output = move_.output.clone();
+        move_.snap_enabled = snap_enabled;
+        self.interactive_move = Some(InteractiveMoveState::Moving(move_));
+        self.refresh_interactive_move_hint(Some(&output));
 
         true
     }
