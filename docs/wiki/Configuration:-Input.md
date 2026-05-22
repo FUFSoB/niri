@@ -338,6 +338,7 @@ input {
 #### `focus-follows-mouse`
 
 Focuses windows and outputs automatically when moving the mouse over them.
+Tablet tool hover uses the same setting.
 
 ```kdl
 input {

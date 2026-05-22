@@ -133,7 +133,7 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_wheel_binds, TabletData,
+    mods_with_tablet_binds, mods_with_wheel_binds, TabletData, TabletToolPress,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -381,6 +381,10 @@ pub struct Niri {
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
+    /// Tablet tool presses to suppress on release/up.
+    pub suppressed_tablet_presses: HashSet<TabletToolPress>,
+    /// Tablet tool press currently driving a pointer grab.
+    pub active_tablet_grab: Option<TabletToolPress>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -429,6 +433,7 @@ pub struct Niri {
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
+    pub mods_with_tablet_binds: HashSet<Modifiers>,
     pub mods_with_wheel_binds: HashSet<Modifiers>,
     pub vertical_finger_scroll_tracker: ScrollTracker,
     pub horizontal_finger_scroll_tracker: ScrollTracker,
@@ -1729,6 +1734,7 @@ impl State {
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
             self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
+            self.niri.mods_with_tablet_binds = mods_with_tablet_binds(new_mod_key, &config.binds);
             self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
             self.niri.mods_with_finger_scroll_binds =
                 mods_with_finger_scroll_binds(new_mod_key, &config.binds);
@@ -2736,6 +2742,7 @@ impl Niri {
 
         let mod_key = backend.mod_key(&config.borrow());
         let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
+        let mods_with_tablet_binds = mods_with_tablet_binds(mod_key, &config_.binds);
         let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds);
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
 
@@ -2886,6 +2893,8 @@ impl Niri {
             popup_grab: None,
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
+            suppressed_tablet_presses: HashSet::new(),
+            active_tablet_grab: None,
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,
@@ -2922,6 +2931,7 @@ impl Niri {
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
             mods_with_mouse_binds,
+            mods_with_tablet_binds,
             mods_with_wheel_binds,
 
             // 10 is copied from Clutter: DISCRETE_SCROLL_STEP.
@@ -7365,8 +7375,9 @@ impl Niri {
         }
     }
 
-    pub fn handle_focus_follows_mouse(
+    pub fn handle_focus_follows_motion(
         &mut self,
+        current_focus: &PointContents,
         previous_focus: &PointContents,
         new_focus: &PointContents,
     ) {
@@ -7382,9 +7393,6 @@ impl Niri {
         if self.window_mru_ui.is_open() {
             return;
         }
-
-        // Recompute the current pointer focus because we don't update it during animations.
-        let current_focus = self.contents_under(pointer.current_location());
 
         if let Some(output) = &new_focus.output {
             if current_focus.output.as_ref() != Some(output) {
@@ -7425,6 +7433,17 @@ impl Niri {
                 self.layer_shell_on_demand_focus = Some(layer.clone());
             }
         }
+    }
+
+    pub fn handle_focus_follows_mouse(
+        &mut self,
+        previous_focus: &PointContents,
+        new_focus: &PointContents,
+    ) {
+        let pointer = &self.seat.get_pointer().unwrap();
+        // Recompute the current pointer focus because we don't update it during animations.
+        let current_focus = self.contents_under(pointer.current_location());
+        self.handle_focus_follows_motion(&current_focus, previous_focus, new_focus);
     }
 
     pub fn do_screen_transition(&mut self, renderer: &mut GlesRenderer, delay_ms: Option<u16>) {

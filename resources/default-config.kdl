@@ -373,6 +373,12 @@ binds {
     Mod+MouseMiddle { move-view-or-switch-workspace-interactively; }
     // In the overview, bare left/right keep the historical behavior by default.
     // Set `overview { mouse-drag-behavior "binds" }` to reuse these drag buttons there without Mod.
+    //
+    // Tablet tool presses can use the same actions. `TabletPress` means tip contact,
+    // while `TabletStylus`, `TabletStylus2`, `TabletStylus3`, or raw `TabletButton<N>`
+    // match stylus buttons reported by libinput/wev.
+    // TabletStylus2 { close-window; }
+    // Mod+TabletPress { move-window-interactively; }
 
     // Use spawn-sh to run a shell command. Do this if you need pipes, multiple commands, etc.
     // Note: the entire command goes as a single argument. It's passed verbatim to `sh -c`.

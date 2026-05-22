@@ -52,7 +52,13 @@ pub enum Trigger {
     TouchpadScrollUp,
     TouchpadScrollLeft,
     TouchpadScrollRight,
+    TabletPress,
+    TabletButton(u32),
 }
+
+const BTN_STYLUS3: u32 = 0x149;
+const BTN_STYLUS: u32 = 0x14b;
+const BTN_STYLUS2: u32 = 0x14c;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1150,6 +1156,25 @@ impl FromStr for Key {
             Trigger::TouchpadScrollLeft
         } else if key.eq_ignore_ascii_case("TouchpadScrollRight") {
             Trigger::TouchpadScrollRight
+        } else if key.eq_ignore_ascii_case("TabletPress") || key.eq_ignore_ascii_case("TabletTip") {
+            Trigger::TabletPress
+        } else if key.eq_ignore_ascii_case("TabletStylus3") {
+            Trigger::TabletButton(BTN_STYLUS3)
+        } else if key.eq_ignore_ascii_case("TabletStylus") {
+            Trigger::TabletButton(BTN_STYLUS)
+        } else if key.eq_ignore_ascii_case("TabletStylus2") {
+            Trigger::TabletButton(BTN_STYLUS2)
+        } else if key
+            .get(..12)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("TabletButton"))
+        {
+            let code = key[12..]
+                .parse::<u32>()
+                .map_err(|_| miette!("invalid tablet button code: {}", &key[12..]))?;
+            if code == 0 {
+                return Err(miette!("invalid tablet button code: 0"));
+            }
+            Trigger::TabletButton(code)
         } else {
             let mut keysym = keysym_from_name(key, KEYSYM_CASE_INSENSITIVE);
             // The keyboard event handling code can receive either
@@ -1249,6 +1274,59 @@ mod tests {
                 modifiers: Modifiers::ISO_LEVEL5_SHIFT
             },
         );
+    }
+
+    #[test]
+    fn parse_tablet_triggers() {
+        assert_eq!(
+            "TabletPress".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletPress,
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert_eq!(
+            "TabletTip".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletPress,
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert_eq!(
+            "Mod+TabletStylus".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS),
+                modifiers: Modifiers::COMPOSITOR,
+            },
+        );
+        assert_eq!(
+            "Ctrl+TabletStylus2".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS2),
+                modifiers: Modifiers::CTRL,
+            },
+        );
+        assert_eq!(
+            "TabletStylus3".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS3),
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert_eq!(
+            "TabletButton332".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(332),
+                modifiers: Modifiers::empty(),
+            },
+        );
+    }
+
+    #[test]
+    fn reject_invalid_tablet_button_codes() {
+        assert!("TabletButton".parse::<Key>().is_err());
+        assert!("TabletButton0".parse::<Key>().is_err());
+        assert!("TabletButtonxyz".parse::<Key>().is_err());
     }
 
     #[test]

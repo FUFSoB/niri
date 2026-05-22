@@ -26,6 +26,9 @@ const FONT: &str = "sans 14px";
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
+const BTN_STYLUS3: u32 = 0x149;
+const BTN_STYLUS: u32 = 0x14b;
+const BTN_STYLUS2: u32 = 0x14c;
 
 pub struct HotkeyOverlay {
     is_open: bool,
@@ -567,6 +570,13 @@ fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
         Trigger::TouchpadScrollUp => String::from("Touchpad Scroll Up"),
         Trigger::TouchpadScrollLeft => String::from("Touchpad Scroll Left"),
         Trigger::TouchpadScrollRight => String::from("Touchpad Scroll Right"),
+        Trigger::TabletPress => String::from("Tablet Press"),
+        Trigger::TabletButton(button) => match button {
+            BTN_STYLUS3 => String::from("Tablet Stylus 3"),
+            BTN_STYLUS => String::from("Tablet Stylus"),
+            BTN_STYLUS2 => String::from("Tablet Stylus 2"),
+            _ => format!("Tablet Button {button}"),
+        },
     };
     name.push_str(&pretty);
 

@@ -15,8 +15,8 @@ use smithay::backend::input::{
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
     InputEvent, KeyState, KeyboardKeyEvent, Keycode, MouseButton, PointerAxisEvent,
     PointerButtonEvent, PointerMotionEvent, ProximityState, Switch, SwitchState, SwitchToggleEvent,
-    TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
-    TabletToolTipState, TouchEvent,
+    TabletToolButtonEvent, TabletToolDescriptor, TabletToolEvent, TabletToolProximityEvent,
+    TabletToolTipEvent, TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
@@ -81,10 +81,17 @@ pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 const MIRROR_VIEW_STEP_FRACTION: f64 = 0.1;
 const MIRROR_ZOOM_STEP: &str = "+0.25";
 const MIRROR_UNZOOM_STEP: &str = "-0.25";
+const BTN_TOUCH: u32 = 0x14a;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TabletToolPress {
+    pub tool: TabletToolDescriptor,
+    pub button: u32,
 }
 
 pub enum PointerOrTouchStartData<D: SeatHandler> {
@@ -587,6 +594,151 @@ impl State {
                 MirrorViewGrabMode::Zoom,
             ),
             _ => false,
+        }
+    }
+
+    fn sync_pointer_to_position(&mut self, pos: Point<f64, Logical>) {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        pointer.set_location(pos);
+        self.niri.pointer_contents = self.niri.contents_under(pos);
+    }
+
+    fn drive_pointer_grab_from_tablet_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let under = self.niri.contents_under(pos);
+        self.niri.pointer_contents.clone_from(&under);
+
+        pointer.motion(
+            self,
+            under.surface,
+            &MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+        self.niri.maybe_activate_pointer_constraint();
+    }
+
+    fn find_tablet_bind(&mut self, trigger: Trigger, mods: ModifiersState) -> Option<Bind> {
+        let modifiers = modifiers_from_state(mods);
+        if !self.niri.window_mru_ui.is_open()
+            && !self.niri.mods_with_tablet_binds.contains(&modifiers)
+        {
+            return None;
+        }
+
+        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
+        let bind = {
+            let config = self.niri.config.borrow();
+            let bindings = make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+            find_configured_bind(bindings, mod_key, trigger, mods)
+        }?;
+
+        (!self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action))
+            .then_some(bind)
+    }
+
+    fn try_start_tablet_drag_action(
+        &mut self,
+        action: &Action,
+        press: &TabletToolPress,
+        pos: Point<f64, Logical>,
+        time: u32,
+    ) -> bool {
+        self.sync_pointer_to_position(pos);
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let started = if self.niri.layout.is_overview_open()
+            && matches!(action, Action::MoveWindowInteractively)
+        {
+            self.try_start_overview_move_window_interactively(press.button, serial)
+        } else {
+            self.try_start_mouse_drag_action(action, press.button, serial)
+        };
+        if !started {
+            return false;
+        }
+
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button: press.button,
+                state: ButtonState::Pressed,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        self.niri.active_tablet_grab = Some(press.clone());
+        true
+    }
+
+    fn maybe_handle_tablet_bind_press(
+        &mut self,
+        trigger: Trigger,
+        press: TabletToolPress,
+        pos: Option<Point<f64, Logical>>,
+        time: u32,
+    ) -> bool {
+        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+        let Some(bind) = self.find_tablet_bind(trigger, mods) else {
+            return false;
+        };
+
+        if is_mouse_drag_action(&bind.action) {
+            let Some(pos) = pos else {
+                return false;
+            };
+            if !self.try_start_tablet_drag_action(&bind.action, &press, pos, time) {
+                return false;
+            }
+            self.niri.suppressed_tablet_presses.insert(press);
+            return true;
+        }
+
+        self.niri.suppressed_tablet_presses.insert(press);
+        self.handle_bind(bind);
+        true
+    }
+
+    fn finish_suppressed_tablet_press(&mut self, press: &TabletToolPress, time: u32) -> bool {
+        if !self.niri.suppressed_tablet_presses.remove(press) {
+            return false;
+        }
+
+        if self.niri.active_tablet_grab.as_ref() == Some(press) {
+            let serial = SERIAL_COUNTER.next_serial();
+            let pointer = self.niri.seat.get_pointer().unwrap();
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button: press.button,
+                    state: ButtonState::Released,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(self);
+            self.niri.active_tablet_grab = None;
+        }
+
+        true
+    }
+
+    fn clear_suppressed_tablet_presses_for_tool(&mut self, tool: &TabletToolDescriptor, time: u32) {
+        let suppressed: Vec<_> = self
+            .niri
+            .suppressed_tablet_presses
+            .iter()
+            .filter(|press| press.tool == *tool)
+            .cloned()
+            .collect();
+
+        for press in suppressed {
+            self.finish_suppressed_tablet_press(&press, time);
         }
     }
 
@@ -4356,59 +4508,78 @@ impl State {
             return;
         };
         let pos = self.clamp_position_to_zoom(pos);
+        let previous_pos = self.niri.tablet_cursor_location;
+        let tool_desc = event.tool();
 
-        if let Some(output) = self.niri.screenshot_ui.selection_output() {
-            let geom = self.niri.global_space.output_geometry(output).unwrap();
-            let point = (pos - geom.loc.to_f64())
-                .to_physical(output.current_scale().fractional_scale())
-                .to_i32_round::<i32>();
-
-            self.niri.screenshot_ui.pointer_motion(point, None);
-        }
-
-        if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                }
-            }
-        }
-
-        let under = self.niri.contents_under(pos);
-
-        let tablet_seat = self.niri.seat.tablet_seat();
-        let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
-        let tool = tablet_seat.get_tool(&event.tool());
-        if let (Some(tablet), Some(tool)) = (tablet, tool) {
-            if event.pressure_has_changed() {
-                tool.pressure(event.pressure());
-            }
-            if event.distance_has_changed() {
-                tool.distance(event.distance());
-            }
-            if event.tilt_has_changed() {
-                tool.tilt(event.tilt());
-            }
-            if event.slider_has_changed() {
-                tool.slider_position(event.slider_position());
-            }
-            if event.rotation_has_changed() {
-                tool.rotation(event.rotation());
-            }
-            if event.wheel_has_changed() {
-                tool.wheel(event.wheel_delta(), event.wheel_delta_discrete());
-            }
-
-            tool.motion(
-                pos,
-                under.surface,
-                &tablet,
-                SERIAL_COUNTER.next_serial(),
-                event.time_msec(),
-            );
-
+        if self
+            .niri
+            .active_tablet_grab
+            .as_ref()
+            .is_some_and(|press| press.tool == tool_desc)
+        {
+            self.drive_pointer_grab_from_tablet_motion(pos, event.time_msec());
             self.niri.pointer_visibility = PointerVisibility::Visible;
             self.niri.tablet_cursor_location = Some(pos);
+        } else {
+            if let Some(output) = self.niri.screenshot_ui.selection_output() {
+                let geom = self.niri.global_space.output_geometry(output).unwrap();
+                let point = (pos - geom.loc.to_f64())
+                    .to_physical(output.current_scale().fractional_scale())
+                    .to_i32_round::<i32>();
+
+                self.niri.screenshot_ui.pointer_motion(point, None);
+            }
+
+            if let Some(mru_output) = self.niri.window_mru_ui.output() {
+                if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                    if mru_output == output {
+                        self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                    }
+                }
+            }
+
+            let under = self.niri.contents_under(pos);
+            let previous_focus = previous_pos
+                .map(|prev| self.niri.contents_under(prev))
+                .unwrap_or_default();
+            let current_focus = previous_focus.clone();
+            self.niri
+                .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
+
+            let tablet_seat = self.niri.seat.tablet_seat();
+            let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
+            let tool = tablet_seat.get_tool(&tool_desc);
+            if let (Some(tablet), Some(tool)) = (tablet, tool) {
+                if event.pressure_has_changed() {
+                    tool.pressure(event.pressure());
+                }
+                if event.distance_has_changed() {
+                    tool.distance(event.distance());
+                }
+                if event.tilt_has_changed() {
+                    tool.tilt(event.tilt());
+                }
+                if event.slider_has_changed() {
+                    tool.slider_position(event.slider_position());
+                }
+                if event.rotation_has_changed() {
+                    tool.rotation(event.rotation());
+                }
+                if event.wheel_has_changed() {
+                    tool.wheel(event.wheel_delta(), event.wheel_delta_discrete());
+                }
+
+                tool.motion(
+                    pos,
+                    under.surface.clone(),
+                    &tablet,
+                    SERIAL_COUNTER.next_serial(),
+                    event.time_msec(),
+                );
+
+                self.niri.pointer_visibility = PointerVisibility::Visible;
+                self.niri.tablet_cursor_location = Some(pos);
+            }
         }
 
         if let Some((output, _)) = self.niri.output_under(pos) {
@@ -4427,10 +4598,9 @@ impl State {
     }
 
     fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent) {
-        let tool = self.niri.seat.tablet_seat().get_tool(&event.tool());
-
-        let Some(tool) = tool else {
-            return;
+        let press = TabletToolPress {
+            tool: event.tool(),
+            button: BTN_TOUCH,
         };
         let tip_state = event.tip_state();
 
@@ -4438,6 +4608,19 @@ impl State {
 
         match tip_state {
             TabletToolTipState::Down => {
+                if self.maybe_handle_tablet_bind_press(
+                    Trigger::TabletPress,
+                    press.clone(),
+                    self.niri.tablet_cursor_location,
+                    event.time_msec(),
+                ) {
+                    return;
+                }
+
+                let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
+                let Some(tool) = tool else {
+                    return;
+                };
                 let serial = SERIAL_COUNTER.next_serial();
                 tool.tip_down(serial, event.time_msec());
 
@@ -4538,6 +4721,14 @@ impl State {
                 }
             }
             TabletToolTipState::Up => {
+                if self.finish_suppressed_tablet_press(&press, event.time_msec()) {
+                    return;
+                }
+
+                let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
+                let Some(tool) = tool else {
+                    return;
+                };
                 if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
                     if capture {
                         self.confirm_screenshot(true);
@@ -4559,16 +4750,25 @@ impl State {
             return;
         };
 
+        let previous_pos = self.niri.tablet_cursor_location;
         let under = self.niri.contents_under(pos);
 
         let tablet_seat = self.niri.seat.tablet_seat();
         let display_handle = self.niri.display_handle.clone();
-        let tool = tablet_seat.add_tool::<Self>(self, &display_handle, &event.tool());
+        let tool_desc = event.tool();
+        let tool = tablet_seat.add_tool::<Self>(self, &display_handle, &tool_desc);
         let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
         if let Some(tablet) = tablet {
             match event.state() {
                 ProximityState::In => {
-                    if let Some(under) = under.surface {
+                    let previous_focus = previous_pos
+                        .map(|prev| self.niri.contents_under(prev))
+                        .unwrap_or_default();
+                    let current_focus = previous_focus.clone();
+                    self.niri
+                        .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
+
+                    if let Some(under) = under.surface.clone() {
                         tool.proximity_in(
                             pos,
                             under,
@@ -4581,6 +4781,7 @@ impl State {
                     self.niri.tablet_cursor_location = Some(pos);
                 }
                 ProximityState::Out => {
+                    self.clear_suppressed_tablet_presses_for_tool(&tool_desc, event.time_msec());
                     tool.proximity_out(event.time_msec());
 
                     // Move the mouse pointer here to avoid discontinuity.
@@ -4602,12 +4803,34 @@ impl State {
     }
 
     fn on_tablet_tool_button<I: InputBackend>(&mut self, event: I::TabletToolButtonEvent) {
-        let tool = self.niri.seat.tablet_seat().get_tool(&event.tool());
+        let press = TabletToolPress {
+            tool: event.tool(),
+            button: event.button(),
+        };
+        let button_state = event.button_state();
 
+        if button_state == ButtonState::Released
+            && self.finish_suppressed_tablet_press(&press, event.time_msec())
+        {
+            return;
+        }
+
+        if button_state == ButtonState::Pressed
+            && self.maybe_handle_tablet_bind_press(
+                Trigger::TabletButton(press.button),
+                press.clone(),
+                self.niri.tablet_cursor_location,
+                event.time_msec(),
+            )
+        {
+            return;
+        }
+
+        let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
         if let Some(tool) = tool {
             tool.button(
-                event.button(),
-                event.button_state(),
+                press.button,
+                button_state,
                 SERIAL_COUNTER.next_serial(),
                 event.time_msec(),
             );
@@ -6010,6 +6233,28 @@ pub fn mods_with_mouse_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifier
     )
 }
 
+pub fn mods_with_tablet_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
+    let mut rv = HashSet::new();
+    for bind in &binds.0 {
+        if !matches!(
+            bind.key.trigger,
+            Trigger::TabletPress | Trigger::TabletButton(_)
+        ) {
+            continue;
+        }
+
+        let mut mods = bind.key.modifiers;
+        if mods.contains(Modifiers::COMPOSITOR) {
+            mods.remove(Modifiers::COMPOSITOR);
+            mods.insert(mod_key.to_modifiers());
+        }
+
+        rv.insert(mods);
+    }
+
+    rv
+}
+
 pub fn mods_with_wheel_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
     mods_with_binds(
         mod_key,
@@ -6630,5 +6875,83 @@ mod tests {
             ModifiersState::default(),
             &Action::MoveViewOrSwitchWorkspaceInteractively,
         ));
+    }
+
+    #[test]
+    fn mods_with_tablet_binds_collect_known_modifiers() {
+        let binds = Binds(vec![
+            Bind {
+                key: Key {
+                    trigger: Trigger::TabletPress,
+                    modifiers: Modifiers::COMPOSITOR,
+                },
+                action: Action::CloseWindow,
+                repeat: true,
+                cooldown: None,
+                allow_when_locked: false,
+                allow_inhibiting: true,
+                hotkey_overlay_title: None,
+            },
+            Bind {
+                key: Key {
+                    trigger: Trigger::TabletButton(332),
+                    modifiers: Modifiers::CTRL | Modifiers::ALT,
+                },
+                action: Action::CloseWindow,
+                repeat: true,
+                cooldown: None,
+                allow_when_locked: false,
+                allow_inhibiting: true,
+                hotkey_overlay_title: None,
+            },
+            Bind {
+                key: Key {
+                    trigger: Trigger::MouseLeft,
+                    modifiers: Modifiers::SHIFT,
+                },
+                action: Action::CloseWindow,
+                repeat: true,
+                cooldown: None,
+                allow_when_locked: false,
+                allow_inhibiting: true,
+                hotkey_overlay_title: None,
+            },
+        ]);
+
+        let mods = mods_with_tablet_binds(ModKey::Super, &binds);
+        assert!(mods.contains(&Modifiers::SUPER));
+        assert!(mods.contains(&(Modifiers::CTRL | Modifiers::ALT)));
+        assert!(!mods.contains(&Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn find_configured_bind_matches_tablet_triggers() {
+        let bind = Bind {
+            key: Key {
+                trigger: Trigger::TabletButton(332),
+                modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT,
+            },
+            action: Action::CloseWindow,
+            repeat: true,
+            cooldown: None,
+            allow_when_locked: false,
+            allow_inhibiting: true,
+            hotkey_overlay_title: None,
+        };
+
+        assert_eq!(
+            find_configured_bind(
+                [&bind],
+                ModKey::Super,
+                Trigger::TabletButton(332),
+                ModifiersState {
+                    logo: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            )
+            .as_ref(),
+            Some(&bind),
+        );
     }
 }
