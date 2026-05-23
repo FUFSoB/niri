@@ -4022,7 +4022,16 @@ impl Niri {
             .and_then(|(_, mapped)| mapped.rules().draw_cursor)
     }
 
-    fn draw_cursor_rule_for_target(&self, cursor_owner: Option<MappedId>) -> Option<DrawCursor> {
+    fn draw_cursor_rule_for_target(
+        &self,
+        target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+    ) -> Option<DrawCursor> {
+        if self.screenshot_ui.is_open() && target == RenderTarget::Output && cursor_owner.is_none()
+        {
+            return None;
+        }
+
         cursor_owner
             .and_then(|window_id| self.draw_cursor_rule_for_window(window_id))
             .or_else(|| {
@@ -4094,7 +4103,7 @@ impl Niri {
         cursor_owner: Option<MappedId>,
     ) -> CursorImageStatus {
         let cursor_image = self.cursor_manager.cursor_image().clone();
-        let draw_cursor_rule = self.draw_cursor_rule_for_target(cursor_owner);
+        let draw_cursor_rule = self.draw_cursor_rule_for_target(target, cursor_owner);
 
         match draw_cursor_rule {
             Some(DrawCursor::AlwaysHidden) => CursorImageStatus::Hidden,
@@ -4111,13 +4120,14 @@ impl Niri {
 
     pub(crate) fn should_render_pointer_for_target(
         &self,
-        _target: RenderTarget,
+        target: RenderTarget,
         cursor_owner: Option<MappedId>,
     ) -> bool {
         match self.pointer_visibility {
             PointerVisibility::Visible => true,
             PointerVisibility::Hidden => {
-                self.draw_cursor_rule_for_target(cursor_owner) == Some(DrawCursor::AlwaysShown)
+                self.draw_cursor_rule_for_target(target, cursor_owner)
+                    == Some(DrawCursor::AlwaysShown)
             }
             PointerVisibility::Disabled => false,
         }

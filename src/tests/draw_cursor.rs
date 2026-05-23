@@ -439,6 +439,46 @@ fn draw_cursor_always_hidden_hides_visible_cursor_on_output() {
 }
 
 #[test]
+fn screenshot_ui_shows_live_pointer_above_always_hidden_window() {
+    let Some(mut f) = set_up(config_with_draw_cursor(DrawCursor::AlwaysHidden)) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+
+    f.niri_state().open_screenshot_ui(false, None);
+    f.niri_complete_animations();
+    assert!(f.niri().screenshot_ui.is_open());
+
+    let output = f.niri_output(1);
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
+
+    assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn screenshot_ui_does_not_show_pointer_in_window_screencast_for_always_hidden_window() {
+    let Some(mut f) = set_up(config_with_draw_cursor(DrawCursor::AlwaysHidden)) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+
+    f.niri_state().open_screenshot_ui(false, None);
+    f.niri_complete_animations();
+    assert!(f.niri().screenshot_ui.is_open());
+
+    let output = f.niri_output(1);
+    let without_pointer = render_window_screencast_pixels(&mut f, &output, window, false);
+    let with_pointer = render_window_screencast_pixels(&mut f, &output, window, true);
+
+    assert_eq!(with_pointer, without_pointer);
+}
+
+#[test]
 fn draw_cursor_always_shown_draws_hidden_cursor_on_output() {
     let Some(mut f) = set_up(config_with_draw_cursor(DrawCursor::AlwaysShown)) else {
         return;
