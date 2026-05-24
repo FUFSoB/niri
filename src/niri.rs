@@ -389,6 +389,7 @@ pub struct Niri {
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
+    pub mirror_keyboard_focus_override: Option<MirrorKeyboardFocusOverride>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
@@ -569,6 +570,20 @@ pub struct PopupGrabState {
     pub has_keyboard_grab: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorForwardTarget {
+    pub origin_mirror_id: MappedId,
+    pub source_window_id: MappedId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorKeyboardFocusOverride {
+    pub origin_mirror_id: MappedId,
+    pub source_window_id: MappedId,
+    pub anchor_layout_focus: Option<MappedId>,
+    pub anchor_active_output_name: Option<String>,
+}
+
 // The surfaces here are always toplevel surfaces focused as far as niri's logic is concerned, even
 // when popup grabs are active (which means the real keyboard focus is on a popup descending from
 // that toplevel surface).
@@ -602,6 +617,8 @@ pub struct PointContents {
     pub surface: Option<(WlSurface, Point<f64, Logical>)>,
     // If surface belongs to a window, this is that layout entry.
     pub window: Option<(MappedId, HitType)>,
+    // If input should be forwarded through a mirror, this is the real source window to focus.
+    pub mirror_forward_window: Option<MirrorForwardTarget>,
     // If surface belongs to a layer surface, this is that layer surface.
     pub layer: Option<LayerSurface>,
     // Pointer is over a hot corner.
@@ -1182,6 +1199,44 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    pub fn set_mirror_keyboard_focus_override(&mut self, target: MirrorForwardTarget) {
+        self.niri.mirror_keyboard_focus_override = Some(MirrorKeyboardFocusOverride {
+            origin_mirror_id: target.origin_mirror_id,
+            source_window_id: target.source_window_id,
+            anchor_layout_focus: self.niri.layout.focus().map(|win| win.id()),
+            anchor_active_output_name: self.niri.layout.active_output().map(Output::name),
+        });
+        self.niri.layer_shell_on_demand_focus = None;
+    }
+
+    pub fn clear_mirror_keyboard_focus_override(&mut self) {
+        self.niri.mirror_keyboard_focus_override = None;
+    }
+
+    pub fn effective_layout_keyboard_focus(&mut self) -> Option<(MappedId, Option<WlSurface>)> {
+        if let Some(override_) = self.niri.validated_mirror_keyboard_focus_override() {
+            let id = override_.source_window_id;
+            let surface = self
+                .niri
+                .find_window_by_id(id)
+                .and_then(|window| window.toplevel().map(|toplevel| toplevel.wl_surface().clone()));
+            return Some((id, surface));
+        }
+
+        self.niri.layout.focus().map(|win| {
+            let surface = win
+                .window()
+                .and_then(Window::toplevel)
+                .map(|toplevel| toplevel.wl_surface().clone());
+            (win.id(), surface)
+        })
+    }
+
+    pub fn effective_layout_keyboard_focus_surface(&mut self) -> Option<WlSurface> {
+        self.effective_layout_keyboard_focus()
+            .and_then(|(_, surface)| surface)
+    }
+
     pub fn confirm_mru(&mut self) {
         if let Some(id) = self.niri.close_mru(MruCloseRequest::Confirm) {
             self.focus_mapped(id);
@@ -1326,6 +1381,8 @@ impl State {
             }
         }
 
+        let effective_layout_focus = self.effective_layout_keyboard_focus();
+
         // Compute the current focus.
         let focus = if self.niri.exit_confirm_dialog.is_open() {
             KeyboardFocus::ExitConfirmDialog
@@ -1355,9 +1412,9 @@ impl State {
             };
 
             let layout_focus = || {
-                self.niri.layout.focus().map(|win| KeyboardFocus::Layout {
-                    surface: win.window().and_then(Window::toplevel).map(|t| t.wl_surface().clone()),
-                    id: Some(win.id()),
+                effective_layout_focus.clone().map(|(id, surface)| KeyboardFocus::Layout {
+                    surface,
+                    id: Some(id),
                 })
             };
 
@@ -1440,6 +1497,10 @@ impl State {
                 id: None,
             }
         };
+
+        if !matches!(focus, KeyboardFocus::Layout { .. }) {
+            self.niri.mirror_keyboard_focus_override = None;
+        }
 
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         if self.niri.keyboard_focus != focus {
@@ -2915,6 +2976,7 @@ impl Niri {
                 surface: None,
                 id: None,
             },
+            mirror_keyboard_focus_override: None,
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
@@ -3898,13 +3960,14 @@ impl Niri {
                             )
                         })
                 })
-                .map(|(s, l)| (Some(s), (None, Some(l.clone()))))
+                .map(|(s, l)| (Some(s), (None, Some(l.clone())), None))
         };
 
         let layer_toplevel_under = |layer| layer_surface_under(layer, false);
         let layer_popup_under = |layer| layer_surface_under(layer, true);
 
         let mapped_hit_data = |(mapped, hit): (&Mapped, HitType)| {
+            let mut mirror_forward_window = None;
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let source_surface_pos = if mapped.is_mirror() {
                     let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
@@ -3939,6 +4002,10 @@ impl Niri {
                         source_window
                             .surface_under(source_surface_pos, WindowSurfaceType::ALL)
                             .map(|(s, surface_loc)| {
+                                mirror_forward_window = Some(MirrorForwardTarget {
+                                    origin_mirror_id: mapped.id(),
+                                    source_window_id: source_mapped.source_id(),
+                                });
                                 let source_surface_local =
                                     source_surface_pos - surface_loc.to_f64();
                                 (s, pos_within_output - source_surface_local)
@@ -3950,6 +4017,12 @@ impl Niri {
                                 window.surface_under(source_surface_pos, WindowSurfaceType::ALL)
                             })
                             .map(|(s, surface_loc)| {
+                                if mapped.is_mirror() {
+                                    mirror_forward_window = Some(MirrorForwardTarget {
+                                        origin_mirror_id: mapped.id(),
+                                        source_window_id: mapped.source_id(),
+                                    });
+                                }
                                 let source_surface_local =
                                     source_surface_pos - surface_loc.to_f64();
                                 (s, pos_within_output - source_surface_local)
@@ -3959,7 +4032,11 @@ impl Niri {
             } else {
                 None
             };
-            (surface_and_pos, (Some((mapped.id(), hit)), None))
+            (
+                surface_and_pos,
+                (Some((mapped.id(), hit)), None),
+                mirror_forward_window,
+            )
         };
 
         let interactive_moved_window_under = || {
@@ -4019,7 +4096,7 @@ impl Niri {
             }
         }
 
-        let Some((mut surface_and_pos, (window, layer))) = under else {
+        let Some((mut surface_and_pos, (window, layer), mirror_forward_window)) = under else {
             return rv;
         };
 
@@ -4030,6 +4107,7 @@ impl Niri {
         rv.surface = surface_and_pos;
         rv.window = window;
         rv.layer = layer;
+        rv.mirror_forward_window = mirror_forward_window;
         rv
     }
 
@@ -4376,6 +4454,40 @@ impl Niri {
             .windows()
             .find(|(_, m)| m.id() == id)
             .and_then(|(_, m)| m.window().cloned())
+    }
+
+    pub fn is_mirror_window(&self, id: MappedId) -> bool {
+        self.layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == id)
+            .is_some_and(|(_, mapped)| mapped.is_mirror())
+    }
+
+    pub fn validated_mirror_keyboard_focus_override(
+        &mut self,
+    ) -> Option<MirrorKeyboardFocusOverride> {
+        let override_ = self.mirror_keyboard_focus_override.clone()?;
+
+        let source_exists = self
+            .layout
+            .windows()
+            .any(|(_, mapped)| mapped.id() == override_.source_window_id);
+        let origin_is_mirror = self
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == override_.origin_mirror_id)
+            .is_some_and(|(_, mapped)| mapped.is_mirror());
+        let layout_focus_matches =
+            self.layout.focus().map(|win| win.id()) == override_.anchor_layout_focus;
+        let active_output_matches = self.layout.active_output().map(Output::name)
+            == override_.anchor_active_output_name;
+
+        if source_exists && origin_is_mirror && layout_focus_matches && active_output_matches {
+            Some(override_)
+        } else {
+            self.mirror_keyboard_focus_override = None;
+            None
+        }
     }
 
     pub fn find_mapped_id_by_window(&self, window: &Window) -> Option<MappedId> {
@@ -4841,7 +4953,10 @@ impl Niri {
             KeyboardFocus::Mru => true,
         };
 
-        self.layout.refresh(layout_is_active);
+        let activated_override = self
+            .validated_mirror_keyboard_focus_override()
+            .map(|override_| override_.source_window_id);
+        self.layout.refresh(layout_is_active, activated_override);
     }
 
     pub fn refresh_idle_inhibit(&mut self) {

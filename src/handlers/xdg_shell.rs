@@ -286,8 +286,8 @@ impl XdgShellHandler for State {
             trace!("ignoring popup grab because the screenshot UI is open");
             let _ = PopupManager::dismiss_popup(&root, &popup);
             return;
-        } else if let Some(output) = self.niri.layout.active_output() {
-            let layers = layer_map_for_output(output);
+        } else if let Some(output) = self.niri.layout.active_output().cloned() {
+            let layers = layer_map_for_output(&output);
 
             // FIXME: somewhere here we probably need to check is_overview_open to match the logic
             // in update_keyboard_focus().
@@ -317,7 +317,7 @@ impl XdgShellHandler for State {
                     return;
                 }
 
-                let mon = self.niri.layout.monitor_for_output(output).unwrap();
+                let mon = self.niri.layout.monitor_for_output(&output).unwrap();
                 if !mon.render_above_top_layer()
                     && layers.layers_on(Layer::Top).any(|l| {
                         (l.cached_state().keyboard_interactivity
@@ -331,8 +331,8 @@ impl XdgShellHandler for State {
                     return;
                 }
 
-                let layout_focus = self.niri.layout.focus();
-                if Some(&root) != layout_focus.map(|win| win.toplevel().wl_surface()) {
+                let layout_focus = self.effective_layout_keyboard_focus_surface();
+                if Some(&root) != layout_focus.as_ref() {
                     trace!("ignoring toplevel popup grab because another window has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;

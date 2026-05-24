@@ -1873,13 +1873,23 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
+    pub fn refresh(
+        &mut self,
+        is_active: bool,
+        is_focused: bool,
+        activated_override: Option<&W::Id>,
+    ) {
         self.scrolling
-            .refresh(is_active && !self.floating_is_active.get(), is_focused);
+            .refresh(
+                is_active && !self.floating_is_active.get(),
+                is_focused,
+                activated_override,
+            );
         self.floating.refresh(
             is_active && self.floating_is_active.get(),
             is_focused,
             false,
+            activated_override,
         );
     }
 

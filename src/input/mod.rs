@@ -53,7 +53,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, AddWindowTarget, HitType, LayoutElement as _, SizingMode};
-use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::niri::{CastTarget, PointContents, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -785,6 +785,18 @@ impl State {
         );
         pointer.frame(self);
         self.niri.maybe_activate_pointer_constraint();
+    }
+
+    fn handle_mirror_press_focus(&mut self, under: &PointContents) -> bool {
+        if let Some(target) = under.mirror_forward_window {
+            self.set_mirror_keyboard_focus_override(target);
+            self.niri.queue_redraw_all();
+            return true;
+        }
+
+        under.window
+            .map(|(window, _)| self.niri.is_mirror_window(window))
+            .unwrap_or(false)
     }
 
     fn find_tablet_bind(&mut self, trigger: Trigger, mods: ModifiersState) -> Option<Bind> {
@@ -4069,35 +4081,25 @@ impl State {
                 self.niri.pointer_visibility = PointerVisibility::Visible;
                 self.niri.tablet_cursor_location = None;
 
-                if let Some(mapped) = self.niri.window_under_cursor() {
-                    let window = if mapped.is_scene_mirror() {
-                        self.niri
-                            .pointer_contents
-                            .surface
-                            .as_ref()
-                            .map(|(surface, _)| self.niri.find_root_shell_surface(surface))
-                            .and_then(|root| {
-                                self.niri
-                                    .layout
-                                    .find_window_and_output(&root)
-                                    .map(|(mapped, _)| mapped.id())
-                            })
-                            .unwrap_or_else(|| mapped.id())
-                    } else {
-                        mapped.id()
-                    };
+                let under = self.niri.contents_under(pointer.current_location());
 
+                if self.handle_mirror_press_focus(&under) {
+                    // Keep the real workspace/output focus unchanged for mirror presses.
+                } else if let Some((window, _)) = under.window {
+                    self.clear_mirror_keyboard_focus_override();
                     if !is_overview_open {
                         self.niri.layout.activate_window(&window);
                     }
 
                     // FIXME: granular.
                     self.niri.queue_redraw_all();
-                } else if let Some((output, ws)) = is_overview_open
+                } else if let Some((output, ws_id)) = is_overview_open
                     .then(|| self.niri.workspace_under_cursor(false))
                     .flatten()
+                    .map(|(output, ws)| (output, ws.id()))
                 {
-                    let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                    self.clear_mirror_keyboard_focus_override();
+                    let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
 
                     self.niri.layout.focus_output(&output);
                     self.niri.layout.toggle_overview_to_workspace(ws_idx);
@@ -4105,6 +4107,7 @@ impl State {
                     // FIXME: granular.
                     self.niri.queue_redraw_all();
                 } else if let Some(output) = self.niri.output_under_cursor() {
+                    self.clear_mirror_keyboard_focus_override();
                     self.niri.layout.focus_output(&output);
 
                     // FIXME: granular.
@@ -4854,6 +4857,8 @@ impl State {
                                 self.niri.cancel_mru();
                             }
                         }
+                    } else if self.handle_mirror_press_focus(&under) {
+                        // Keep the real workspace/output focus unchanged for mirror presses.
                     } else if let Some((window, _)) = under.window {
                         if let Some(output) = is_overview_open.then_some(under.output).flatten() {
                             let mut workspaces = self.niri.layout.workspaces();
@@ -4883,15 +4888,18 @@ impl State {
                             }
                         }
 
+                        self.clear_mirror_keyboard_focus_override();
                         self.niri.layout.activate_window(&window);
 
                         // FIXME: granular.
                         self.niri.queue_redraw_all();
-                    } else if let Some((output, ws)) = is_overview_open
+                    } else if let Some((output, ws_id)) = is_overview_open
                         .then(|| self.niri.workspace_under(false, pos))
                         .flatten()
+                        .map(|(output, ws)| (output, ws.id()))
                     {
-                        let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                        self.clear_mirror_keyboard_focus_override();
+                        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
 
                         self.niri.layout.focus_output(&output);
                         self.niri.layout.toggle_overview_to_workspace(ws_idx);
@@ -4899,6 +4907,7 @@ impl State {
                         // FIXME: granular.
                         self.niri.queue_redraw_all();
                     } else if let Some(output) = under.output {
+                        self.clear_mirror_keyboard_focus_override();
                         self.niri.layout.focus_output(&output);
 
                         // FIXME: granular.
@@ -5531,7 +5540,10 @@ impl State {
                     window,
                 );
                 handle.set_grab(self, grab, serial);
+            } else if self.handle_mirror_press_focus(&under) {
+                // Keep the real workspace/output focus unchanged for mirror presses.
             } else if let Some((window, _)) = under.window {
+                self.clear_mirror_keyboard_focus_override();
                 self.niri.layout.activate_window(&window);
 
                 // Check if we need to start a touch move grab.
@@ -5550,6 +5562,7 @@ impl State {
                 // FIXME: granular.
                 self.niri.queue_redraw_all();
             } else if let Some(output) = under.output {
+                self.clear_mirror_keyboard_focus_override();
                 self.niri.layout.focus_output(&output);
 
                 // FIXME: granular.

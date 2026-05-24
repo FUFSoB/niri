@@ -900,6 +900,13 @@ fn zoomed_mirror_hover_uses_source_surface_coords() {
     let id = f.add_client();
     create_window(&mut f, id, "source", (40, 20), GREEN);
 
+    let source_id = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| !mapped.is_mirror())
+        .map(|(_, mapped)| mapped.id())
+        .unwrap();
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.toggle_window_floating(Some(&mirror_id));
     f.niri()
@@ -928,6 +935,13 @@ fn zoomed_mirror_hover_uses_source_surface_coords() {
     let under = f.niri().contents_under(point);
 
     assert_eq!(under.window.map(|(id, _)| id), Some(mirror_id));
+    assert_eq!(
+        under.mirror_forward_window,
+        Some(crate::niri::MirrorForwardTarget {
+            origin_mirror_id: mirror_id,
+            source_window_id: source_id,
+        })
+    );
     let (surface, surface_pos) = under.surface.unwrap();
     assert_eq!(surface, source_surface);
     assert_eq!(surface_pos, Point::from((pos.x as f64 - 20., pos.y as f64)));
@@ -996,6 +1010,7 @@ fn mirror_padding_is_activate_only() {
         )) if id == mirror_id
     ));
     assert!(under.surface.is_none());
+    assert!(under.mirror_forward_window.is_none());
 }
 
 #[test]

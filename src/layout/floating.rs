@@ -1249,7 +1249,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.interactive_resize = None;
     }
 
-    pub fn refresh(&mut self, is_active: bool, is_focused: bool, is_sticky: bool) {
+    pub fn refresh(
+        &mut self,
+        is_active: bool,
+        is_focused: bool,
+        is_sticky: bool,
+        activated_override: Option<&W::Id>,
+    ) {
         let active = self.active_window_id.clone();
         for tile in &mut self.tiles {
             let win = tile.window_mut();
@@ -1262,6 +1268,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             if self.options.deactivate_unfocused_windows {
                 is_active &= is_focused;
             }
+            is_active |= activated_override == Some(win.id());
             win.set_activated(is_active);
 
             let resize_data = self

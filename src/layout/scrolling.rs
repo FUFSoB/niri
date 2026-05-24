@@ -4101,7 +4101,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.interactive_resize = None;
     }
 
-    pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
+    pub fn refresh(
+        &mut self,
+        is_active: bool,
+        is_focused: bool,
+        activated_override: Option<&W::Id>,
+    ) {
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
             let mut col_resize_data = None;
             if let Some(resize) = &self.interactive_resize {
@@ -4155,6 +4160,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     // animations when switching tabs.
                     active &= active_in_column || is_tabbed;
                 }
+                active |= activated_override == Some(win.id());
                 win.set_activated(active);
 
                 win.set_interactive_resize(col_resize_data);

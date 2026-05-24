@@ -6808,7 +6808,7 @@ impl<W: LayoutElement> Layout<W> {
             });
     }
 
-    pub fn refresh(&mut self, is_active: bool) {
+    pub fn refresh(&mut self, is_active: bool, activated_override: Option<W::Id>) {
         let _span = tracy_client::span!("Layout::refresh");
 
         self.is_active = is_active;
@@ -6867,7 +6867,7 @@ impl<W: LayoutElement> Layout<W> {
 
                     for (ws_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                         let is_focused = is_active && ws_idx == mon.active_workspace_idx;
-                        ws.refresh(is_active, is_focused);
+                        ws.refresh(is_active, is_focused, activated_override.as_ref());
 
                         if let Some(is_scrolling) = ongoing_scrolling_dnd {
                             // Lock or unlock the view for scrolling interactive move.
@@ -6885,12 +6885,17 @@ impl<W: LayoutElement> Layout<W> {
                     }
 
                     let sticky_is_active = is_active && mon.sticky_is_active();
-                    mon.sticky.refresh(sticky_is_active, sticky_is_active, true);
+                    mon.sticky.refresh(
+                        sticky_is_active,
+                        sticky_is_active,
+                        true,
+                        activated_override.as_ref(),
+                    );
                 }
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
-                    ws.refresh(false, false);
+                    ws.refresh(false, false, activated_override.as_ref());
                     ws.view_offset_gesture_end(None);
                 }
             }
