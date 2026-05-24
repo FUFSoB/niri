@@ -1365,6 +1365,9 @@ impl<W: LayoutElement> Tile<W> {
                 LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
                     LayoutElementRenderElement::MirrorScaledClippedWayland(elem).into()
                 }
+                LayoutElementRenderElement::Texture(elem) => {
+                    LayoutElementRenderElement::Texture(elem).into()
+                }
                 LayoutElementRenderElement::SolidColor(elem) => {
                     // In this branch we're rendering a blocked-out window with a solid
                     // color. We need to render it with a rounded corner shader even if

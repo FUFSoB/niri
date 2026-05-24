@@ -330,7 +330,10 @@ fn render_window_screen_capture_pixels(
                     block_out_enabled: niri.block_out_enabled,
                     xray: None,
                 },
-                mapped.window.geometry().loc.to_f64(),
+                mapped
+                    .window()
+                    .map(|window| window.geometry().loc.to_f64())
+                    .unwrap_or_default(),
                 scale,
                 alpha,
                 XrayPos::default(),

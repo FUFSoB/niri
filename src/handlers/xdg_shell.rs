@@ -1248,7 +1248,9 @@ impl State {
 
         // Figure out if the root is a window or a layer surface.
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
-            self.unconstrain_window_popup(popup, &mapped.window);
+            if let Some(window) = mapped.window() {
+                self.unconstrain_window_popup(popup, window);
+            }
         } else if let Some((layer_surface, output)) = self.niri.layout.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer_surface = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;

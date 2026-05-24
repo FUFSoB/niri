@@ -162,6 +162,8 @@ pub enum Action {
     CreateWindowMirror,
     #[knuffel(skip)]
     CreateWindowMirrorById(u64),
+    CreateOutputMirror(#[knuffel(argument)] Option<String>),
+    CreateWorkspaceMirror(#[knuffel(argument)] Option<WorkspaceReference>),
     SetWindowMirrorZoom(#[knuffel(argument)] String),
     #[knuffel(skip)]
     SetWindowMirrorZoomById {
@@ -505,6 +507,14 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::CreateWindowMirror { id: None } => Self::CreateWindowMirror,
             niri_ipc::Action::CreateWindowMirror { id: Some(id) } => {
                 Self::CreateWindowMirrorById(id)
+            }
+            niri_ipc::Action::CreateOutputMirror { output } => Self::CreateOutputMirror(output),
+            niri_ipc::Action::CreateWorkspaceMirror { id, idx, name } => {
+                let reference = id
+                    .map(WorkspaceReference::Id)
+                    .or_else(|| idx.map(WorkspaceReference::Index))
+                    .or_else(|| name.map(WorkspaceReference::Name));
+                Self::CreateWorkspaceMirror(reference)
             }
             niri_ipc::Action::SetWindowMirrorZoom { id: None, level } => {
                 Self::SetWindowMirrorZoom(level)

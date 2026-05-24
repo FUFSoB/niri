@@ -183,10 +183,11 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, with_toplevel_role, write_png_rgba8, xwayland,
+    send_scale_transform, write_png_rgba8, xwayland,
 };
-use crate::window::mapped::MappedId;
+use crate::window::mapped::{MappedId, MirrorSource as SceneMirrorSource};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::utils::transaction::Transaction;
 use crate::zoom::{
     compute_zoom_base_focal_update, zoom_display_cursor_logical, zoom_subpixel_correction,
     zoom_wrap, ZoomWrapper, ZoomedRenderElements,
@@ -1355,7 +1356,7 @@ impl State {
 
             let layout_focus = || {
                 self.niri.layout.focus().map(|win| KeyboardFocus::Layout {
-                    surface: Some(win.toplevel().wl_surface().clone()),
+                    surface: win.window().and_then(Window::toplevel).map(|t| t.wl_surface().clone()),
                     id: Some(win.id()),
                 })
             };
@@ -2409,8 +2410,6 @@ impl State {
         to_introspect: &async_channel::Sender<NiriToIntrospect>,
         msg: IntrospectToNiri,
     ) {
-        use crate::utils::with_toplevel_role;
-
         let IntrospectToNiri::GetWindows = msg;
         let _span = tracy_client::span!("GetWindows");
 
@@ -2436,31 +2435,37 @@ impl State {
             .layout
             .with_windows(|mapped, output, workspace_id, _| {
                 let id = mapped.id().get();
-                let props = with_toplevel_role(mapped.toplevel(), |role| {
-                    gnome_shell_introspect::WindowProperties {
-                        title: role.title.clone().unwrap_or_default(),
-                        app_id: role
-                            .app_id
-                            .as_ref()
-                            // We don't do proper .desktop file tracking (it's quite involved), and
-                            // Wayland windows can set any app id they want. However, this seems to
-                            // work well enough in practice.
-                            .map(|app_id| format!("{app_id}.desktop"))
-                            .unwrap_or_default(),
-                    }
-                });
+                let props = gnome_shell_introspect::WindowProperties {
+                    title: mapped.title().unwrap_or_default(),
+                    app_id: mapped
+                        .app_id()
+                        .as_ref()
+                        // We don't do proper .desktop file tracking (it's quite involved), and
+                        // Wayland windows can set any app id they want. However, this seems to
+                        // work well enough in practice.
+                        .map(|app_id| format!("{app_id}.desktop"))
+                        .unwrap_or_else(|| {
+                            if mapped.is_scene_mirror() {
+                                String::from("rs.bxt.niri.desktop")
+                            } else {
+                                String::new()
+                            }
+                        }),
+                };
 
                 windows.insert(id, props);
 
                 #[cfg(feature = "xdp-gnome-screencast")]
                 {
-                    let summary = with_toplevel_role(mapped.toplevel(), |role| {
-                        gnome_shell_introspect::WorkspaceWindow {
-                            id,
-                            title: role.title.clone(),
-                            app_id: role.app_id.clone(),
-                        }
-                    });
+                    let summary = gnome_shell_introspect::WorkspaceWindow {
+                        id,
+                        title: mapped.title(),
+                        app_id: mapped.app_id().or_else(|| {
+                            mapped
+                                .is_scene_mirror()
+                                .then(|| String::from("rs.bxt.niri.desktop"))
+                        }),
+                    };
 
                     match workspace_id {
                         Some(workspace_id) => workspace_windows
@@ -3003,15 +3008,13 @@ impl Niri {
                 return;
             };
 
-            windows.push(with_toplevel_role(mapped.toplevel(), |role| {
-                niri_ipc::BlockedWindow {
-                    id: mapped.id().get(),
-                    title: role.title.clone(),
-                    app_id: role.app_id.clone(),
-                    workspace_id: ws_id.map(|id| id.get()),
-                    block_out_from: ipc_block_out_from(block_out_from),
-                }
-            }));
+            windows.push(niri_ipc::BlockedWindow {
+                id: mapped.id().get(),
+                title: mapped.title(),
+                app_id: mapped.app_id(),
+                workspace_id: ws_id.map(|id| id.get()),
+                block_out_from: ipc_block_out_from(block_out_from),
+            });
         });
         windows.sort_unstable_by_key(|window| window.id);
 
@@ -3902,7 +3905,6 @@ impl Niri {
         let layer_popup_under = |layer| layer_surface_under(layer, true);
 
         let mapped_hit_data = |(mapped, hit): (&Mapped, HitType)| {
-            let window = &mapped.window;
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let source_surface_pos = if mapped.is_mirror() {
                     let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
@@ -3911,12 +3913,48 @@ impl Niri {
                     Some(pos_within_output - win_pos)
                 };
                 source_surface_pos.and_then(|source_surface_pos| {
-                    window
-                        .surface_under(source_surface_pos, WindowSurfaceType::ALL)
-                        .map(|(s, surface_loc)| {
-                            let source_surface_local = source_surface_pos - surface_loc.to_f64();
-                            (s, pos_within_output - source_surface_local)
-                        })
+                    if mapped.is_scene_mirror() {
+                        let source_hit = match mapped.mirror_source() {
+                            SceneMirrorSource::Window(_) => None,
+                            SceneMirrorSource::Output(name) => self
+                                .output_by_name_match(name)
+                                .and_then(|output| self.layout.window_under(output, source_surface_pos)),
+                            SceneMirrorSource::Workspace(workspace_id) => {
+                                let (_, workspace) = self.layout.find_workspace_by_id(*workspace_id)?;
+                                let output = workspace.current_output()?;
+                                let monitor = self.layout.monitor_for_output(output)?;
+                                monitor.window_under_in_workspace_at_origin(
+                                    *workspace_id,
+                                    source_surface_pos,
+                                )
+                            }
+                        }?;
+
+                        let (source_mapped, source_hit) = source_hit;
+                        let source_window = source_mapped.window()?;
+                        let HitType::Input { win_pos } = source_hit else {
+                            return None;
+                        };
+                        let source_surface_pos = source_surface_pos - win_pos;
+                        source_window
+                            .surface_under(source_surface_pos, WindowSurfaceType::ALL)
+                            .map(|(s, surface_loc)| {
+                                let source_surface_local =
+                                    source_surface_pos - surface_loc.to_f64();
+                                (s, pos_within_output - source_surface_local)
+                            })
+                    } else {
+                        mapped
+                            .window()
+                            .and_then(|window| {
+                                window.surface_under(source_surface_pos, WindowSurfaceType::ALL)
+                            })
+                            .map(|(s, surface_loc)| {
+                                let source_surface_local =
+                                    source_surface_pos - surface_loc.to_f64();
+                                (s, pos_within_output - source_surface_local)
+                            })
+                    }
                 })
             } else {
                 None
@@ -4337,13 +4375,13 @@ impl Niri {
         self.layout
             .windows()
             .find(|(_, m)| m.id() == id)
-            .map(|(_, m)| m.window.clone())
+            .and_then(|(_, m)| m.window().cloned())
     }
 
     pub fn find_mapped_id_by_window(&self, window: &Window) -> Option<MappedId> {
         self.layout
             .windows()
-            .find(|(_, m)| !m.is_mirror() && &m.window == window)
+            .find(|(_, m)| !m.is_mirror() && m.window() == Some(window))
             .map(|(_, m)| m.id())
     }
 
@@ -4619,7 +4657,12 @@ impl Niri {
                     || pointer
                         .current_focus()
                         .map(|focused| self.find_root_shell_surface(&focused))
-                        .is_some_and(|focused| mapped.toplevel().wl_surface() == &focused);
+                        .is_some_and(|focused| {
+                            mapped
+                                .window()
+                                .and_then(Window::toplevel)
+                                .is_some_and(|toplevel| toplevel.wl_surface() == &focused)
+                        });
                 if current_focus_matches {
                     // We don't check for pointer visibility because it can only be Visible or
                     // Hidden, and never Disabled (then it wouldn't have focus). Even when the
@@ -4835,7 +4878,7 @@ impl Niri {
         let mut outputs = HashSet::new();
         self.layout.with_windows_mut(|mapped, output| {
             if mapped.recompute_window_rules_if_needed(window_rules, self.is_at_startup) {
-                windows.push((mapped.id(), mapped.window.clone()));
+                windows.push((mapped.id(), mapped.window().cloned()));
 
                 if let Some(output) = output {
                     outputs.insert(output.clone());
@@ -4851,9 +4894,11 @@ impl Niri {
 
         for (id, win) in windows {
             self.layout.update_window(&id, None);
-            win.toplevel()
-                .expect("no X11 support")
-                .send_pending_configure();
+            if let Some(win) = win {
+                win.toplevel()
+                    .expect("no X11 support")
+                    .send_pending_configure();
+            }
         }
         for output in outputs {
             self.queue_redraw(&output);
@@ -4879,6 +4924,7 @@ impl Niri {
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
+        self.prune_unavailable_scene_mirrors();
         self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
 
@@ -4903,6 +4949,36 @@ impl Niri {
                     mapped.update_render_elements(geo.size.to_f64());
                 }
             }
+        }
+    }
+
+    fn prune_unavailable_scene_mirrors(&mut self) {
+        let to_remove: Vec<_> = self
+            .layout
+            .windows()
+            .filter_map(|(_, mapped)| {
+                if !mapped.is_scene_mirror() {
+                    return None;
+                }
+
+                let unavailable = match mapped.mirror_source() {
+                    SceneMirrorSource::Window(_) => false,
+                    SceneMirrorSource::Output(name) => self.output_by_name_match(name).is_none(),
+                    SceneMirrorSource::Workspace(id) => self
+                        .layout
+                        .find_workspace_by_id(*id)
+                        .and_then(|(_, workspace)| workspace.current_output())
+                        .is_none(),
+                };
+
+                unavailable.then_some(mapped.id())
+            })
+            .collect();
+
+        for id in to_remove {
+            self.stop_casts_for_target(CastTarget::Window { id: id.get() });
+            self.window_mru_ui.remove_window(id);
+            self.layout.remove_window(&id, Transaction::new());
         }
     }
 
@@ -5034,6 +5110,167 @@ impl Niri {
         elements
     }
 
+    fn clear_scene_mirror_source_for_target(
+        &self,
+        source: &SceneMirrorSource,
+        target: RenderTarget,
+    ) {
+        self.layout.with_windows(|mapped, _, _, _| {
+            if mapped.is_scene_mirror() && mapped.mirror_source() == source {
+                mapped.clear_scene_prepared_texture(target);
+            }
+        });
+    }
+
+    fn collect_output_render_elements(
+        &self,
+        renderer: &mut GlesRenderer,
+        target: RenderTarget,
+        output: &Output,
+    ) -> Vec<OutputRenderElements<GlesRenderer>> {
+        let mut elements = Vec::new();
+        let mut ctx = RenderCtx {
+            renderer,
+            target,
+            block_out_enabled: self.block_out_enabled,
+            xray: None,
+        };
+
+        self.fill_xray_elements(ctx.as_gles(), output);
+
+        let mut ctx = ctx.r();
+        let state = self.output_state.get(output).unwrap();
+        ctx.xray = Some(&state.xray);
+        self.render_inner(ctx, output, false, &mut |elem| elements.push(elem));
+        self.clear_xray_elements(output);
+
+        elements
+    }
+
+    fn collect_workspace_render_elements(
+        &self,
+        renderer: &mut GlesRenderer,
+        target: RenderTarget,
+        output: &Output,
+        workspace: &Workspace<Mapped>,
+    ) -> Vec<OutputRenderElements<GlesRenderer>> {
+        let mut elements = Vec::new();
+        let ctx = RenderCtx {
+            renderer,
+            target,
+            block_out_enabled: self.block_out_enabled,
+            xray: None,
+        };
+        self.render_workspace_for_screen_cast_inner(ctx, output, workspace, &mut |elem| {
+            elements.push(elem)
+        });
+        elements
+    }
+
+    pub(crate) fn prepare_scene_mirror_textures(
+        &self,
+        renderer: &mut GlesRenderer,
+        target: RenderTarget,
+    ) {
+        let mirrors: Vec<_> = self
+            .layout
+            .windows()
+            .filter_map(|(_, mapped)| mapped.is_scene_mirror().then_some(mapped))
+            .collect();
+        let mut prepared = HashSet::new();
+
+        for mirror in mirrors {
+            let source = mirror.mirror_source().clone();
+            if !prepared.insert(source.clone()) {
+                continue;
+            }
+
+            self.clear_scene_mirror_source_for_target(&source, target);
+
+            let prepared_texture = match &source {
+                SceneMirrorSource::Window(_) => None,
+                SceneMirrorSource::Output(name) => {
+                    let Some(output) = self.output_by_name_match(name) else {
+                        continue;
+                    };
+                    let source_geometry = Rectangle::from_size(output_size(output));
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let size = source_geometry.size.to_physical_precise_round(scale);
+                    let elements = self.collect_output_render_elements(renderer, target, output);
+                    let Ok((texture, _)) = render_to_texture(
+                        renderer,
+                        size,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    ) else {
+                        continue;
+                    };
+
+                    Some((
+                        TextureBuffer::from_texture(
+                            renderer,
+                            texture,
+                            scale,
+                            Transform::Normal,
+                            Vec::new(),
+                        ),
+                        source_geometry,
+                    ))
+                }
+                SceneMirrorSource::Workspace(workspace_id) => {
+                    let Some((_, workspace)) = self.layout.find_workspace_by_id(*workspace_id)
+                    else {
+                        continue;
+                    };
+                    let Some(output) = workspace.current_output() else {
+                        continue;
+                    };
+                    let source_geometry = Rectangle::from_size(output_size(output));
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let size = source_geometry.size.to_physical_precise_round(scale);
+                    let elements =
+                        self.collect_workspace_render_elements(renderer, target, output, workspace);
+                    let Ok((texture, _)) = render_to_texture(
+                        renderer,
+                        size,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    ) else {
+                        continue;
+                    };
+
+                    Some((
+                        TextureBuffer::from_texture(
+                            renderer,
+                            texture,
+                            scale,
+                            Transform::Normal,
+                            Vec::new(),
+                        ),
+                        source_geometry,
+                    ))
+                }
+            };
+
+            self.layout.with_windows(|mapped, _, _, _| {
+                if !mapped.is_scene_mirror() || mapped.mirror_source() != &source {
+                    return;
+                }
+
+                if let Some((buffer, source_geometry)) = &prepared_texture {
+                    mapped.set_scene_prepared_texture(target, buffer.clone(), *source_geometry);
+                    mapped.set_scene_source_geometry(*source_geometry);
+                } else {
+                    mapped.clear_scene_prepared_texture(target);
+                }
+            });
+        }
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -5052,6 +5289,9 @@ impl Niri {
             }
         }
 
+        let target = ctx.target;
+        self.prepare_scene_mirror_textures(ctx.as_gles().renderer, target);
+
         self.fill_xray_elements(ctx.as_gles(), output);
 
         // Reborrow to shorten lifetime to be able to put in xray.
@@ -5065,6 +5305,18 @@ impl Niri {
     }
 
     pub fn render_workspace_for_screen_cast<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        workspace: &Workspace<Mapped>,
+        push: &mut dyn FnMut(OutputRenderElements<R>),
+    ) {
+        let target = ctx.target;
+        self.prepare_scene_mirror_textures(ctx.as_gles().renderer, target);
+        self.render_workspace_for_screen_cast_inner(ctx, output, workspace, push);
+    }
+
+    fn render_workspace_for_screen_cast_inner<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
         output: &Output,
@@ -5745,7 +5997,10 @@ impl Niri {
         let current = self.layout.windows_for_output(output).any(|mapped| {
             mapped.rules().variable_refresh_rate == Some(true) && {
                 let mut visible = false;
-                mapped.window.with_surfaces(|surface, states| {
+                let Some(window) = mapped.window() else {
+                    return false;
+                };
+                window.with_surfaces(|surface, states| {
                     if !visible
                         && surface_primary_scanout_output(surface, states).as_ref() == Some(output)
                     {
@@ -5822,7 +6077,10 @@ impl Niri {
 
         for mapped_group in mapped_by_source.into_values() {
             let mapped = mapped_group[0];
-            mapped.window.with_surfaces(|surface, states| {
+            let Some(window) = mapped.window() else {
+                continue;
+            };
+            window.with_surfaces(|surface, states| {
                 let primary_scanout_output = states
                     .data_map
                     .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
@@ -5943,7 +6201,11 @@ impl Niri {
                 continue;
             }
 
-            mapped.window.send_dmabuf_feedback(
+            let Some(window) = mapped.window() else {
+                continue;
+            };
+
+            window.send_dmabuf_feedback(
                 output,
                 |_, _| Some(output.clone()),
                 |surface, _| {
@@ -6399,7 +6661,11 @@ impl Niri {
         }
 
         for mapped in self.layout.windows_for_output(output) {
-            mapped.window.take_presentation_feedback(
+            let Some(window) = mapped.window() else {
+                continue;
+            };
+
+            window.take_presentation_feedback(
                 &mut feedback,
                 surface_primary_scanout_output,
                 |surface, _| {
@@ -6787,6 +7053,8 @@ impl Niri {
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
+        self.prepare_scene_mirror_textures(renderer, RenderTarget::ScreenCapture);
+
         let scale = Scale::from(output.current_scale().fractional_scale());
         let alpha =
             if mapped.sizing_mode().is_fullscreen() || mapped.is_ignoring_opacity_window_rule() {
@@ -6824,9 +7092,13 @@ impl Niri {
             block_out_enabled: self.block_out_enabled,
             xray: None,
         };
+        let location = mapped
+            .window()
+            .map(|window| window.geometry().loc.to_f64())
+            .unwrap_or_default();
         mapped.render(
             ctx,
-            mapped.window.geometry().loc.to_f64(),
+            location,
             scale,
             alpha,
             XrayPos::default(),

@@ -335,6 +335,42 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Create a mirror of an output.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Create a mirror of the focused output")
+    )]
+    CreateOutputMirror {
+        /// Name of the output to mirror.
+        ///
+        /// If `None`, uses the focused output.
+        #[cfg_attr(feature = "clap", arg())]
+        output: Option<String>,
+    },
+    /// Create a mirror of a workspace.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Create a mirror of the focused workspace")
+    )]
+    CreateWorkspaceMirror {
+        /// Id of the workspace to mirror.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        id: Option<u64>,
+
+        /// Index of the workspace to mirror.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        idx: Option<u8>,
+
+        /// Name of the workspace to mirror.
+        ///
+        /// If `None`, uses the focused workspace.
+        #[cfg_attr(feature = "clap", arg(long, group = "workspace-reference"))]
+        name: Option<String>,
+    },
     /// Set the zoom level of a mirror window.
     #[cfg_attr(
         feature = "clap",
@@ -1539,6 +1575,10 @@ pub struct Window {
     ///
     /// This is `None` for real windows.
     pub source_window_id: Option<u64>,
+    /// Source entity for mirrors.
+    ///
+    /// This is `None` for real windows.
+    pub mirror_source: Option<MirrorSource>,
     /// Title, if set.
     pub title: Option<String>,
     /// Application ID, if set.
@@ -1577,6 +1617,27 @@ pub struct Window {
     ///
     /// The timestamp comes from the monotonic clock.
     pub focus_timestamp: Option<Timestamp>,
+}
+
+/// Source entity for a mirror window.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum MirrorSource {
+    /// A regular window source.
+    Window {
+        /// Window ID.
+        id: u64,
+    },
+    /// A workspace source.
+    Workspace {
+        /// Workspace ID.
+        id: u64,
+    },
+    /// An output source.
+    Output {
+        /// Output name.
+        name: String,
+    },
 }
 
 /// A moment in time.

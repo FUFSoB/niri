@@ -128,6 +128,10 @@ pub fn refresh(state: &mut State) {
     // surface, so aggregate per surface before refreshing.
     let mut refreshes = HashMap::new();
     state.niri.layout.with_windows(|mapped, output, _, _| {
+        if mapped.is_scene_mirror() {
+            return;
+        }
+
         let toplevel = mapped.toplevel().clone();
         let entry = refreshes
             .entry(toplevel.wl_surface().clone())

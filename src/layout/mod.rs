@@ -65,6 +65,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -140,6 +141,7 @@ niri_render_elements! {
         NamespacedWayland = NamespacedElement<WaylandSurfaceRenderElement<R>>,
         MirrorScaledWayland = NamespacedScaledWaylandSurfaceRenderElement<R>,
         MirrorScaledClippedWayland = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
+        Texture = PrimaryGpuTextureRenderElement,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
     }

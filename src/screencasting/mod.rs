@@ -871,6 +871,8 @@ impl Niri {
     ) {
         let _span = tracy_client::span!("Niri::render_windows_for_screen_cast");
 
+        self.prepare_scene_mirror_textures(renderer, RenderTarget::Screencast);
+
         let scale = Scale::from(output.current_scale().fractional_scale());
 
         let mut casts_to_stop = vec![];

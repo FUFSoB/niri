@@ -7,7 +7,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, OverviewMouseDragBehavior,
-    SwitchBinds, Trigger, ZoomIncrementType,
+    SwitchBinds, Trigger, WorkspaceReference, ZoomIncrementType,
 };
 use niri_ipc::{LayoutSwitchTarget, PositionChange};
 use smithay::backend::input::{
@@ -35,7 +35,7 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
-    Logical, Physical, Point, Rectangle, Scale, Serial, Transform, SERIAL_COUNTER,
+    Logical, Physical, Point, Rectangle, Scale, Serial, Size, Transform, SERIAL_COUNTER,
 };
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
@@ -52,13 +52,13 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, AddWindowTarget, HitType, LayoutElement as _};
+use crate::layout::{ActivateWindow, AddWindowTarget, HitType, LayoutElement as _, SizingMode};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::transaction::Transaction;
-use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 use crate::window::Mapped;
 
 pub mod backend_ext;
@@ -159,6 +159,172 @@ impl State {
             );
             self.niri.queue_redraw_all();
         }
+    }
+
+    fn scene_mirror_initial_size(
+        &self,
+        source_size: Size<f64, Logical>,
+        target_output: Option<&Output>,
+    ) -> Size<i32, Logical> {
+        let mut source_size = Size::from((source_size.w.max(1.), source_size.h.max(1.)));
+        let Some(target_output) = target_output else {
+            return source_size.to_i32_round();
+        };
+
+        let Some(monitor) = self.niri.layout.monitor_for_output(target_output) else {
+            return source_size.to_i32_round();
+        };
+
+        let max_size = monitor.working_area().size * 0.75;
+        let scale = f64::min(
+            max_size.w / source_size.w.max(1.),
+            max_size.h / source_size.h.max(1.),
+        )
+        .clamp(0.0001, 1.);
+
+        source_size = source_size.upscale(scale);
+        Size::from((source_size.w.max(1.).round() as i32, source_size.h.max(1.).round() as i32))
+    }
+
+    fn create_output_mirror(&mut self, requested_output: Option<String>) {
+        let source_output = requested_output
+            .as_deref()
+            .and_then(|name| self.niri.output_by_name_match(name))
+            .cloned()
+            .or_else(|| self.niri.layout.active_output().cloned());
+        let Some(source_output) = source_output else {
+            return;
+        };
+
+        let target_output = self
+            .niri
+            .layout
+            .active_output()
+            .cloned()
+            .or_else(|| Some(source_output.clone()));
+        let source_geometry = Rectangle::from_size(output_size(&source_output));
+        let title = format!("Mirror: Output {}", source_output.name());
+
+        let mut mirror = Mapped::new_output_mirror(
+            source_output.name(),
+            title,
+            source_geometry,
+            &self.niri.config.borrow(),
+        );
+        let initial_size = self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
+        mirror.request_size(initial_size, SizingMode::Normal, false, None);
+
+        let target = target_output
+            .as_ref()
+            .map(AddWindowTarget::Output)
+            .unwrap_or(AddWindowTarget::Auto);
+        self.niri.layout.add_window(
+            mirror,
+            target,
+            None,
+            None,
+            false,
+            true,
+            false,
+            ActivateWindow::Smart,
+        );
+        self.niri.queue_redraw_all();
+    }
+
+    fn create_workspace_mirror(&mut self, requested_workspace: Option<WorkspaceReference>) {
+        let source = match requested_workspace {
+            None => {
+                let (Some(output), Some(workspace)) = (
+                    self.niri.layout.active_output(),
+                    self.niri.layout.active_workspace(),
+                ) else {
+                    return;
+                };
+                let workspace_idx = self
+                    .niri
+                    .layout
+                    .find_workspace_by_id(workspace.id())
+                    .map(|(idx, _)| idx)
+                    .unwrap_or_default();
+                Some((
+                    output.clone(),
+                    workspace.id(),
+                    workspace.name().cloned(),
+                    workspace_idx,
+                ))
+            }
+            Some(WorkspaceReference::Index(index)) => {
+                let Some(output) = self.niri.layout.active_output().cloned() else {
+                    return;
+                };
+                let ws_idx = index.saturating_sub(1) as usize;
+                self.niri
+                    .layout
+                    .workspaces()
+                    .find(|(mon, idx, _)| {
+                        mon.is_some_and(|mon| mon.output() == &output) && *idx == ws_idx
+                    })
+                    .map(|(_, idx, ws)| (output, ws.id(), ws.name().cloned(), idx))
+            }
+            Some(WorkspaceReference::Name(name)) => self
+                .niri
+                .layout
+                .workspaces()
+                .find(|(_, _, ws)| ws.name().is_some_and(|ws_name| ws_name.eq_ignore_ascii_case(&name)))
+                .and_then(|(_, idx, ws)| {
+                    Some((ws.current_output()?.clone(), ws.id(), ws.name().cloned(), idx))
+                }),
+            Some(WorkspaceReference::Id(id)) => self
+                .niri
+                .layout
+                .workspaces()
+                .find(|(_, _, ws)| ws.id().get() == id)
+                .and_then(|(_, idx, ws)| {
+                    Some((ws.current_output()?.clone(), ws.id(), ws.name().cloned(), idx))
+                }),
+        };
+        let Some((source_output, workspace_id, workspace_name, workspace_idx)) = source else {
+            return;
+        };
+
+        let target_output = self
+            .niri
+            .layout
+            .active_output()
+            .cloned()
+            .or_else(|| Some(source_output.clone()));
+        let source_geometry = Rectangle::from_size(output_size(&source_output));
+        let workspace_display_name = workspace_name.unwrap_or_else(|| format!("{}", workspace_idx + 1));
+        let title = format!(
+            "Mirror: Workspace {} on {}",
+            workspace_display_name,
+            source_output.name()
+        );
+
+        let mut mirror = Mapped::new_workspace_mirror(
+            workspace_id,
+            title,
+            source_geometry,
+            &self.niri.config.borrow(),
+        );
+        let initial_size = self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
+        mirror.request_size(initial_size, SizingMode::Normal, false, None);
+
+        let target = target_output
+            .as_ref()
+            .map(AddWindowTarget::Output)
+            .unwrap_or(AddWindowTarget::Auto);
+        self.niri.layout.add_window(
+            mirror,
+            target,
+            None,
+            None,
+            false,
+            true,
+            false,
+            ActivateWindow::Smart,
+        );
+        self.niri.queue_redraw_all();
     }
 
     fn active_zoom_output(&self, requested_output: Option<&str>) -> Option<Output> {
@@ -1542,6 +1708,12 @@ impl State {
             }
             Action::CreateWindowMirrorById(id) => {
                 self.create_window_mirror(Some(id));
+            }
+            Action::CreateOutputMirror(output) => {
+                self.create_output_mirror(output);
+            }
+            Action::CreateWorkspaceMirror(workspace) => {
+                self.create_workspace_mirror(workspace);
             }
             Action::SetWindowMirrorZoom(level) => {
                 if self.set_window_mirror_zoom(None, &level) {
@@ -3898,7 +4070,22 @@ impl State {
                 self.niri.tablet_cursor_location = None;
 
                 if let Some(mapped) = self.niri.window_under_cursor() {
-                    let window = mapped.id();
+                    let window = if mapped.is_scene_mirror() {
+                        self.niri
+                            .pointer_contents
+                            .surface
+                            .as_ref()
+                            .map(|(surface, _)| self.niri.find_root_shell_surface(surface))
+                            .and_then(|root| {
+                                self.niri
+                                    .layout
+                                    .find_window_and_output(&root)
+                                    .map(|(mapped, _)| mapped.id())
+                            })
+                            .unwrap_or_else(|| mapped.id())
+                    } else {
+                        mapped.id()
+                    };
 
                     if !is_overview_open {
                         self.niri.layout.activate_window(&window);

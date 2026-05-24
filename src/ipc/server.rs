@@ -34,7 +34,7 @@ use crate::backend::IpcOutputMap;
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
-use crate::utils::{version, with_toplevel_role};
+use crate::utils::version;
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -612,12 +612,13 @@ fn make_ipc_window(
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
 ) -> niri_ipc::Window {
-    with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
+    niri_ipc::Window {
         id: mapped.id().get(),
         is_mirror: mapped.is_mirror(),
-        source_window_id: mapped.is_mirror().then(|| mapped.source_id().get()),
-        title: role.title.clone(),
-        app_id: role.app_id.clone(),
+        source_window_id: mapped.mirror_source_window_id(),
+        mirror_source: mapped.ipc_mirror_source(),
+        title: mapped.title(),
+        app_id: mapped.app_id(),
         pid: mapped.credentials().map(|c| c.pid),
         workspace_id: workspace_id.map(|id| id.get()),
         is_focused: mapped.is_focused(),
@@ -627,7 +628,7 @@ fn make_ipc_window(
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
-    })
+    }
 }
 
 fn diff_block_out_events(
@@ -931,9 +932,7 @@ impl State {
                 || ipc_win.is_sticky != mapped.is_sticky()
                 || ipc_win.is_block_out != mapped.is_block_out();
 
-            changed |= with_toplevel_role(mapped.toplevel(), |role| {
-                ipc_win.title != role.title || ipc_win.app_id != role.app_id
-            });
+            changed |= ipc_win.title != mapped.title() || ipc_win.app_id != mapped.app_id();
 
             if changed {
                 let window = make_ipc_window(mapped, ws_id, window_layout);

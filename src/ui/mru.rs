@@ -42,7 +42,6 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
-    with_toplevel_role,
 };
 use crate::window::mapped::MappedId;
 use crate::window::Mapped;
@@ -236,7 +235,7 @@ struct Thumbnail {
 
 impl Thumbnail {
     fn from_mapped(mapped: &Mapped, clock: Clock, config: niri_config::MruPreviews) -> Self {
-        let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+        let app_id = mapped.app_id();
 
         let background = FocusRing::new(niri_config::FocusRing {
             off: false,
@@ -333,11 +332,10 @@ impl Thumbnail {
         mapped: &Mapped,
         scale: f64,
     ) -> Option<MruTexture> {
-        with_toplevel_role(mapped.toplevel(), |role| {
-            role.title
-                .as_ref()
-                .and_then(|title| self.title_texture.borrow_mut().get(renderer, title, scale))
-        })
+        mapped
+            .title()
+            .as_ref()
+            .and_then(|title| self.title_texture.borrow_mut().get(renderer, title, scale))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -434,6 +432,10 @@ impl Thumbnail {
             }
             LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
                 let elem = LayoutElementRenderElement::MirrorScaledClippedWayland(elem);
+                ThumbnailRenderElement::LayoutElement(elem)
+            }
+            LayoutElementRenderElement::Texture(elem) => {
+                let elem = LayoutElementRenderElement::Texture(elem);
                 ThumbnailRenderElement::LayoutElement(elem)
             }
             LayoutElementRenderElement::SolidColor(elem) => {

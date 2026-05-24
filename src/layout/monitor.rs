@@ -1745,6 +1745,20 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    pub fn window_under_in_workspace_at_origin(
+        &self,
+        workspace_id: WorkspaceId,
+        pos_within_workspace: Point<f64, Logical>,
+    ) -> Option<(&W, HitType)> {
+        let workspace = self.workspaces.iter().find(|ws| ws.id() == workspace_id)?;
+
+        if let Some((win, hit)) = self.sticky.window_under(pos_within_workspace) {
+            return Some((win, hit));
+        }
+
+        workspace.window_under(pos_within_workspace)
+    }
+
     pub fn resize_edges_under(&self, pos_within_output: Point<f64, Logical>) -> Option<ResizeEdge> {
         if self.overview_progress.is_some() {
             return None;

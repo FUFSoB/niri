@@ -402,6 +402,7 @@ fn first_surface_geometry(
             LayoutElementRenderElement::MirrorScaledClippedWayland(elem) => {
                 Some(elem.geometry(scale))
             }
+            LayoutElementRenderElement::Texture(elem) => Some(elem.geometry(scale)),
             LayoutElementRenderElement::SolidColor(_) => None,
             LayoutElementRenderElement::BackgroundEffect(_) => None,
         })
@@ -421,7 +422,10 @@ fn mirror_output_content_rect(
         .find(|(_, mapped)| mapped.id() == id)
         .map(|(_, mapped)| mapped)
         .unwrap();
-    let source_geometry = mapped.window.geometry().to_f64();
+    let source_geometry = mapped
+        .window()
+        .map(|window| window.geometry().to_f64())
+        .unwrap_or_else(|| smithay::utils::Rectangle::from_size(mapped.size().to_f64()));
     let (loc, content_scale) = mapped.mirror_content_transform();
     smithay::utils::Rectangle::new(loc, source_geometry.size.upscale(content_scale))
         .to_physical_precise_round(scale)
@@ -1437,7 +1441,10 @@ fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
             .map(|(_, mapped)| mapped)
             .unwrap();
         let (content_loc, content_scale) = mapped.mirror_content_transform();
-        let source_geometry = mapped.window.geometry().to_f64();
+        let source_geometry = mapped
+            .window()
+            .map(|window| window.geometry().to_f64())
+            .unwrap_or_else(|| smithay::utils::Rectangle::from_size(mapped.size().to_f64()));
         let content_rect = smithay::utils::Rectangle::new(
             window_render_loc + content_loc.to_i32_round(),
             source_geometry.size.upscale(content_scale).to_i32_round(),

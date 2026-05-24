@@ -253,7 +253,7 @@ impl InputMethodHandler for State {
         self.niri
             .layout
             .find_window_and_output(parent)
-            .map(|(mapped, _)| mapped.window.geometry())
+            .and_then(|(mapped, _)| mapped.window().map(|window| window.geometry()))
             .unwrap_or_default()
     }
 }

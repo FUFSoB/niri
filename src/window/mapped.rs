@@ -30,11 +30,13 @@ use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,
 };
+use crate::layout::workspace::WorkspaceId;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -42,7 +44,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
 };
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
 use crate::utils::id::IdCounter;
@@ -55,7 +57,7 @@ use crate::utils::{
 
 #[derive(Debug)]
 pub struct Mapped {
-    pub window: Window,
+    window: Option<Window>,
 
     /// Unique ID of this `Mapped`.
     id: MappedId,
@@ -65,6 +67,9 @@ pub struct Mapped {
 
     /// Whether this mapped entry is only a mirror of another entry.
     is_mirror: bool,
+
+    /// Source entity mirrored by this entry.
+    mirror_source: MirrorSource,
 
     /// Current visual size for mirror entries.
     mirror_size: Size<i32, Logical>,
@@ -231,6 +236,9 @@ pub struct Mapped {
 
     /// Most recent monotonic time when the window had the focus.
     focus_timestamp: Option<Duration>,
+
+    /// Runtime state for compositor-owned scene mirrors.
+    scene_mirror: Option<RefCell<SceneMirrorState>>,
 }
 
 niri_render_elements! {
@@ -272,6 +280,26 @@ impl MappedId {
     pub fn to_protocol_identifier(self) -> String {
         format!("{}", self.0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MirrorSource {
+    Window(MappedId),
+    Workspace(WorkspaceId),
+    Output(String),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSceneMirror {
+    buffer: TextureBuffer<GlesTexture>,
+    source_geometry: Rectangle<f64, Logical>,
+}
+
+#[derive(Debug)]
+struct SceneMirrorState {
+    title: String,
+    source_geometry: Rectangle<f64, Logical>,
+    prepared: [Option<PreparedSceneMirror>; RenderTarget::COUNT],
 }
 
 #[derive(Default)]
@@ -418,10 +446,11 @@ impl Mapped {
         let credentials = get_credentials_for_surface(&surface);
         let id = MappedId::next();
         let mut rv = Self {
-            window,
+            window: Some(window),
             id,
             source_id: id,
             is_mirror: false,
+            mirror_source: MirrorSource::Window(id),
             mirror_size: Size::from((1, 1)),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
@@ -461,6 +490,7 @@ impl Mapped {
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
+            scene_mirror: None,
         };
 
         rv.is_maximized = rv.sizing_mode().is_maximized();
@@ -470,6 +500,65 @@ impl Mapped {
     }
 
     pub fn new_mirror(source: &Mapped) -> Self {
+        if source.is_scene_mirror() {
+            let id = MappedId::next();
+            let title = source.scene_title().unwrap_or_else(|| String::from("Mirror"));
+            let source_geometry = source
+                .scene_source_geometry()
+                .unwrap_or_else(|| Rectangle::from_size(source.size().to_f64()));
+            return Self {
+                window: None,
+                id,
+                source_id: id,
+                is_mirror: true,
+                mirror_source: source.mirror_source.clone(),
+                mirror_size: source.size(),
+                mirror_sizing_mode: SizingMode::Normal,
+                mirror_pending_sizing_mode: SizingMode::Normal,
+                mirror_view: source.mirror_view,
+                credentials: None,
+                pre_commit_hook: None,
+                rules: source.rules.clone(),
+                need_to_recompute_rules: false,
+                needs_configure: false,
+                needs_frame_callback: false,
+                offscreen_data: RefCell::new(None),
+                is_urgent: false,
+                is_focused: false,
+                is_activated: false,
+                is_active_in_column: true,
+                is_floating: source.is_floating,
+                is_sticky: false,
+                is_window_cast_target: false,
+                is_screen_cast_target: false,
+                ignore_opacity_window_rule: source.ignore_opacity_window_rule,
+                invert_cursor_capture_window_rule: source.invert_cursor_capture_window_rule,
+                invert_block_out_window_rule: source.invert_block_out_window_rule,
+                block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
+                blur_config: source.blur_config,
+                animate_next_configure: false,
+                animate_serials: Vec::new(),
+                animation_snapshot: None,
+                request_size_once: None,
+                transaction_for_next_configure: None,
+                pending_transactions: Vec::new(),
+                interactive_resize: None,
+                last_interactive_resize_start: Cell::new(None),
+                is_windowed_fullscreen: false,
+                is_pending_windowed_fullscreen: false,
+                uncommitted_windowed_fullscreen: Vec::new(),
+                is_maximized: false,
+                is_pending_maximized: false,
+                uncommitted_maximized: Vec::new(),
+                focus_timestamp: None,
+                scene_mirror: Some(RefCell::new(SceneMirrorState {
+                    title,
+                    source_geometry,
+                    prepared: std::array::from_fn(|_| None),
+                })),
+            };
+        }
+
         let id = MappedId::next();
         let mut rules = source.rules.clone();
         rules.clip_to_geometry = Some(true);
@@ -481,6 +570,7 @@ impl Mapped {
             id,
             source_id: source.source_id,
             is_mirror: true,
+            mirror_source: source.mirror_source.clone(),
             mirror_size: source.size(),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
@@ -520,15 +610,223 @@ impl Mapped {
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
+            scene_mirror: None,
+        }
+    }
+
+    pub fn new_output_mirror(
+        output_name: String,
+        title: String,
+        source_geometry: Rectangle<f64, Logical>,
+        config: &Config,
+    ) -> Self {
+        Self::new_scene_mirror(MirrorSource::Output(output_name), title, source_geometry, config)
+    }
+
+    pub fn new_workspace_mirror(
+        workspace_id: WorkspaceId,
+        title: String,
+        source_geometry: Rectangle<f64, Logical>,
+        config: &Config,
+    ) -> Self {
+        Self::new_scene_mirror(
+            MirrorSource::Workspace(workspace_id),
+            title,
+            source_geometry,
+            config,
+        )
+    }
+
+    fn new_scene_mirror(
+        mirror_source: MirrorSource,
+        title: String,
+        source_geometry: Rectangle<f64, Logical>,
+        config: &Config,
+    ) -> Self {
+        let id = MappedId::next();
+        let mut rules = ResolvedWindowRules::default();
+        rules.clip_to_geometry = Some(true);
+        rules.draw_border_with_background = Some(false);
+
+        Self {
+            window: None,
+            id,
+            source_id: id,
+            is_mirror: true,
+            mirror_source,
+            mirror_size: source_geometry.size.to_i32_round(),
+            mirror_sizing_mode: SizingMode::Normal,
+            mirror_pending_sizing_mode: SizingMode::Normal,
+            mirror_view: MirrorViewState::default(),
+            credentials: None,
+            pre_commit_hook: None,
+            rules,
+            need_to_recompute_rules: false,
+            needs_configure: false,
+            needs_frame_callback: false,
+            offscreen_data: RefCell::new(None),
+            is_urgent: false,
+            is_focused: false,
+            is_activated: false,
+            is_active_in_column: true,
+            is_floating: false,
+            is_sticky: false,
+            is_window_cast_target: false,
+            is_screen_cast_target: false,
+            ignore_opacity_window_rule: false,
+            invert_cursor_capture_window_rule: false,
+            invert_block_out_window_rule: false,
+            block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
+            blur_config: config.blur,
+            animate_next_configure: false,
+            animate_serials: Vec::new(),
+            animation_snapshot: None,
+            request_size_once: None,
+            transaction_for_next_configure: None,
+            pending_transactions: Vec::new(),
+            interactive_resize: None,
+            last_interactive_resize_start: Cell::new(None),
+            is_windowed_fullscreen: false,
+            is_pending_windowed_fullscreen: false,
+            uncommitted_windowed_fullscreen: Vec::new(),
+            is_maximized: false,
+            is_pending_maximized: false,
+            uncommitted_maximized: Vec::new(),
+            focus_timestamp: None,
+            scene_mirror: Some(RefCell::new(SceneMirrorState {
+                title,
+                source_geometry,
+                prepared: std::array::from_fn(|_| None),
+            })),
         }
     }
 
     pub fn toplevel(&self) -> &ToplevelSurface {
-        self.window.toplevel().expect("no X11 support")
+        self.window
+            .as_ref()
+            .and_then(Window::toplevel)
+            .expect("scene mirrors do not have a toplevel surface")
+    }
+
+    pub fn window(&self) -> Option<&Window> {
+        self.window.as_ref()
+    }
+
+    pub fn is_scene_mirror(&self) -> bool {
+        self.is_mirror && self.window.is_none()
+    }
+
+    pub fn mirror_source(&self) -> &MirrorSource {
+        &self.mirror_source
+    }
+
+    pub fn scene_title(&self) -> Option<String> {
+        self.scene_mirror
+            .as_ref()
+            .map(|state| state.borrow().title.clone())
+    }
+
+    pub fn title(&self) -> Option<String> {
+        if self.is_scene_mirror() {
+            return self.scene_title();
+        }
+
+        with_toplevel_role(self.toplevel(), |role| role.title.clone())
+    }
+
+    pub fn app_id(&self) -> Option<String> {
+        if self.is_scene_mirror() {
+            return None;
+        }
+
+        with_toplevel_role(self.toplevel(), |role| role.app_id.clone())
+    }
+
+    pub fn mirror_source_window_id(&self) -> Option<u64> {
+        match self.mirror_source {
+            MirrorSource::Window(id) => Some(id.get()),
+            MirrorSource::Workspace(_) | MirrorSource::Output(_) => None,
+        }
+    }
+
+    pub fn ipc_mirror_source(&self) -> Option<niri_ipc::MirrorSource> {
+        self.is_mirror.then(|| match &self.mirror_source {
+            MirrorSource::Window(id) => niri_ipc::MirrorSource::Window { id: id.get() },
+            MirrorSource::Workspace(id) => niri_ipc::MirrorSource::Workspace { id: id.get() },
+            MirrorSource::Output(name) => niri_ipc::MirrorSource::Output { name: name.clone() },
+        })
+    }
+
+    pub fn set_scene_title(&self, title: String) {
+        let Some(state) = &self.scene_mirror else {
+            return;
+        };
+        state.borrow_mut().title = title;
+    }
+
+    pub fn scene_source_geometry(&self) -> Option<Rectangle<f64, Logical>> {
+        self.scene_mirror
+            .as_ref()
+            .map(|state| state.borrow().source_geometry)
+    }
+
+    pub fn set_scene_source_geometry(&self, source_geometry: Rectangle<f64, Logical>) {
+        let Some(state) = &self.scene_mirror else {
+            return;
+        };
+
+        let mut state = state.borrow_mut();
+        if state.source_geometry != source_geometry {
+            state.source_geometry = source_geometry;
+            for prepared in &mut state.prepared {
+                *prepared = None;
+            }
+        }
+    }
+
+    pub fn set_scene_prepared_texture(
+        &self,
+        target: RenderTarget,
+        buffer: TextureBuffer<GlesTexture>,
+        source_geometry: Rectangle<f64, Logical>,
+    ) {
+        let Some(state) = &self.scene_mirror else {
+            return;
+        };
+
+        let idx = target as usize;
+        let mut state = state.borrow_mut();
+        state.source_geometry = source_geometry;
+        state.prepared[idx] = Some(PreparedSceneMirror {
+            buffer,
+            source_geometry,
+        });
+    }
+
+    pub fn clear_scene_prepared_texture(&self, target: RenderTarget) {
+        let Some(state) = &self.scene_mirror else {
+            return;
+        };
+
+        state.borrow_mut().prepared[target as usize] = None;
+    }
+
+    fn prepared_scene_texture(
+        &self,
+        target: RenderTarget,
+    ) -> Option<PreparedSceneMirror> {
+        self.scene_mirror
+            .as_ref()
+            .and_then(|state| state.borrow().prepared[target as usize].clone())
     }
 
     /// Recomputes the resolved window rules and returns whether they changed.
     pub fn recompute_window_rules(&mut self, rules: &[WindowRule], is_at_startup: bool) -> bool {
+        if self.is_scene_mirror() {
+            self.need_to_recompute_rules = false;
+            return false;
+        }
+
         self.need_to_recompute_rules = false;
 
         let mut new_rules =
@@ -592,7 +890,18 @@ impl Mapped {
     }
 
     fn mirror_source_geometry(&self) -> Rectangle<f64, Logical> {
-        let mut source_geometry = self.window.geometry().to_f64();
+        if let Some(source_geometry) = self.scene_source_geometry() {
+            let mut source_geometry = source_geometry;
+            source_geometry.size.w = source_geometry.size.w.max(1.);
+            source_geometry.size.h = source_geometry.size.h.max(1.);
+            return source_geometry;
+        }
+
+        let mut source_geometry = self
+            .window()
+            .expect("non-scene mirrors must have a source window")
+            .geometry()
+            .to_f64();
         source_geometry.size.w = source_geometry.size.w.max(1.);
         source_geometry.size.h = source_geometry.size.h.max(1.);
         source_geometry
@@ -765,6 +1074,28 @@ impl Mapped {
         }
 
         let layout = self.mirror_render_layout(location, mirror_size, scale);
+        if self.is_scene_mirror() {
+            let Some(prepared) = self.prepared_scene_texture(ctx.target) else {
+                return;
+            };
+
+            let src_loc = (layout.transform.visible_rect.loc - layout.transform.content_rect.loc)
+                .downscale(layout.transform.scale)
+                + prepared.source_geometry.loc;
+            let src_size = layout.transform.visible_rect.size.downscale(layout.transform.scale);
+            let src = Rectangle::new(src_loc, src_size);
+            let elem = TextureRenderElement::from_texture_buffer(
+                prepared.buffer,
+                location + layout.transform.visible_rect.loc,
+                alpha,
+                Some(src),
+                Some(layout.transform.visible_rect.size),
+                Kind::Unspecified,
+            );
+            push(PrimaryGpuTextureRenderElement(elem).into());
+            return;
+        }
+
         let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
         let clip_geo = Rectangle::new(layout.visible_loc, layout.transform.visible_rect.size);
         let clip_radius = self
@@ -1142,12 +1473,24 @@ impl Mapped {
             dst: None,
         }];
 
-        let buf_pos = self.window.geometry().loc.upscale(-1).to_f64();
-
         let mut contents = vec![];
 
-        let surface = self.toplevel().wl_surface();
-        if self.is_mirror {
+        if self.is_scene_mirror() {
+            if let Some(prepared) = self.prepared_scene_texture(RenderTarget::Output) {
+                let transform = self.mirror_transform();
+                let src_loc = (transform.visible_rect.loc - transform.content_rect.loc)
+                    .downscale(transform.scale)
+                    + prepared.source_geometry.loc;
+                let src_size = transform.visible_rect.size.downscale(transform.scale);
+                contents.push(BakedBuffer {
+                    buffer: prepared.buffer,
+                    location: transform.visible_rect.loc,
+                    src: Some(Rectangle::new(src_loc, src_size)),
+                    dst: Some(transform.visible_rect.size.to_i32_round()),
+                });
+            }
+        } else if self.is_mirror {
+            let surface = self.toplevel().wl_surface();
             render_snapshot_from_surface_tree(renderer, surface, Point::default(), &mut contents);
 
             let transform = self.mirror_transform();
@@ -1162,6 +1505,14 @@ impl Mapped {
             }
             contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, transform.visible_rect));
         } else {
+            let buf_pos = self
+                .window()
+                .expect("real windows must have a backing window")
+                .geometry()
+                .loc
+                .upscale(-1)
+                .to_f64();
+            let surface = self.toplevel().wl_surface();
             render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
         }
 
@@ -1252,7 +1603,12 @@ impl Mapped {
         let location = if self.is_mirror {
             Point::default()
         } else {
-            self.window.geometry().loc.to_f64() - bbox.loc.to_f64().to_logical(scale)
+            self.window()
+                .expect("real windows must have a backing window")
+                .geometry()
+                .loc
+                .to_f64()
+                - bbox.loc.to_f64().to_logical(scale)
         };
 
         let use_border = |elem| {
@@ -1304,7 +1660,10 @@ impl Mapped {
         if self.is_mirror {
             Rectangle::from_size(self.size()).to_physical_precise_up(scale)
         } else {
-            self.window.bbox_with_popups().to_physical_precise_up(scale)
+            self.window()
+                .expect("real windows must have a backing window")
+                .bbox_with_popups()
+                .to_physical_precise_up(scale)
         }
     }
 
@@ -1339,6 +1698,11 @@ impl Mapped {
         T: Into<Duration>,
         F: FnMut(&WlSurface, &SurfaceData) -> Option<Output> + Copy,
     {
+        if self.is_scene_mirror() {
+            self.needs_frame_callback = false;
+            return;
+        }
+
         let needs_frame_callback = self.needs_frame_callback;
         self.needs_frame_callback = false;
 
@@ -1351,7 +1715,9 @@ impl Mapped {
             // Send unconditionally to all surfaces if the window needs a surface callback.
             needs_frame_callback.then(|| output.clone())
         };
-        self.window.send_frame(output, time, throttle, should_send);
+        self.window()
+            .expect("real windows must have a backing window")
+            .send_frame(output, time, throttle, should_send);
     }
 
     pub fn update_tiled_state(&self, prefer_no_csd: bool) {
@@ -1384,7 +1750,7 @@ impl Mapped {
 
 impl Drop for Mapped {
     fn drop(&mut self) {
-        if self.is_activated {
+        if self.is_activated && !self.is_scene_mirror() {
             let surface = self.toplevel().wl_surface();
             if surface.is_alive() {
                 let any_active = update_surface_activated_entries(surface, self.id, false);
@@ -1420,7 +1786,10 @@ impl LayoutElement for Mapped {
             return self.mirror_size;
         }
 
-        self.window.geometry().size
+        self.window()
+            .expect("real windows must have a backing window")
+            .geometry()
+            .size
     }
 
     fn buf_loc(&self) -> Point<i32, Logical> {
@@ -1431,7 +1800,12 @@ impl LayoutElement for Mapped {
             .to_i32_round();
         }
 
-        Point::from((0, 0)) - self.window.geometry().loc
+        Point::from((0, 0))
+            - self
+                .window()
+                .expect("real windows must have a backing window")
+                .geometry()
+                .loc
     }
 
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
@@ -1439,11 +1813,23 @@ impl LayoutElement for Mapped {
             let Some(point) = self.mirror_point_to_source(point) else {
                 return false;
             };
-            return self.window.is_in_input_region(&point);
+            return self.is_scene_mirror()
+                || self
+                    .window()
+                    .expect("window mirrors must have a backing window")
+                    .is_in_input_region(&point);
         }
 
-        let surface_local = point + self.window.geometry().loc.to_f64();
-        self.window.is_in_input_region(&surface_local)
+        let surface_local = point
+            + self
+                .window()
+                .expect("real windows must have a backing window")
+                .geometry()
+                .loc
+                .to_f64();
+        self.window()
+            .expect("real windows must have a backing window")
+            .is_in_input_region(&surface_local)
     }
 
     fn render_normal_with_size<R: NiriRenderer>(
@@ -1478,12 +1864,24 @@ impl LayoutElement for Mapped {
 
         if ctx.should_block_out(self.effective_block_out_from()) {
             let mut buffer = self.block_out_buffer.borrow_mut();
-            buffer.resize(self.window.geometry().size.to_f64());
+            buffer.resize(
+                self.window()
+                    .expect("real windows must have a backing window")
+                    .geometry()
+                    .size
+                    .to_f64(),
+            );
             let elem =
                 SolidColorRenderElement::from_buffer(&buffer, location, alpha, Kind::Unspecified);
             push(elem.into());
         } else {
-            let buf_pos = location - self.window.geometry().loc.to_f64();
+            let buf_pos = location
+                - self
+                    .window()
+                    .expect("real windows must have a backing window")
+                    .geometry()
+                    .loc
+                    .to_f64();
             let surface = self.toplevel().wl_surface();
             let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
             push_elements_from_surface_tree(
@@ -1508,6 +1906,10 @@ impl LayoutElement for Mapped {
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
         if ctx.should_block_out(self.effective_block_out_from()) {
+            return;
+        }
+
+        if self.is_scene_mirror() {
             return;
         }
 
@@ -1647,6 +2049,10 @@ impl LayoutElement for Mapped {
     ) {
         let should_block_out = ctx.should_block_out(self.effective_block_out_from());
         if should_block_out {
+            return;
+        }
+
+        if self.is_scene_mirror() {
             return;
         }
 
@@ -1880,12 +2286,18 @@ impl LayoutElement for Mapped {
             return;
         }
 
-        self.window.with_surfaces(|surface, data| {
+        self.window()
+            .expect("real windows must have a backing window")
+            .with_surfaces(|surface, data| {
             send_scale_transform(surface, data, scale, transform);
-        });
+            });
     }
 
     fn has_ssd(&self) -> bool {
+        if self.is_scene_mirror() {
+            return false;
+        }
+
         let toplevel = self.toplevel();
         let mode = self
             .toplevel()
@@ -1912,7 +2324,9 @@ impl LayoutElement for Mapped {
         }
 
         let overlap = Rectangle::from_size(Size::from((i32::MAX, i32::MAX)));
-        self.window.output_enter(output, overlap)
+        self.window()
+            .expect("real windows must have a backing window")
+            .output_enter(output, overlap)
     }
 
     fn output_leave(&self, output: &Output) {
@@ -1921,7 +2335,9 @@ impl LayoutElement for Mapped {
             return;
         }
 
-        self.window.output_leave(output)
+        self.window()
+            .expect("real windows must have a backing window")
+            .output_leave(output)
     }
 
     fn set_offscreen_data(&self, data: Option<OffscreenData>) {
@@ -1954,6 +2370,11 @@ impl LayoutElement for Mapped {
         }
 
         self.is_activated = active;
+
+        if self.is_scene_mirror() {
+            self.need_to_recompute_rules = true;
+            return;
+        }
 
         let surface = self.toplevel().wl_surface();
         let any_active = update_surface_activated_entries(surface, self.id, active);
@@ -2093,7 +2514,11 @@ impl LayoutElement for Mapped {
         if has_pending_changes {
             // If needed, replace the pending size with the current window size.
             if let Some(RequestSizeOnce::UseWindowSize) = self.request_size_once {
-                let size = self.window.geometry().size;
+                let size = self
+                    .window()
+                    .expect("real windows must have a backing window")
+                    .geometry()
+                    .size;
                 toplevel.with_pending_state(|state| {
                     state.size = Some(size);
                 });
@@ -2246,7 +2671,12 @@ impl LayoutElement for Mapped {
         }
 
         // We can only use current size if it's not maximized or fullscreen.
-        let current_size = (self.sizing_mode().is_normal()).then(|| self.window.geometry().size);
+        let current_size = (self.sizing_mode().is_normal()).then(|| {
+            self.window()
+                .expect("real windows must have a backing window")
+                .geometry()
+                .size
+        });
 
         // Check if we should be using the current window size.
         //
@@ -2400,7 +2830,9 @@ impl LayoutElement for Mapped {
             return;
         }
 
-        self.window.refresh();
+        self.window()
+            .expect("real windows must have a backing window")
+            .refresh();
     }
 
     fn rules(&self) -> &ResolvedWindowRules {

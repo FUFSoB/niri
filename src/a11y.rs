@@ -11,7 +11,6 @@ use niri_config::MruScope;
 
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::{KeyboardFocus, Niri, State};
-use crate::utils::with_toplevel_role;
 use crate::window::mapped::MappedId;
 
 const ID_ROOT: NodeId = NodeId(0);
@@ -194,18 +193,16 @@ impl Niri {
             if update_mru_selection {
                 if let Some(id) = self.a11y.mru_selection {
                     if let Some((_, mapped)) = self.layout.windows().find(|(_, m)| m.id() == id) {
-                        with_toplevel_role(mapped.toplevel(), |role| {
-                            let mut title = role.title.as_deref().unwrap_or("Unknown").to_owned();
-                            // Change title on match to ensure we announce same-titled windows.
-                            if self.a11y.last_mru_title == title {
-                                title.push(' ');
-                            }
-                            self.a11y.last_mru_title = title;
+                        let mut title = mapped.title().unwrap_or_else(|| String::from("Unknown"));
+                        // Change title on match to ensure we announce same-titled windows.
+                        if self.a11y.last_mru_title == title {
+                            title.push(' ');
+                        }
+                        self.a11y.last_mru_title = title;
 
-                            let mut mru = Node::new(Role::Button);
-                            mru.set_label(&*self.a11y.last_mru_title);
-                            nodes.push((ID_MRU, mru));
-                        });
+                        let mut mru = Node::new(Role::Button);
+                        mru.set_label(&*self.a11y.last_mru_title);
+                        nodes.push((ID_MRU, mru));
                     }
                 } else {
                     let mut mru = Node::new(Role::Group);

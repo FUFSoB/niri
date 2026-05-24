@@ -263,7 +263,10 @@ impl CompositorHandler for State {
 
             // This is a commit of a previously-mapped root or a non-toplevel root.
             if let Some((mapped, output)) = self.niri.layout.find_window_and_output(surface) {
-                let window = mapped.window.clone();
+                let window = mapped
+                    .window()
+                    .cloned()
+                    .expect("surface commits must belong to real windows");
                 let output = output.cloned();
 
                 let id = mapped.id();
@@ -392,7 +395,10 @@ impl CompositorHandler for State {
         // This is a commit of a non-root or a non-toplevel root.
         let root_window_output = self.niri.layout.find_window_and_output(&root_surface);
         if let Some((mapped, output)) = root_window_output {
-            let window = mapped.window.clone();
+            let window = mapped
+                .window()
+                .cloned()
+                .expect("surface commits must belong to real windows");
             let id = mapped.id();
             let output = output.cloned();
             let instances = self.niri.mapped_instances_for_source(id);
