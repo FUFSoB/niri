@@ -418,6 +418,15 @@ pub enum Action {
     ToggleBlockOutWindow,
     #[knuffel(skip)]
     ToggleBlockOutWindowById(u64),
+    LockWindowMirror,
+    #[knuffel(skip)]
+    LockWindowMirrorById(u64),
+    UnlockWindowMirror,
+    #[knuffel(skip)]
+    UnlockWindowMirrorById(u64),
+    ToggleWindowMirrorLock,
+    #[knuffel(skip)]
+    ToggleWindowMirrorLockById(u64),
     ToggleBlockOut,
     SetDynamicCastWindow,
     #[knuffel(skip)]
@@ -840,6 +849,16 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleBlockOutWindow { id: None } => Self::ToggleBlockOutWindow,
             niri_ipc::Action::ToggleBlockOutWindow { id: Some(id) } => {
                 Self::ToggleBlockOutWindowById(id)
+            }
+            niri_ipc::Action::LockWindowMirror { id: None } => Self::LockWindowMirror,
+            niri_ipc::Action::LockWindowMirror { id: Some(id) } => Self::LockWindowMirrorById(id),
+            niri_ipc::Action::UnlockWindowMirror { id: None } => Self::UnlockWindowMirror,
+            niri_ipc::Action::UnlockWindowMirror { id: Some(id) } => {
+                Self::UnlockWindowMirrorById(id)
+            }
+            niri_ipc::Action::ToggleWindowMirrorLock { id: None } => Self::ToggleWindowMirrorLock,
+            niri_ipc::Action::ToggleWindowMirrorLock { id: Some(id) } => {
+                Self::ToggleWindowMirrorLockById(id)
             }
             niri_ipc::Action::ToggleBlockOut {} => Self::ToggleBlockOut,
             niri_ipc::Action::SetDynamicCastWindow { id: None } => Self::SetDynamicCastWindow,

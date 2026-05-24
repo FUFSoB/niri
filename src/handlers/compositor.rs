@@ -21,7 +21,7 @@ use smithay::{delegate_compositor, delegate_shm};
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
-use crate::niri::{CastTarget, ClientState, LockState, State};
+use crate::niri::{CastTarget, ClientState, LockState, MirrorSpawnTarget, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
@@ -162,7 +162,7 @@ impl CompositorHandler for State {
                     let activate = activate.unwrap_or_else(|| {
                         // Check the token timestamp again in case the window took a while between
                         // requesting activation and mapping.
-                        let token = activation_token_data.filter(|token| {
+                        let token = activation_token_data.clone().filter(|token| {
                             token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
                         });
                         if token.is_some() {
@@ -192,6 +192,27 @@ impl CompositorHandler for State {
                                 || output.as_ref() == *parent_output
                         })
                         .map(|(mapped, _)| mapped.id());
+
+                    let (output, workspace_id) =
+                        if parent.is_none() && output.is_none() && workspace_id.is_none() {
+                            if let Some(target) = activation_token_data.and_then(|token| {
+                                token.user_data.get::<MirrorSpawnTarget>().cloned()
+                            }) {
+                                let workspace_id = target.workspace_id.filter(|workspace_id| {
+                                    self.niri
+                                        .layout
+                                        .find_workspace_by_id(*workspace_id)
+                                        .is_some()
+                                });
+                                let output =
+                                    self.niri.output_by_name_match(&target.output_name).cloned();
+                                (output, workspace_id)
+                            } else {
+                                (output, workspace_id)
+                            }
+                        } else {
+                            (output, workspace_id)
+                        };
 
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);

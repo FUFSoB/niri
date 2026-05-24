@@ -26,11 +26,11 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
+use crate::layout::workspace::WorkspaceId;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,
 };
-use crate::layout::workspace::WorkspaceId;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
@@ -502,7 +502,9 @@ impl Mapped {
     pub fn new_mirror(source: &Mapped) -> Self {
         if source.is_scene_mirror() {
             let id = MappedId::next();
-            let title = source.scene_title().unwrap_or_else(|| String::from("Mirror"));
+            let title = source
+                .scene_title()
+                .unwrap_or_else(|| String::from("Mirror"));
             let source_geometry = source
                 .scene_source_geometry()
                 .unwrap_or_else(|| Rectangle::from_size(source.size().to_f64()));
@@ -620,7 +622,12 @@ impl Mapped {
         source_geometry: Rectangle<f64, Logical>,
         config: &Config,
     ) -> Self {
-        Self::new_scene_mirror(MirrorSource::Output(output_name), title, source_geometry, config)
+        Self::new_scene_mirror(
+            MirrorSource::Output(output_name),
+            title,
+            source_geometry,
+            config,
+        )
     }
 
     pub fn new_workspace_mirror(
@@ -764,6 +771,23 @@ impl Mapped {
         state.borrow_mut().title = title;
     }
 
+    pub fn set_scene_mirror_source(&mut self, mirror_source: MirrorSource) {
+        if !self.is_scene_mirror() {
+            return;
+        }
+
+        if self.mirror_source == mirror_source {
+            return;
+        }
+
+        self.mirror_source = mirror_source;
+        if let Some(state) = &self.scene_mirror {
+            for prepared in &mut state.borrow_mut().prepared {
+                *prepared = None;
+            }
+        }
+    }
+
     pub fn scene_source_geometry(&self) -> Option<Rectangle<f64, Logical>> {
         self.scene_mirror
             .as_ref()
@@ -811,10 +835,7 @@ impl Mapped {
         state.borrow_mut().prepared[target as usize] = None;
     }
 
-    fn prepared_scene_texture(
-        &self,
-        target: RenderTarget,
-    ) -> Option<PreparedSceneMirror> {
+    fn prepared_scene_texture(&self, target: RenderTarget) -> Option<PreparedSceneMirror> {
         self.scene_mirror
             .as_ref()
             .and_then(|state| state.borrow().prepared[target as usize].clone())
@@ -1082,7 +1103,11 @@ impl Mapped {
             let src_loc = (layout.transform.visible_rect.loc - layout.transform.content_rect.loc)
                 .downscale(layout.transform.scale)
                 + prepared.source_geometry.loc;
-            let src_size = layout.transform.visible_rect.size.downscale(layout.transform.scale);
+            let src_size = layout
+                .transform
+                .visible_rect
+                .size
+                .downscale(layout.transform.scale);
             let src = Rectangle::new(src_loc, src_size);
             let elem = TextureRenderElement::from_texture_buffer(
                 prepared.buffer,
@@ -2289,7 +2314,7 @@ impl LayoutElement for Mapped {
         self.window()
             .expect("real windows must have a backing window")
             .with_surfaces(|surface, data| {
-            send_scale_transform(surface, data, scale, transform);
+                send_scale_transform(surface, data, scale, transform);
             });
     }
 

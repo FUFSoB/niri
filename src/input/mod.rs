@@ -40,6 +40,7 @@ use smithay::utils::{
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
+use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::mirror_click_grab::MirrorClickGrab;
@@ -183,7 +184,10 @@ impl State {
         .clamp(0.0001, 1.);
 
         source_size = source_size.upscale(scale);
-        Size::from((source_size.w.max(1.).round() as i32, source_size.h.max(1.).round() as i32))
+        Size::from((
+            source_size.w.max(1.).round() as i32,
+            source_size.h.max(1.).round() as i32,
+        ))
     }
 
     fn create_output_mirror(&mut self, requested_output: Option<String>) {
@@ -211,7 +215,8 @@ impl State {
             source_geometry,
             &self.niri.config.borrow(),
         );
-        let initial_size = self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
+        let initial_size =
+            self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
         mirror.request_size(initial_size, SizingMode::Normal, false, None);
 
         let target = target_output
@@ -270,9 +275,17 @@ impl State {
                 .niri
                 .layout
                 .workspaces()
-                .find(|(_, _, ws)| ws.name().is_some_and(|ws_name| ws_name.eq_ignore_ascii_case(&name)))
+                .find(|(_, _, ws)| {
+                    ws.name()
+                        .is_some_and(|ws_name| ws_name.eq_ignore_ascii_case(&name))
+                })
                 .and_then(|(_, idx, ws)| {
-                    Some((ws.current_output()?.clone(), ws.id(), ws.name().cloned(), idx))
+                    Some((
+                        ws.current_output()?.clone(),
+                        ws.id(),
+                        ws.name().cloned(),
+                        idx,
+                    ))
                 }),
             Some(WorkspaceReference::Id(id)) => self
                 .niri
@@ -280,7 +293,12 @@ impl State {
                 .workspaces()
                 .find(|(_, _, ws)| ws.id().get() == id)
                 .and_then(|(_, idx, ws)| {
-                    Some((ws.current_output()?.clone(), ws.id(), ws.name().cloned(), idx))
+                    Some((
+                        ws.current_output()?.clone(),
+                        ws.id(),
+                        ws.name().cloned(),
+                        idx,
+                    ))
                 }),
         };
         let Some((source_output, workspace_id, workspace_name, workspace_idx)) = source else {
@@ -294,7 +312,8 @@ impl State {
             .cloned()
             .or_else(|| Some(source_output.clone()));
         let source_geometry = Rectangle::from_size(output_size(&source_output));
-        let workspace_display_name = workspace_name.unwrap_or_else(|| format!("{}", workspace_idx + 1));
+        let workspace_display_name =
+            workspace_name.unwrap_or_else(|| format!("{}", workspace_idx + 1));
         let title = format!(
             "Mirror: Workspace {} on {}",
             workspace_display_name,
@@ -307,7 +326,8 @@ impl State {
             source_geometry,
             &self.niri.config.borrow(),
         );
-        let initial_size = self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
+        let initial_size =
+            self.scene_mirror_initial_size(source_geometry.size, target_output.as_ref());
         mirror.request_size(initial_size, SizingMode::Normal, false, None);
 
         let target = target_output
@@ -377,6 +397,44 @@ impl State {
                 .layout
                 .focus()
                 .and_then(|mapped| mapped.is_mirror().then(|| mapped.id())),
+        }
+    }
+
+    fn target_scene_mirror_window_for_lock_change(
+        &self,
+        id: Option<u64>,
+        prefer_lock_owner: bool,
+    ) -> Option<crate::window::mapped::MappedId> {
+        match id {
+            Some(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id().get() == id && mapped.is_scene_mirror())
+                .map(|(_, mapped)| mapped.id()),
+            None => {
+                if prefer_lock_owner {
+                    if let Some(owner_mirror_id) = self
+                        .niri
+                        .scene_mirror_lock
+                        .as_ref()
+                        .map(|lock| lock.owner_mirror_id)
+                        .filter(|id| self.niri.is_scene_mirror_window(*id))
+                    {
+                        return Some(owner_mirror_id);
+                    }
+                }
+
+                self.niri
+                    .last_interacted_scene_mirror
+                    .filter(|id| self.niri.is_scene_mirror_window(*id))
+                    .or_else(|| {
+                        self.niri
+                            .layout
+                            .focus()
+                            .and_then(|mapped| mapped.is_scene_mirror().then(|| mapped.id()))
+                    })
+            }
         }
     }
 
@@ -476,13 +534,167 @@ impl State {
         Some((window, mirror_local, source_point, mapped.mirror_zoom()))
     }
 
+    fn lock_window_mirror(&mut self, id: Option<u64>) -> bool {
+        let Some(window) = self.target_scene_mirror_window_for_lock_change(id, false) else {
+            return false;
+        };
+
+        self.set_scene_mirror_lock(window);
+        true
+    }
+
+    fn unlock_window_mirror(&mut self, id: Option<u64>) -> bool {
+        let Some(window) = self.target_scene_mirror_window_for_lock_change(id, true) else {
+            return false;
+        };
+        if self
+            .niri
+            .scene_mirror_lock
+            .as_ref()
+            .is_none_or(|lock| lock.owner_mirror_id != window)
+        {
+            return false;
+        }
+
+        self.clear_scene_mirror_lock(Some(window));
+        true
+    }
+
+    fn toggle_window_mirror_lock(&mut self, id: Option<u64>) -> bool {
+        let Some(window) = self.target_scene_mirror_window_for_lock_change(id, true) else {
+            return false;
+        };
+
+        if self
+            .niri
+            .scene_mirror_lock
+            .as_ref()
+            .is_some_and(|lock| lock.owner_mirror_id == window)
+        {
+            self.clear_scene_mirror_lock(Some(window));
+        } else {
+            self.set_scene_mirror_lock(window);
+        }
+
+        true
+    }
+
+    fn should_proxy_scene_mirror_action(&self, action: &Action) -> bool {
+        if self.niri.scene_mirror_lock.is_none() {
+            return false;
+        }
+
+        !matches!(
+            action,
+            Action::Quit(_)
+                | Action::ChangeVt(_)
+                | Action::Suspend
+                | Action::PowerOffMonitors
+                | Action::PowerOnMonitors
+                | Action::ToggleDebugTint
+                | Action::DebugToggleOpaqueRegions
+                | Action::DebugToggleDamage
+                | Action::DoScreenTransition(_)
+                | Action::CreateWindowMirror
+                | Action::CreateWindowMirrorById(_)
+                | Action::CreateOutputMirror(_)
+                | Action::CreateWorkspaceMirror(_)
+                | Action::SetWindowMirrorZoom(_)
+                | Action::SetWindowMirrorZoomById { .. }
+                | Action::SetWindowMirrorCenterX(_)
+                | Action::SetWindowMirrorCenterXById { .. }
+                | Action::SetWindowMirrorCenterY(_)
+                | Action::SetWindowMirrorCenterYById { .. }
+                | Action::ResetWindowMirrorView
+                | Action::ResetWindowMirrorViewById(_)
+                | Action::MoveWindowMirrorViewLeft
+                | Action::MoveWindowMirrorViewLeftById(_)
+                | Action::MoveWindowMirrorViewRight
+                | Action::MoveWindowMirrorViewRightById(_)
+                | Action::MoveWindowMirrorViewUp
+                | Action::MoveWindowMirrorViewUpById(_)
+                | Action::MoveWindowMirrorViewDown
+                | Action::MoveWindowMirrorViewDownById(_)
+                | Action::ZoomWindowMirrorIn
+                | Action::ZoomWindowMirrorInById(_)
+                | Action::ZoomWindowMirrorOut
+                | Action::ZoomWindowMirrorOutById(_)
+                | Action::PanWindowMirrorInteractively
+                | Action::ZoomWindowMirrorInteractively
+                | Action::LockWindowMirror
+                | Action::LockWindowMirrorById(_)
+                | Action::UnlockWindowMirror
+                | Action::UnlockWindowMirrorById(_)
+                | Action::ToggleWindowMirrorLock
+                | Action::ToggleWindowMirrorLockById(_)
+                | Action::LoadConfigFile(_)
+        )
+    }
+
+    fn locked_scene_mirror_context_under_cursor(
+        &self,
+    ) -> Option<(
+        Output,
+        Option<crate::layout::workspace::WorkspaceId>,
+        Option<crate::window::mapped::MappedId>,
+    )> {
+        let lock = self.niri.scene_mirror_lock.as_ref()?;
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let contents = self.niri.contents_under(pointer.current_location());
+        let over_owner = contents
+            .mirror_forward_window
+            .is_some_and(|target| target.origin_mirror_id == lock.owner_mirror_id)
+            || contents
+                .window
+                .is_some_and(|(window, _)| window == lock.owner_mirror_id);
+        if !over_owner {
+            return None;
+        }
+
+        let mapped = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == lock.owner_mirror_id && mapped.is_scene_mirror())
+            .map(|(_, mapped)| mapped)?;
+        match mapped.mirror_source() {
+            crate::window::mapped::MirrorSource::Window(_) => None,
+            crate::window::mapped::MirrorSource::Output(name) => {
+                let output = self.niri.output_by_name_match(name)?.clone();
+                let workspace_id = self
+                    .niri
+                    .layout
+                    .monitor_for_output(&output)
+                    .map(|monitor| monitor.active_workspace_ref().id());
+                let source_window_id = contents
+                    .mirror_forward_window
+                    .filter(|target| target.origin_mirror_id == lock.owner_mirror_id)
+                    .map(|target| target.source_window_id);
+                Some((output, workspace_id, source_window_id))
+            }
+            crate::window::mapped::MirrorSource::Workspace(workspace_id) => {
+                let (_, workspace) = self.niri.layout.find_workspace_by_id(*workspace_id)?;
+                let output = workspace.current_output()?.clone();
+                let source_window_id = contents
+                    .mirror_forward_window
+                    .filter(|target| target.origin_mirror_id == lock.owner_mirror_id)
+                    .map(|target| target.source_window_id);
+                Some((output, Some(*workspace_id), source_window_id))
+            }
+        }
+    }
+
     fn try_start_move_window_interactively(&mut self, button_code: u32, serial: Serial) -> bool {
         let pointer = self.niri.seat.get_pointer().unwrap();
         if pointer.is_grabbed() {
             return false;
         }
 
-        let Some(window) = self.niri.window_under_cursor().map(|mapped| mapped.id()) else {
+        let Some(window) = self
+            .locked_scene_mirror_context_under_cursor()
+            .and_then(|(_, _, window)| window)
+            .or_else(|| self.niri.window_under_cursor().map(|mapped| mapped.id()))
+        else {
             return false;
         };
         let is_overview_open = self.niri.layout.is_overview_open();
@@ -585,7 +797,19 @@ impl State {
             return false;
         }
 
-        let Some(mapped) = self.niri.window_under_cursor() else {
+        let locked_source_window = self
+            .locked_scene_mirror_context_under_cursor()
+            .and_then(|(_, _, window)| window);
+        let Some(mapped) = locked_source_window
+            .and_then(|id| {
+                self.niri
+                    .layout
+                    .windows()
+                    .find(|(_, mapped)| mapped.id() == id)
+                    .map(|(_, mapped)| mapped)
+            })
+            .or_else(|| self.niri.window_under_cursor())
+        else {
             return false;
         };
         let window = mapped.id();
@@ -677,14 +901,26 @@ impl State {
         }
 
         let is_overview_open = self.niri.layout.is_overview_open();
-        let output_ws = if is_overview_open {
-            self.niri.workspace_under_cursor(true)
+        let output_ws = if !is_overview_open {
+            self.locked_scene_mirror_context_under_cursor()
+                .and_then(|(output, workspace_id, _)| {
+                    let workspace_id = workspace_id?;
+                    let (_, workspace) = self.niri.layout.find_workspace_by_id(workspace_id)?;
+                    Some((output, workspace))
+                })
         } else {
-            self.niri.output_under_cursor().and_then(|output| {
-                let mon = self.niri.layout.monitor_for_output(&output)?;
-                Some((output, mon.active_workspace_ref()))
-            })
-        };
+            None
+        }
+        .or_else(|| {
+            if is_overview_open {
+                self.niri.workspace_under_cursor(true)
+            } else {
+                self.niri.output_under_cursor().and_then(|output| {
+                    let mon = self.niri.layout.monitor_for_output(&output)?;
+                    Some((output, mon.active_workspace_ref()))
+                })
+            }
+        });
         let Some((output, ws)) = output_ws else {
             return false;
         };
@@ -789,13 +1025,22 @@ impl State {
 
     fn handle_mirror_press_focus(&mut self, under: &PointContents) -> bool {
         if let Some(target) = under.mirror_forward_window {
+            if self.niri.is_scene_mirror_window(target.origin_mirror_id) {
+                self.remember_scene_mirror_interaction(target.origin_mirror_id);
+            }
             self.set_mirror_keyboard_focus_override(target);
             self.niri.queue_redraw_all();
             return true;
         }
 
-        under.window
-            .map(|(window, _)| self.niri.is_mirror_window(window))
+        under
+            .window
+            .map(|(window, _)| {
+                if self.niri.is_scene_mirror_window(window) {
+                    self.remember_scene_mirror_interaction(window);
+                }
+                self.niri.is_mirror_window(window)
+            })
             .unwrap_or(false)
     }
 
@@ -1527,6 +1772,20 @@ impl State {
             touch.cancel(self);
         }
 
+        if self.should_proxy_scene_mirror_action(&action)
+            && self
+                .with_locked_scene_mirror_action_context(|state| {
+                    state.do_action_inner(action.clone());
+                })
+                .is_some()
+        {
+            return;
+        }
+
+        self.do_action_inner(action);
+    }
+
+    fn do_action_inner(&mut self, action: Action) {
         match action {
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
@@ -1570,11 +1829,21 @@ impl State {
                 self.niri.debug_toggle_damage();
             }
             Action::Spawn(command) => {
-                let (token, _) = self.niri.activation_state.create_external_token(None);
+                let token_data = self.niri.locked_scene_mirror_spawn_target().map(|target| {
+                    let data = XdgActivationTokenData::default();
+                    data.user_data.insert_if_missing(move || target.clone());
+                    data
+                });
+                let (token, _) = self.niri.activation_state.create_external_token(token_data);
                 spawn(command, Some(token.clone()));
             }
             Action::SpawnSh(command) => {
-                let (token, _) = self.niri.activation_state.create_external_token(None);
+                let token_data = self.niri.locked_scene_mirror_spawn_target().map(|target| {
+                    let data = XdgActivationTokenData::default();
+                    data.user_data.insert_if_missing(move || target.clone());
+                    data
+                });
+                let (token, _) = self.niri.activation_state.create_external_token(token_data);
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
@@ -3302,6 +3571,36 @@ impl State {
                             mapped.toggle_block_out_window_rule();
                         }
                     });
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::LockWindowMirror => {
+                if self.lock_window_mirror(None) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::LockWindowMirrorById(id) => {
+                if self.lock_window_mirror(Some(id)) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UnlockWindowMirror => {
+                if self.unlock_window_mirror(None) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UnlockWindowMirrorById(id) => {
+                if self.unlock_window_mirror(Some(id)) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowMirrorLock => {
+                if self.toggle_window_mirror_lock(None) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowMirrorLockById(id) => {
+                if self.toggle_window_mirror_lock(Some(id)) {
                     self.niri.queue_redraw_all();
                 }
             }

@@ -1097,6 +1097,41 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Lock a scene mirror so compositor actions target its source.
+    #[cfg_attr(feature = "clap", clap(about = "Lock the focused scene mirror"))]
+    LockWindowMirror {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the current lock owner, the last interacted scene mirror, or the
+        /// focused scene mirror.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Unlock a scene mirror so actions target the local layout again.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Unlock the currently locked scene mirror")
+    )]
+    UnlockWindowMirror {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the current lock owner.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Toggle scene-mirror lock mode.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Toggle lock mode for the focused scene mirror")
+    )]
+    ToggleWindowMirrorLock {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the current lock owner, the last interacted scene mirror, or the
+        /// focused scene mirror.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Toggle block-out globally.
     ToggleBlockOut {},
     /// Set the dynamic cast target to a window.

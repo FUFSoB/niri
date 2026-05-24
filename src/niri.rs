@@ -177,6 +177,7 @@ use crate::ui::screenshot_ui::{
 };
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::transaction::Transaction;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
@@ -187,7 +188,6 @@ use crate::utils::{
 };
 use crate::window::mapped::{MappedId, MirrorSource as SceneMirrorSource};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
-use crate::utils::transaction::Transaction;
 use crate::zoom::{
     compute_zoom_base_focal_update, zoom_display_cursor_logical, zoom_subpixel_correction,
     zoom_wrap, ZoomWrapper, ZoomedRenderElements,
@@ -390,6 +390,8 @@ pub struct Niri {
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
     pub mirror_keyboard_focus_override: Option<MirrorKeyboardFocusOverride>,
+    pub scene_mirror_lock: Option<SceneMirrorLockState>,
+    pub last_interacted_scene_mirror: Option<MappedId>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
@@ -477,6 +479,7 @@ pub struct Niri {
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
     pub force_render_state: RefCell<HashMap<u32, ForceRenderState>>,
+    pub suppress_focus_side_effects: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -582,6 +585,26 @@ pub struct MirrorKeyboardFocusOverride {
     pub source_window_id: MappedId,
     pub anchor_layout_focus: Option<MappedId>,
     pub anchor_active_output_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneMirrorLockState {
+    pub owner_mirror_id: MappedId,
+}
+
+#[derive(Debug, Clone)]
+struct SceneMirrorActionTarget {
+    owner_mirror_id: MappedId,
+    source: SceneMirrorSource,
+    output: Output,
+    workspace_id: Option<WorkspaceId>,
+    focused_window_id: Option<MappedId>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorSpawnTarget {
+    pub output_name: String,
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 // The surfaces here are always toplevel surfaces focused as far as niri's logic is concerned, even
@@ -1210,16 +1233,188 @@ impl State {
     }
 
     pub fn clear_mirror_keyboard_focus_override(&mut self) {
+        if self.niri.scene_mirror_lock.as_ref().is_some_and(|lock| {
+            self.niri
+                .mirror_keyboard_focus_override
+                .as_ref()
+                .is_some_and(|override_| override_.origin_mirror_id == lock.owner_mirror_id)
+        }) {
+            return;
+        }
         self.niri.mirror_keyboard_focus_override = None;
     }
 
+    pub fn remember_scene_mirror_interaction(&mut self, mirror_id: MappedId) {
+        self.niri.last_interacted_scene_mirror = Some(mirror_id);
+    }
+
+    pub fn set_scene_mirror_lock(&mut self, owner_mirror_id: MappedId) {
+        self.niri.scene_mirror_lock = Some(SceneMirrorLockState { owner_mirror_id });
+        self.remember_scene_mirror_interaction(owner_mirror_id);
+        self.niri.layer_shell_on_demand_focus = None;
+    }
+
+    pub fn clear_scene_mirror_lock(&mut self, owner_mirror_id: Option<MappedId>) {
+        let Some(lock) = self.niri.scene_mirror_lock.clone() else {
+            return;
+        };
+        if owner_mirror_id.is_some_and(|id| id != lock.owner_mirror_id) {
+            return;
+        }
+
+        if self
+            .niri
+            .mirror_keyboard_focus_override
+            .as_ref()
+            .is_some_and(|override_| override_.origin_mirror_id == lock.owner_mirror_id)
+        {
+            self.niri.mirror_keyboard_focus_override = None;
+        }
+        self.niri.scene_mirror_lock = None;
+    }
+
+    fn activate_scene_mirror_action_target(&mut self, target: &SceneMirrorActionTarget) {
+        self.niri.layout.focus_output(&target.output);
+
+        if let Some(workspace_id) = target.workspace_id {
+            let current_workspace = self.niri.layout.active_workspace().map(|ws| ws.id());
+            if current_workspace != Some(workspace_id) {
+                if let Some((idx, _)) = self.niri.layout.find_workspace_by_id(workspace_id) {
+                    self.niri.layout.switch_workspace(idx);
+                }
+            }
+        }
+
+        if let Some(window_id) = target.focused_window_id {
+            self.niri.layout.activate_window(&window_id);
+        }
+    }
+
+    fn scene_mirror_source_for_action_result(
+        &self,
+        target: &SceneMirrorActionTarget,
+    ) -> Option<SceneMirrorSource> {
+        match target.source {
+            SceneMirrorSource::Window(_) => None,
+            SceneMirrorSource::Output(_) => self
+                .niri
+                .layout
+                .active_output()
+                .map(|output| SceneMirrorSource::Output(output.name())),
+            SceneMirrorSource::Workspace(_) => self
+                .niri
+                .layout
+                .active_workspace()
+                .map(|workspace| SceneMirrorSource::Workspace(workspace.id())),
+        }
+    }
+
+    fn retarget_scene_mirror_owner(
+        &mut self,
+        owner_mirror_id: MappedId,
+        source: SceneMirrorSource,
+    ) -> bool {
+        let Some((title, source_geometry)) = self.niri.scene_mirror_title_and_geometry(&source)
+        else {
+            self.clear_scene_mirror_lock(Some(owner_mirror_id));
+            return false;
+        };
+
+        let mut updated = false;
+        self.niri.layout.with_windows_mut(|mapped, _| {
+            if mapped.id() != owner_mirror_id || !mapped.is_scene_mirror() {
+                return;
+            }
+
+            mapped.set_scene_mirror_source(source.clone());
+            mapped.set_scene_title(title.clone());
+            mapped.set_scene_source_geometry(source_geometry);
+            updated = true;
+        });
+
+        if updated {
+            if self
+                .niri
+                .mirror_keyboard_focus_override
+                .as_ref()
+                .is_some_and(|override_| override_.origin_mirror_id == owner_mirror_id)
+            {
+                self.niri.mirror_keyboard_focus_override = None;
+            }
+        } else {
+            self.clear_scene_mirror_lock(Some(owner_mirror_id));
+        }
+
+        updated
+    }
+
+    pub fn with_locked_scene_mirror_action_context<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        let target = self.niri.validated_scene_mirror_action_target()?;
+        let previous_output = self.niri.layout.active_output().cloned();
+        let previous_workspace_id = matches!(target.source, SceneMirrorSource::Workspace(_))
+            .then(|| {
+                previous_output
+                    .as_ref()
+                    .filter(|output| *output == &target.output)
+                    .and_then(|output| self.niri.layout.monitor_for_output(output))
+                    .map(|monitor| monitor.active_workspace_ref().id())
+            })
+            .flatten();
+        let previous_suppress = mem::replace(&mut self.niri.suppress_focus_side_effects, true);
+
+        self.activate_scene_mirror_action_target(&target);
+        let rv = f(self);
+        let post_source = self.scene_mirror_source_for_action_result(&target);
+
+        if let Some(output) = previous_output.as_ref() {
+            if self.niri.layout.active_output() != Some(output) {
+                self.niri.layout.focus_output(output);
+            }
+        }
+
+        if let Some(previous_workspace_id) = previous_workspace_id {
+            let current_workspace_id = self.niri.layout.active_workspace().map(|ws| ws.id());
+            if current_workspace_id != Some(previous_workspace_id) {
+                if let Some((idx, _)) = self.niri.layout.find_workspace_by_id(previous_workspace_id)
+                {
+                    self.niri.layout.switch_workspace(idx);
+                }
+            }
+        }
+
+        self.niri.suppress_focus_side_effects = previous_suppress;
+
+        if let Some(source) = post_source {
+            self.retarget_scene_mirror_owner(target.owner_mirror_id, source);
+        }
+
+        Some(rv)
+    }
+
     pub fn effective_layout_keyboard_focus(&mut self) -> Option<(MappedId, Option<WlSurface>)> {
+        if let Some(target) = self.niri.validated_scene_mirror_action_target() {
+            if let Some(id) = target.focused_window_id {
+                let surface = self.niri.find_window_by_id(id).and_then(|window| {
+                    window
+                        .toplevel()
+                        .map(|toplevel| toplevel.wl_surface().clone())
+                });
+                return Some((id, surface));
+            }
+
+            return None;
+        }
+
         if let Some(override_) = self.niri.validated_mirror_keyboard_focus_override() {
             let id = override_.source_window_id;
-            let surface = self
-                .niri
-                .find_window_by_id(id)
-                .and_then(|window| window.toplevel().map(|toplevel| toplevel.wl_surface().clone()));
+            let surface = self.niri.find_window_by_id(id).and_then(|window| {
+                window
+                    .toplevel()
+                    .map(|toplevel| toplevel.wl_surface().clone())
+            });
             return Some((id, surface));
         }
 
@@ -1244,6 +1439,10 @@ impl State {
     }
 
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
+        if self.niri.suppress_focus_side_effects {
+            return false;
+        }
+
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
             None => return false,
             Some(inner) => match inner.mode {
@@ -1256,6 +1455,10 @@ impl State {
     }
 
     pub fn maybe_warp_cursor_to_focus_centered(&mut self) -> bool {
+        if self.niri.suppress_focus_side_effects {
+            return false;
+        }
+
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
             None => return false,
             Some(inner) => match inner.mode {
@@ -1346,6 +1549,10 @@ impl State {
     }
 
     pub fn move_cursor_to_output(&mut self, output: &Output) {
+        if self.niri.suppress_focus_side_effects {
+            return;
+        }
+
         let geo = self.niri.global_space.output_geometry(output).unwrap();
         self.move_cursor(center(geo).to_f64());
     }
@@ -1412,10 +1619,12 @@ impl State {
             };
 
             let layout_focus = || {
-                effective_layout_focus.clone().map(|(id, surface)| KeyboardFocus::Layout {
-                    surface,
-                    id: Some(id),
-                })
+                effective_layout_focus
+                    .clone()
+                    .map(|(id, surface)| KeyboardFocus::Layout {
+                        surface,
+                        id: Some(id),
+                    })
             };
 
             let excl_focus_on_layer = |layer| {
@@ -2977,6 +3186,8 @@ impl Niri {
                 id: None,
             },
             mirror_keyboard_focus_override: None,
+            scene_mirror_lock: None,
+            last_interacted_scene_mirror: None,
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
@@ -3040,6 +3251,7 @@ impl Niri {
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
             force_render_state: RefCell::new(HashMap::new()),
+            suppress_focus_side_effects: false,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -3979,11 +4191,14 @@ impl Niri {
                     if mapped.is_scene_mirror() {
                         let source_hit = match mapped.mirror_source() {
                             SceneMirrorSource::Window(_) => None,
-                            SceneMirrorSource::Output(name) => self
-                                .output_by_name_match(name)
-                                .and_then(|output| self.layout.window_under(output, source_surface_pos)),
+                            SceneMirrorSource::Output(name) => {
+                                self.output_by_name_match(name).and_then(|output| {
+                                    self.layout.window_under(output, source_surface_pos)
+                                })
+                            }
                             SceneMirrorSource::Workspace(workspace_id) => {
-                                let (_, workspace) = self.layout.find_workspace_by_id(*workspace_id)?;
+                                let (_, workspace) =
+                                    self.layout.find_workspace_by_id(*workspace_id)?;
                                 let output = workspace.current_output()?;
                                 let monitor = self.layout.monitor_for_output(output)?;
                                 monitor.window_under_in_workspace_at_origin(
@@ -4449,6 +4664,36 @@ impl Niri {
         Some((target_output.cloned(), target_workspace_index))
     }
 
+    pub fn scene_mirror_title_and_geometry(
+        &self,
+        source: &SceneMirrorSource,
+    ) -> Option<(String, Rectangle<f64, Logical>)> {
+        match source {
+            SceneMirrorSource::Window(_) => None,
+            SceneMirrorSource::Output(name) => {
+                let output = self.output_by_name_match(name)?;
+                let title = format!("Mirror: Output {}", output.name());
+                let geometry = Rectangle::from_size(output_size(output));
+                Some((title, geometry))
+            }
+            SceneMirrorSource::Workspace(workspace_id) => {
+                let (workspace_idx, workspace) = self.layout.find_workspace_by_id(*workspace_id)?;
+                let output = workspace.current_output()?;
+                let workspace_display_name = workspace
+                    .name()
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}", workspace_idx + 1));
+                let title = format!(
+                    "Mirror: Workspace {} on {}",
+                    workspace_display_name,
+                    output.name()
+                );
+                let geometry = Rectangle::from_size(output_size(output));
+                Some((title, geometry))
+            }
+        }
+    }
+
     pub fn find_window_by_id(&self, id: MappedId) -> Option<Window> {
         self.layout
             .windows()
@@ -4461,6 +4706,100 @@ impl Niri {
             .windows()
             .find(|(_, mapped)| mapped.id() == id)
             .is_some_and(|(_, mapped)| mapped.is_mirror())
+    }
+
+    pub fn is_scene_mirror_window(&self, id: MappedId) -> bool {
+        self.layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == id)
+            .is_some_and(|(_, mapped)| mapped.is_scene_mirror())
+    }
+
+    fn scene_mirror_action_target_for(
+        &self,
+        owner_mirror_id: MappedId,
+    ) -> Option<SceneMirrorActionTarget> {
+        let source = self
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == owner_mirror_id && mapped.is_scene_mirror())
+            .map(|(_, mapped)| mapped.mirror_source().clone())?;
+
+        let override_window_id = self
+            .mirror_keyboard_focus_override
+            .as_ref()
+            .filter(|override_| override_.origin_mirror_id == owner_mirror_id)
+            .map(|override_| override_.source_window_id);
+
+        let fallback_window_id =
+            |window: &Mapped| (!window.is_scene_mirror()).then(|| window.source_id());
+
+        match &source {
+            SceneMirrorSource::Window(_) => None,
+            SceneMirrorSource::Output(name) => {
+                let output = self.output_by_name_match(name)?.clone();
+                let monitor = self.layout.monitor_for_output(&output)?;
+                let focused_window_id = override_window_id
+                    .filter(|window_id| {
+                        self.outputs_for_source(*window_id)
+                            .iter()
+                            .any(|candidate| candidate == &output)
+                    })
+                    .or_else(|| monitor.active_window().and_then(fallback_window_id));
+
+                Some(SceneMirrorActionTarget {
+                    owner_mirror_id,
+                    source: source.clone(),
+                    output,
+                    workspace_id: Some(monitor.active_workspace_ref().id()),
+                    focused_window_id,
+                })
+            }
+            SceneMirrorSource::Workspace(workspace_id) => {
+                let (_, workspace) = self.layout.find_workspace_by_id(*workspace_id)?;
+                let output = workspace.current_output()?.clone();
+                let focused_window_id = override_window_id
+                    .filter(|window_id| {
+                        self.outputs_for_source(*window_id)
+                            .iter()
+                            .any(|candidate| candidate == &output)
+                    })
+                    .or_else(|| workspace.active_window().and_then(fallback_window_id));
+
+                Some(SceneMirrorActionTarget {
+                    owner_mirror_id,
+                    source: source.clone(),
+                    output,
+                    workspace_id: Some(*workspace_id),
+                    focused_window_id,
+                })
+            }
+        }
+    }
+
+    fn validated_scene_mirror_action_target(&mut self) -> Option<SceneMirrorActionTarget> {
+        let owner_mirror_id = self.scene_mirror_lock.as_ref()?.owner_mirror_id;
+        if let Some(target) = self.scene_mirror_action_target_for(owner_mirror_id) {
+            return Some(target);
+        }
+
+        self.scene_mirror_lock = None;
+        if self
+            .mirror_keyboard_focus_override
+            .as_ref()
+            .is_some_and(|override_| override_.origin_mirror_id == owner_mirror_id)
+        {
+            self.mirror_keyboard_focus_override = None;
+        }
+        None
+    }
+
+    pub(crate) fn locked_scene_mirror_spawn_target(&mut self) -> Option<MirrorSpawnTarget> {
+        let target = self.validated_scene_mirror_action_target()?;
+        Some(MirrorSpawnTarget {
+            output_name: target.output.name(),
+            workspace_id: target.workspace_id,
+        })
     }
 
     pub fn validated_mirror_keyboard_focus_override(
@@ -4477,12 +4816,19 @@ impl Niri {
             .windows()
             .find(|(_, mapped)| mapped.id() == override_.origin_mirror_id)
             .is_some_and(|(_, mapped)| mapped.is_mirror());
+        let locked_origin = self
+            .scene_mirror_lock
+            .as_ref()
+            .is_some_and(|lock| lock.owner_mirror_id == override_.origin_mirror_id);
         let layout_focus_matches =
             self.layout.focus().map(|win| win.id()) == override_.anchor_layout_focus;
-        let active_output_matches = self.layout.active_output().map(Output::name)
-            == override_.anchor_active_output_name;
+        let active_output_matches =
+            self.layout.active_output().map(Output::name) == override_.anchor_active_output_name;
 
-        if source_exists && origin_is_mirror && layout_focus_matches && active_output_matches {
+        if source_exists
+            && origin_is_mirror
+            && (locked_origin || (layout_focus_matches && active_output_matches))
+        {
             Some(override_)
         } else {
             self.mirror_keyboard_focus_override = None;
@@ -5091,6 +5437,23 @@ impl Niri {
             .collect();
 
         for id in to_remove {
+            if self
+                .scene_mirror_lock
+                .as_ref()
+                .is_some_and(|lock| lock.owner_mirror_id == id)
+            {
+                self.scene_mirror_lock = None;
+            }
+            if self.last_interacted_scene_mirror == Some(id) {
+                self.last_interacted_scene_mirror = None;
+            }
+            if self
+                .mirror_keyboard_focus_override
+                .as_ref()
+                .is_some_and(|override_| override_.origin_mirror_id == id)
+            {
+                self.mirror_keyboard_focus_override = None;
+            }
             self.stop_casts_for_target(CastTarget::Window { id: id.get() });
             self.window_mru_ui.remove_window(id);
             self.layout.remove_window(&id, Transaction::new());
@@ -6443,6 +6806,58 @@ impl Niri {
 
         let state = self.output_state.get(output).unwrap();
         let sequence = state.frame_callback_sequence;
+        let mut mirrored_workspace_ids = HashSet::new();
+        let mut mirror_entire_output = false;
+
+        for (_, mapped) in self.layout.windows() {
+            if !mapped.is_scene_mirror() {
+                continue;
+            }
+
+            match mapped.mirror_source() {
+                SceneMirrorSource::Window(_) => {}
+                SceneMirrorSource::Output(name) => {
+                    if self
+                        .output_by_name_match(name)
+                        .is_some_and(|candidate| candidate == output)
+                    {
+                        mirror_entire_output = true;
+                    }
+                }
+                SceneMirrorSource::Workspace(workspace_id) => {
+                    let Some((_, workspace)) = self.layout.find_workspace_by_id(*workspace_id)
+                    else {
+                        continue;
+                    };
+                    if workspace
+                        .current_output()
+                        .is_some_and(|candidate| candidate == output)
+                    {
+                        mirrored_workspace_ids.insert(*workspace_id);
+                    }
+                }
+            }
+        }
+
+        let needs_live_scene_callbacks = mirror_entire_output || !mirrored_workspace_ids.is_empty();
+        let mirrored_window_ids = (!mirror_entire_output && !mirrored_workspace_ids.is_empty())
+            .then(|| {
+                let mut ids = HashSet::new();
+                self.layout
+                    .with_windows(|mapped, window_output, workspace_id, _| {
+                        if mapped.is_scene_mirror() || window_output != Some(output) {
+                            return;
+                        }
+
+                        if workspace_id.is_some_and(|id| mirrored_workspace_ids.contains(&id))
+                            || (workspace_id.is_none() && mapped.is_sticky())
+                        {
+                            ids.insert(mapped.id());
+                        }
+                    });
+                ids
+            })
+            .unwrap_or_default();
 
         let should_send = |surface: &WlSurface, states: &SurfaceData| {
             // Do the standard primary scanout output check. For pointer surfaces it deduplicates
@@ -6476,6 +6891,26 @@ impl Niri {
                 None
             }
         };
+        let should_send_live_scene = |_: &WlSurface, states: &SurfaceData| {
+            let frame_throttling_state = states
+                .data_map
+                .get_or_insert(SurfaceFrameThrottlingState::default);
+            let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
+
+            let mut send = true;
+            if let Some((last_output, last_sequence)) = &*last_sent_at {
+                if last_output == output && *last_sequence == sequence {
+                    send = false;
+                }
+            }
+
+            if send {
+                *last_sent_at = Some((output.clone(), sequence));
+                Some(output.clone())
+            } else {
+                None
+            }
+        };
 
         let frame_callback_time = get_monotonic_time();
 
@@ -6483,6 +6918,18 @@ impl Niri {
         let delayed_surfaces = RefCell::new(HashMap::new());
 
         for mapped in self.layout.windows_for_output_mut(output) {
+            // Scene mirrors need their source scenes to keep producing frames even when the source
+            // workspace/output is hidden by normal scanout visibility rules.
+            if mirror_entire_output || mirrored_window_ids.contains(&mapped.id()) {
+                mapped.send_frame(
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_live_scene,
+                );
+                continue;
+            }
+
             // Check if the surface should be forced to render.
             if mapped.rules().force_render == Some(true) || mapped.is_screen_cast_target() {
                 // Calculate delay time.
@@ -6577,22 +7024,41 @@ impl Niri {
         }
 
         for surface in layer_map_for_output(output).layers() {
-            surface.send_frame(
-                output,
-                frame_callback_time,
-                FRAME_CALLBACK_THROTTLE,
-                should_send,
-            );
+            if needs_live_scene_callbacks {
+                surface.send_frame(
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_live_scene,
+                );
+            } else {
+                surface.send_frame(
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send,
+                );
+            }
         }
 
         if let Some(surface) = &self.output_state[output].lock_surface {
-            send_frames_surface_tree(
-                surface.wl_surface(),
-                output,
-                frame_callback_time,
-                FRAME_CALLBACK_THROTTLE,
-                should_send,
-            );
+            if needs_live_scene_callbacks {
+                send_frames_surface_tree(
+                    surface.wl_surface(),
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_live_scene,
+                );
+            } else {
+                send_frames_surface_tree(
+                    surface.wl_surface(),
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send,
+                );
+            }
         }
 
         if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
@@ -7778,6 +8244,10 @@ impl Niri {
         previous_focus: &PointContents,
         new_focus: &PointContents,
     ) {
+        if self.scene_mirror_lock.is_some() {
+            return;
+        }
+
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
         };
