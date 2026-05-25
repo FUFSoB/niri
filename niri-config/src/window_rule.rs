@@ -1,4 +1,9 @@
+use std::str::FromStr;
+
+use knuffel::errors::DecodeError;
+use miette::miette;
 use niri_ipc::ColumnDisplay;
+use smithay::input::pointer::CursorIcon;
 
 use crate::appearance::{
     BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
@@ -70,6 +75,8 @@ pub struct WindowRule {
     #[knuffel(child, unwrap(argument))]
     pub draw_cursor: Option<DrawCursor>,
     #[knuffel(child, unwrap(argument))]
+    pub force_cursor_shape: Option<ForceCursorShape>,
+    #[knuffel(child, unwrap(argument))]
     pub cursor_capture: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub variable_refresh_rate: Option<bool>,
@@ -134,6 +141,72 @@ pub enum DrawCursor {
     AlwaysHidden,
     AlwaysShown,
     HiddenOnCapture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceCursorShape {
+    None,
+    Shape(CursorIcon),
+}
+
+impl ForceCursorShape {
+    pub fn icon(self) -> Option<CursorIcon> {
+        match self {
+            Self::None => None,
+            Self::Shape(icon) => Some(icon),
+        }
+    }
+}
+
+impl FromStr for ForceCursorShape {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "none" {
+            return Ok(Self::None);
+        }
+
+        let icon = match s {
+            "dnd-ask" => CursorIcon::DndAsk,
+            "all-resize" => CursorIcon::AllResize,
+            _ => CursorIcon::from_str(s).map_err(|_| miette!("unknown cursor shape: {s}"))?,
+        };
+
+        Ok(Self::Shape(icon))
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ForceCursorShape {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        match &**val {
+            knuffel::ast::Literal::String(ref s) => {
+                Self::from_str(s).map_err(|e| DecodeError::conversion(val, e))
+            }
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only strings are recognized",
+                ));
+                Ok(Self::None)
+            }
+        }
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

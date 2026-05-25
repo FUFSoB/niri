@@ -341,7 +341,7 @@ impl State {
         if !is_overview_open {
             self.niri
                 .cursor_manager
-                .set_cursor_image(CursorImageStatus::Named(icon));
+                .set_compositor_cursor_image(CursorImageStatus::Named(icon));
         }
         self.niri.queue_redraw_all();
         true
@@ -407,7 +407,7 @@ impl State {
         pointer.set_grab(self, grab, serial, Focus::Clear);
         self.niri
             .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+            .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
         self.niri.queue_redraw_all();
         true
@@ -495,7 +495,7 @@ impl State {
         pointer.set_grab(self, grab, serial, Focus::Clear);
         self.niri
             .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+            .set_compositor_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
         self.niri.queue_redraw_all();
         true
     }
@@ -535,7 +535,7 @@ impl State {
         pointer.set_grab(self, grab, serial, Focus::Clear);
         self.niri
             .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+            .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
         self.niri.queue_redraw_all();
         true
     }
@@ -1429,9 +1429,7 @@ impl State {
                 }
 
                 self.niri.screenshot_ui.close();
-                self.niri
-                    .cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
+                self.niri.cursor_manager.clear_compositor_cursor_image();
                 self.niri.queue_redraw_all();
             }
             Action::ScreenshotTogglePointer => {

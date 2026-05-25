@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use smithay::input::pointer::CursorImageSurfaceData;
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -427,10 +427,7 @@ impl CompositorHandler for State {
         }
 
         // This might be a cursor surface.
-        if matches!(
-            &self.niri.cursor_manager.cursor_image(),
-            CursorImageStatus::Surface(s) if s == &root_surface
-        ) {
+        if self.niri.cursor_manager.has_cursor_surface(&root_surface) {
             // In case the cursor surface has been committed handle the role specific
             // buffer offset by applying the offset on the cursor image hotspot
             if surface == &root_surface {

@@ -15,8 +15,8 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::{
-    BlockOutFrom, Config, DrawCursor, FloatOrInt, Key, Modifiers, OutputName, TrackLayout,
-    WarpMouseToFocusMode, WorkspaceReference, Xkb,
+    BlockOutFrom, Config, DrawCursor, FloatOrInt, ForceCursorShape, Key, Modifiers, OutputName,
+    TrackLayout, WarpMouseToFocusMode, WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
@@ -117,7 +117,7 @@ use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
-use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
+use crate::cursor::{CursorImageSource, CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
 #[cfg(feature = "dbus")]
@@ -605,6 +605,12 @@ pub struct PointContents {
     pub layer: Option<LayerSurface>,
     // Pointer is over a hot corner.
     pub hot_corner: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CursorWindowRules {
+    draw_cursor: Option<DrawCursor>,
+    force_cursor_shape: Option<ForceCursorShape>,
 }
 
 #[derive(Debug, Default)]
@@ -2234,7 +2240,7 @@ impl State {
 
         self.niri
             .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+            .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
         self.niri.queue_redraw_all();
     }
 
@@ -2250,7 +2256,7 @@ impl State {
         self.niri.pick_color = Some(tx);
         self.niri
             .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+            .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
         self.niri.queue_redraw_all();
     }
 
@@ -2291,9 +2297,7 @@ impl State {
         });
 
         self.niri.screenshot_ui.close();
-        self.niri
-            .cursor_manager
-            .set_cursor_image(CursorImageStatus::default_named());
+        self.niri.cursor_manager.clear_compositor_cursor_image();
         self.niri.queue_redraw_all();
     }
 
@@ -3376,8 +3380,7 @@ impl Niri {
         }
 
         if self.screenshot_ui.close() {
-            self.cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
+            self.cursor_manager.clear_compositor_cursor_image();
             self.queue_redraw_all();
         }
 
@@ -3426,8 +3429,7 @@ impl Niri {
             // physical coordinates.
             if old_size != size || old_scale != scale || old_transform != transform {
                 self.screenshot_ui.close();
-                self.cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
+                self.cursor_manager.clear_compositor_cursor_image();
                 self.queue_redraw_all();
                 return;
             }
@@ -3995,54 +3997,61 @@ impl Niri {
         rv
     }
 
-    fn draw_cursor_rule_under_pointer(&self) -> Option<DrawCursor> {
+    fn cursor_window_under_pointer(&self) -> Option<MappedId> {
         let pointer_pos = self
             .tablet_cursor_location
             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
         let contents = self.contents_under_with_niri_ui(pointer_pos, true);
         let window_id = if self.tablet_cursor_location.is_some() {
             contents.window.map(|(id, _)| id)
-        } else if self.draw_cursor_transition_active(&contents) {
+        } else if self.cursor_window_transition_active(&contents) {
             self.pointer_contents
                 .window
                 .map(|(id, _)| id)
                 .or_else(|| contents.window.map(|(id, _)| id))
-                .or_else(|| self.draw_cursor_transition_fallback_window(pointer_pos, &contents))
+                .or_else(|| self.cursor_window_transition_fallback_window(pointer_pos, &contents))
         } else {
             contents.window.map(|(id, _)| id)
-        }?;
+        };
 
-        self.draw_cursor_rule_for_window(window_id)
+        window_id
     }
 
-    fn draw_cursor_rule_for_window(&self, window_id: MappedId) -> Option<DrawCursor> {
+    fn cursor_window_rules_under_pointer(&self) -> CursorWindowRules {
+        self.cursor_window_under_pointer()
+            .map(|window_id| self.cursor_window_rules_for_window(window_id))
+            .unwrap_or_default()
+    }
+
+    fn cursor_window_rules_for_window(&self, window_id: MappedId) -> CursorWindowRules {
         self.layout
             .windows()
             .find(|(_, mapped)| mapped.id() == window_id)
-            .and_then(|(_, mapped)| mapped.rules().draw_cursor)
+            .map(|(_, mapped)| CursorWindowRules {
+                draw_cursor: mapped.rules().draw_cursor,
+                force_cursor_shape: mapped.rules().force_cursor_shape,
+            })
+            .unwrap_or_default()
     }
 
-    fn draw_cursor_rule_for_target(
+    fn cursor_window_rules_for_target(
         &self,
         target: RenderTarget,
         cursor_owner: Option<MappedId>,
-    ) -> Option<DrawCursor> {
+    ) -> CursorWindowRules {
+        let mut rules = cursor_owner
+            .map(|window_id| self.cursor_window_rules_for_window(window_id))
+            .unwrap_or_else(|| self.cursor_window_rules_under_pointer());
+
         if self.screenshot_ui.is_open() && target == RenderTarget::Output && cursor_owner.is_none()
         {
-            return None;
+            rules.draw_cursor = None;
         }
 
-        cursor_owner
-            .and_then(|window_id| self.draw_cursor_rule_for_window(window_id))
-            .or_else(|| {
-                cursor_owner
-                    .is_none()
-                    .then(|| self.draw_cursor_rule_under_pointer())
-                    .flatten()
-            })
+        rules
     }
 
-    fn draw_cursor_transition_active(&self, contents: &PointContents) -> bool {
+    fn cursor_window_transition_active(&self, contents: &PointContents) -> bool {
         if self.tablet_cursor_location.is_some() {
             return false;
         }
@@ -4054,7 +4063,7 @@ impl Niri {
             .is_some_and(|mon| mon.are_transitions_ongoing())
     }
 
-    fn draw_cursor_transition_fallback_window(
+    fn cursor_window_transition_fallback_window(
         &self,
         pointer_pos: Point<f64, Logical>,
         contents: &PointContents,
@@ -4067,7 +4076,7 @@ impl Niri {
 
         // During workspace switch animations, the pointer can temporarily pass through the gap
         // between workspaces. If there is no stable frozen pointer window, reuse the nearest
-        // workspace for draw-cursor lookups to avoid showing the default cursor for a frame.
+        // workspace for cursor rule lookups to avoid flickering to the default behavior.
         if contents.layer.is_some() || contents.hot_corner {
             return None;
         }
@@ -4097,15 +4106,16 @@ impl Niri {
             .map(|(mapped, _)| mapped.id())
     }
 
-    fn cursor_image_for_target(
+    pub(crate) fn cursor_image_for_target(
         &self,
         target: RenderTarget,
         cursor_owner: Option<MappedId>,
     ) -> CursorImageStatus {
         let cursor_image = self.cursor_manager.cursor_image().clone();
-        let draw_cursor_rule = self.draw_cursor_rule_for_target(target, cursor_owner);
+        let cursor_source = self.cursor_manager.cursor_source();
+        let rules = self.cursor_window_rules_for_target(target, cursor_owner);
 
-        match draw_cursor_rule {
+        let cursor_image = match rules.draw_cursor {
             Some(DrawCursor::AlwaysHidden) => CursorImageStatus::Hidden,
             Some(DrawCursor::AlwaysShown) => match cursor_image {
                 CursorImageStatus::Hidden => CursorImageStatus::default_named(),
@@ -4115,7 +4125,19 @@ impl Niri {
                 CursorImageStatus::Hidden
             }
             Some(DrawCursor::Default) | Some(DrawCursor::HiddenOnCapture) | None => cursor_image,
+        };
+
+        if matches!(cursor_image, CursorImageStatus::Hidden) {
+            return cursor_image;
         }
+
+        if cursor_source == CursorImageSource::Client {
+            if let Some(icon) = rules.force_cursor_shape.and_then(ForceCursorShape::icon) {
+                return CursorImageStatus::Named(icon);
+            }
+        }
+
+        cursor_image
     }
 
     pub(crate) fn should_render_pointer_for_target(
@@ -4126,7 +4148,8 @@ impl Niri {
         match self.pointer_visibility {
             PointerVisibility::Visible => true,
             PointerVisibility::Hidden => {
-                self.draw_cursor_rule_for_target(target, cursor_owner)
+                self.cursor_window_rules_for_target(target, cursor_owner)
+                    .draw_cursor
                     == Some(DrawCursor::AlwaysShown)
             }
             PointerVisibility::Disabled => false,
@@ -4636,7 +4659,7 @@ impl Niri {
     }
 
     pub fn refresh_pointer_outputs(&mut self) {
-        if !self.pointer_visibility.is_visible() {
+        if !self.should_render_pointer_for_target(RenderTarget::Output, None) {
             return;
         }
 
@@ -4647,9 +4670,9 @@ impl Niri {
             .tablet_cursor_location
             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
 
-        match self.cursor_manager.cursor_image() {
-            CursorImageStatus::Surface(ref surface) => {
-                let hotspot = with_states(surface, |states| {
+        match self.cursor_image_for_target(RenderTarget::Output, None) {
+            CursorImageStatus::Surface(surface) => {
+                let hotspot = with_states(&surface, |states| {
                     states
                         .data_map
                         .get::<CursorImageSurfaceData>()
@@ -4660,7 +4683,7 @@ impl Niri {
                 });
 
                 let surface_pos = pointer_pos.to_i32_round() - hotspot;
-                let bbox = bbox_from_surface_tree(surface, surface_pos);
+                let bbox = bbox_from_surface_tree(&surface, surface_pos);
 
                 let dnd = self
                     .dnd_icon
@@ -4685,9 +4708,9 @@ impl Niri {
                         // FIXME: using the largest overlapping or "primary" output transform would
                         // make more sense here.
                         cursor_transform = output.current_transform();
-                        output_update(output, Some(overlap), surface);
+                        output_update(output, Some(overlap), &surface);
                     } else {
-                        output_update(output, None, surface);
+                        output_update(output, None, &surface);
                     }
 
                     // Compute DnD icon surface overlap.
@@ -4706,9 +4729,9 @@ impl Niri {
                     }
                 }
 
-                with_states(surface, |data| {
+                with_states(&surface, |data| {
                     send_scale_transform(
-                        surface,
+                        &surface,
                         data,
                         output::Scale::Fractional(cursor_scale),
                         cursor_transform,
@@ -4732,7 +4755,7 @@ impl Niri {
                 };
 
                 let icon = if let CursorImageStatus::Named(icon) = cursor_image {
-                    *icon
+                    icon
                 } else {
                     Default::default()
                 };
@@ -5612,6 +5635,16 @@ impl Niri {
 
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
+            let cursor_is_animated = if self
+                .should_render_pointer_for_target(RenderTarget::Output, None)
+            {
+                let cursor_image = self.cursor_image_for_target(RenderTarget::Output, None);
+                self.cursor_manager
+                    .is_cursor_image_animated(&cursor_image, output.current_scale().integer_scale())
+            } else {
+                false
+            };
+
             let state = self.output_state.get_mut(output).unwrap();
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
@@ -5621,10 +5654,8 @@ impl Niri {
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
-            // Also keep redrawing if the current cursor is animated.
-            state.unfinished_animations_remain |= self
-                .cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale());
+            // Also keep redrawing if the effective output cursor is animated.
+            state.unfinished_animations_remain |= cursor_is_animated;
 
             // Also check layer surfaces.
             if !state.unfinished_animations_remain {
@@ -7074,8 +7105,7 @@ impl Niri {
         if self.output_state.is_empty() {
             // There are no outputs, lock the session right away.
             self.screenshot_ui.close();
-            self.cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
+            self.cursor_manager.clear_compositor_cursor_image();
 
             let lock = confirmation.ext_session_lock().clone();
             confirmation.lock();
@@ -7134,8 +7164,7 @@ impl Niri {
                 self.event_loop.remove(deadline_token);
 
                 self.screenshot_ui.close();
-                self.cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
+                self.cursor_manager.clear_compositor_cursor_image();
                 self.cancel_mru();
 
                 if self.output_state.is_empty() {

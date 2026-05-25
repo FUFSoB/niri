@@ -136,9 +136,7 @@ impl MoveGrab {
         }
 
         if self.start_data.is_pointer() {
-            data.niri
-                .cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
+            data.niri.cursor_manager.clear_compositor_cursor_image();
         }
 
         // FIXME: only redraw the window output.
@@ -160,7 +158,7 @@ impl MoveGrab {
         if self.start_data.is_pointer() {
             data.niri
                 .cursor_manager
-                .set_cursor_image(CursorImageStatus::Named(self.move_icon));
+                .set_compositor_cursor_image(CursorImageStatus::Named(self.move_icon));
         }
 
         true
@@ -197,7 +195,7 @@ impl MoveGrab {
         if self.start_data.is_pointer() {
             data.niri
                 .cursor_manager
-                .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+                .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
         }
 
         true

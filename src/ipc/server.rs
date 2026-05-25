@@ -362,7 +362,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 state
                     .niri
                     .cursor_manager
-                    .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+                    .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
                 // Redraw to update the cursor.
                 state.niri.queue_redraw_all();
             });

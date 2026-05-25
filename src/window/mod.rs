@@ -1,7 +1,7 @@
 use std::cmp::{max, min};
 
 use niri_config::utils::MergeWith as _;
-use niri_config::window_rule::{DrawCursor, Match, WindowRule};
+use niri_config::window_rule::{DrawCursor, ForceCursorShape, Match, WindowRule};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
     ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
@@ -118,6 +118,12 @@ pub struct ResolvedWindowRules {
     ///
     /// `Some(DrawCursor::Default)` means an explicit reset to the default behavior.
     pub draw_cursor: Option<DrawCursor>,
+
+    /// Which cursor shape to force while the pointer is over this window.
+    ///
+    /// `Some(ForceCursorShape::None)` means an explicit reset to the normal app-controlled
+    /// behavior.
+    pub force_cursor_shape: Option<ForceCursorShape>,
 
     /// Whether this window should capture the cursor.
     pub cursor_capture: Option<bool>,
@@ -323,6 +329,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.draw_cursor {
                     resolved.draw_cursor = Some(x);
+                }
+                if let Some(x) = rule.force_cursor_shape {
+                    resolved.force_cursor_shape = Some(x);
                 }
                 if let Some(x) = rule.cursor_capture {
                     resolved.cursor_capture = Some(x);

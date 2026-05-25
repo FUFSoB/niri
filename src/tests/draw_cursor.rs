@@ -2,15 +2,16 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use niri_config::utils::RegexEq;
-use niri_config::window_rule::{DrawCursor, Match as WindowMatch, WindowRule};
+use niri_config::window_rule::{DrawCursor, ForceCursorShape, Match as WindowMatch, WindowRule};
 use niri_config::{Action, Config};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 
 use super::client::LayerConfigureProps;
@@ -99,6 +100,15 @@ fn zoom_output(f: &mut Fixture, level: &str) {
 
 fn cursor_pos(f: &mut Fixture) -> Point<f64, Logical> {
     f.niri().seat.get_pointer().unwrap().current_location()
+}
+
+fn window_surface(f: &mut Fixture, id: MappedId) -> WlSurface {
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == id)
+        .map(|(_, mapped)| mapped.toplevel().wl_surface().clone())
+        .unwrap()
 }
 
 fn render_output_pixels(
@@ -360,7 +370,7 @@ fn render_window_screen_capture_pixels(
 }
 
 fn set_cursor_image(f: &mut Fixture, image: CursorImageStatus) {
-    f.niri().cursor_manager.set_cursor_image(image);
+    f.niri().cursor_manager.set_client_cursor_image(image);
 }
 
 fn create_top_layer(f: &mut Fixture, size: (u16, u16)) {
@@ -420,6 +430,30 @@ fn config_with_draw_cursor(draw_cursor: DrawCursor) -> Config {
         ..Default::default()
     });
     config
+}
+
+fn config_with_force_cursor_shape(force_cursor_shape: ForceCursorShape) -> Config {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^test$").unwrap()),
+            ..Default::default()
+        }],
+        force_cursor_shape: Some(force_cursor_shape),
+        ..Default::default()
+    });
+    config
+}
+
+fn output_cursor_image(f: &mut Fixture) -> CursorImageStatus {
+    f.niri().cursor_image_for_target(RenderTarget::Output, None)
+}
+
+fn assert_named_cursor(image: CursorImageStatus, expected: CursorIcon) {
+    match image {
+        CursorImageStatus::Named(icon) => assert_eq!(icon, expected),
+        _ => panic!("expected named cursor"),
+    }
 }
 
 #[test]
@@ -509,6 +543,134 @@ fn draw_cursor_always_shown_overrides_hidden_pointer_visibility() {
     let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
 
     assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn force_cursor_shape_overrides_hidden_client_cursor_on_output() {
+    let Some(mut f) = set_up(config_with_force_cursor_shape(ForceCursorShape::Shape(
+        CursorIcon::Crosshair,
+    ))) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::Hidden);
+
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+
+    let output = f.niri_output(1);
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Output, true);
+    assert_ne!(with_pointer, without_pointer);
+}
+
+#[test]
+fn force_cursor_shape_freezes_named_client_cursor_changes() {
+    let Some(mut f) = set_up(config_with_force_cursor_shape(ForceCursorShape::Shape(
+        CursorIcon::Crosshair,
+    ))) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Pointer));
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Text));
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+}
+
+#[test]
+fn later_force_cursor_shape_none_restores_app_control() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^test$").unwrap()),
+            ..Default::default()
+        }],
+        force_cursor_shape: Some(ForceCursorShape::Shape(CursorIcon::Crosshair)),
+        ..Default::default()
+    });
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^test$").unwrap()),
+            ..Default::default()
+        }],
+        force_cursor_shape: Some(ForceCursorShape::None),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Pointer));
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Pointer);
+
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Text));
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Text);
+}
+
+#[test]
+fn force_cursor_shape_does_not_override_compositor_cursor() {
+    let Some(mut f) = set_up(config_with_force_cursor_shape(ForceCursorShape::Shape(
+        CursorIcon::Text,
+    ))) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Pointer));
+    f.niri()
+        .cursor_manager
+        .set_compositor_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+}
+
+#[test]
+fn force_cursor_shape_overrides_client_surface() {
+    let Some(mut f) = set_up(config_with_force_cursor_shape(ForceCursorShape::Shape(
+        CursorIcon::Crosshair,
+    ))) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+
+    let surface = window_surface(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::Surface(surface));
+
+    assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+}
+
+#[test]
+fn draw_cursor_always_hidden_overrides_force_cursor_shape() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^test$").unwrap()),
+            ..Default::default()
+        }],
+        draw_cursor: Some(DrawCursor::AlwaysHidden),
+        force_cursor_shape: Some(ForceCursorShape::Shape(CursorIcon::Crosshair)),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::Named(CursorIcon::Pointer));
+
+    assert!(matches!(
+        output_cursor_image(&mut f),
+        CursorImageStatus::Hidden
+    ));
 }
 
 #[test]

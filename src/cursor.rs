@@ -20,10 +20,17 @@ static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
 
 type XCursorCache = HashMap<(CursorIcon, i32), Option<Rc<XCursor>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorImageSource {
+    Client,
+    Compositor,
+}
+
 pub struct CursorManager {
     theme: CursorTheme,
     size: u8,
-    current_cursor: CursorImageStatus,
+    client_cursor: CursorImageStatus,
+    compositor_cursor: Option<CursorImageStatus>,
     named_cursor_cache: RefCell<XCursorCache>,
 }
 
@@ -36,7 +43,8 @@ impl CursorManager {
         Self {
             theme,
             size,
-            current_cursor: CursorImageStatus::default_named(),
+            client_cursor: CursorImageStatus::default_named(),
+            compositor_cursor: None,
             named_cursor_cache: Default::default(),
         }
     }
@@ -51,16 +59,22 @@ impl CursorManager {
 
     /// Checks if the cursor WlSurface is alive, and if not, cleans it up.
     pub fn check_cursor_image_surface_alive(&mut self) {
-        if let CursorImageStatus::Surface(surface) = &self.current_cursor {
+        if let CursorImageStatus::Surface(surface) = &self.client_cursor {
             if !surface.alive() {
-                self.current_cursor = CursorImageStatus::default_named();
+                self.client_cursor = CursorImageStatus::default_named();
+            }
+        }
+
+        if let Some(CursorImageStatus::Surface(surface)) = &self.compositor_cursor {
+            if !surface.alive() {
+                self.compositor_cursor = None;
             }
         }
     }
 
     /// Get the current rendering cursor.
     pub fn get_render_cursor(&self, scale: i32) -> RenderCursor {
-        self.get_render_cursor_for_image(self.current_cursor.clone(), scale)
+        self.get_render_cursor_for_image(self.cursor_image().clone(), scale)
     }
 
     pub fn get_render_cursor_for_image(
@@ -102,7 +116,11 @@ impl CursorManager {
     }
 
     pub fn is_current_cursor_animated(&self, scale: i32) -> bool {
-        match &self.current_cursor {
+        self.is_cursor_image_animated(self.cursor_image(), scale)
+    }
+
+    pub fn is_cursor_image_animated(&self, cursor_image: &CursorImageStatus, scale: i32) -> bool {
+        match cursor_image {
             CursorImageStatus::Hidden => false,
             CursorImageStatus::Surface(_) => false,
             CursorImageStatus::Named(icon) => self
@@ -154,12 +172,49 @@ impl CursorManager {
 
     /// Currently used cursor_image as a cursor provider.
     pub fn cursor_image(&self) -> &CursorImageStatus {
-        &self.current_cursor
+        self.compositor_cursor
+            .as_ref()
+            .unwrap_or(&self.client_cursor)
     }
 
-    /// Set new cursor image provider.
-    pub fn set_cursor_image(&mut self, cursor: CursorImageStatus) {
-        self.current_cursor = cursor;
+    pub fn cursor_source(&self) -> CursorImageSource {
+        if self.compositor_cursor.is_some() {
+            CursorImageSource::Compositor
+        } else {
+            CursorImageSource::Client
+        }
+    }
+
+    pub fn client_cursor_image(&self) -> &CursorImageStatus {
+        &self.client_cursor
+    }
+
+    pub fn compositor_cursor_image(&self) -> Option<&CursorImageStatus> {
+        self.compositor_cursor.as_ref()
+    }
+
+    pub fn has_cursor_surface(&self, root_surface: &WlSurface) -> bool {
+        let matches = |cursor_image: &CursorImageStatus| match cursor_image {
+            CursorImageStatus::Surface(surface) => surface == root_surface,
+            _ => false,
+        };
+
+        matches(&self.client_cursor) || self.compositor_cursor.as_ref().is_some_and(matches)
+    }
+
+    /// Set the app-controlled cursor image.
+    pub fn set_client_cursor_image(&mut self, cursor: CursorImageStatus) {
+        self.client_cursor = cursor;
+    }
+
+    /// Set the compositor-controlled cursor image override.
+    pub fn set_compositor_cursor_image(&mut self, cursor: CursorImageStatus) {
+        self.compositor_cursor = Some(cursor);
+    }
+
+    /// Clear the compositor-controlled cursor image override.
+    pub fn clear_compositor_cursor_image(&mut self) {
+        self.compositor_cursor = None;
     }
 
     /// Load the cursor with the given `name` from the file system picking the closest

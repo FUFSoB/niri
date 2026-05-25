@@ -15,7 +15,7 @@ use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
+use smithay::input::pointer::{CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
@@ -107,13 +107,8 @@ impl SeatHandler for State {
         &mut self.niri.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, mut image: CursorImageStatus) {
-        // FIXME: this hack should be removable once the screenshot UI is tracked with a
-        // PointerFocus properly.
-        if self.niri.screenshot_ui.is_open() {
-            image = CursorImageStatus::Named(CursorIcon::Crosshair);
-        }
-        self.niri.cursor_manager.set_cursor_image(image);
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.niri.cursor_manager.set_client_cursor_image(image);
         // FIXME: more granular
         self.niri.queue_redraw_all();
     }
@@ -147,7 +142,7 @@ delegate_text_input_manager!(State);
 impl TabletSeatHandler for State {
     fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
         // FIXME: tablet tools should have their own cursors.
-        self.niri.cursor_manager.set_cursor_image(image);
+        self.niri.cursor_manager.set_client_cursor_image(image);
         // FIXME: granular.
         self.niri.queue_redraw_all();
     }

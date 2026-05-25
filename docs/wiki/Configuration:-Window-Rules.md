@@ -57,6 +57,8 @@ window-rule {
     draw-cursor "always-hidden"
     // draw-cursor "always-shown"
     // draw-cursor "hidden-on-capture"
+    // force-cursor-shape "crosshair"
+    // force-cursor-shape "none"
     opacity 0.5
     block-out-from "screencast"
     // block-out-from "screen-capture"
@@ -692,6 +694,42 @@ window-rule {
     match app-id="^secret-app$"
 
     draw-cursor "hidden-on-capture"
+}
+```
+
+#### `force-cursor-shape`
+
+Force a specific named cursor while the pointer is over this window.
+
+By default, apps can change their cursor shape normally.
+Set `force-cursor-shape` to one of niri's supported Linux cursor names to keep drawing that shape
+instead.
+
+Supported values:
+
+- `"none"`: restore the normal app-controlled behavior.
+- Cursor names: `"default"`, `"context-menu"`, `"help"`, `"pointer"`, `"progress"`, `"wait"`, `"cell"`, `"crosshair"`, `"text"`, `"vertical-text"`, `"alias"`, `"copy"`, `"move"`, `"no-drop"`, `"not-allowed"`, `"grab"`, `"grabbing"`, `"e-resize"`, `"n-resize"`, `"ne-resize"`, `"nw-resize"`, `"s-resize"`, `"se-resize"`, `"sw-resize"`, `"w-resize"`, `"ew-resize"`, `"ns-resize"`, `"nesw-resize"`, `"nwse-resize"`, `"col-resize"`, `"row-resize"`, `"all-scroll"`, `"zoom-in"`, `"zoom-out"`, `"dnd-ask"`, `"all-resize"`.
+
+If a later matching rule sets `force-cursor-shape "none"`, it restores the normal behavior even
+if an earlier rule forced a shape.
+
+This only overrides app-requested cursor changes.
+Compositor-owned cursors, like the screenshot crosshair or move/resize cursors, still show
+normally.
+
+If the app hides the cursor or uses a cursor surface, niri will still draw the forced named shape.
+
+```kdl
+window-rule {
+    match app-id="^my-game$"
+
+    force-cursor-shape "crosshair"
+}
+
+window-rule {
+    match app-id="^my-game$" title="^Launcher$"
+
+    force-cursor-shape "none"
 }
 ```
 
