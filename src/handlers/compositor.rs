@@ -21,9 +21,12 @@ use smithay::{delegate_compositor, delegate_shm};
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
-use crate::niri::{CastTarget, ClientState, LockState, MirrorSpawnTarget, State};
+use crate::niri::{
+    CastTarget, ClientState, LockState, MirrorForwardTarget, MirrorSpawnTarget, State,
+};
+use crate::utils::spawning::take_pending_mirror_spawn;
 use crate::utils::transaction::Transaction;
-use crate::utils::{is_mapped, send_scale_transform};
+use crate::utils::{get_credentials_for_surface, is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
 impl CompositorHandler for State {
@@ -193,26 +196,45 @@ impl CompositorHandler for State {
                         })
                         .map(|(mapped, _)| mapped.id());
 
-                    let (output, workspace_id) =
+                    let mirror_spawn_target =
                         if parent.is_none() && output.is_none() && workspace_id.is_none() {
-                            if let Some(target) = activation_token_data.and_then(|token| {
+                            let pending_target = get_credentials_for_surface(surface)
+                                .and_then(|credentials| take_pending_mirror_spawn(credentials.pid));
+                            let token_target = activation_token_data.as_ref().and_then(|token| {
                                 token.user_data.get::<MirrorSpawnTarget>().cloned()
-                            }) {
-                                let workspace_id = target.workspace_id.filter(|workspace_id| {
-                                    self.niri
-                                        .layout
-                                        .find_workspace_by_id(*workspace_id)
-                                        .is_some()
-                                });
-                                let output =
-                                    self.niri.output_by_name_match(&target.output_name).cloned();
-                                (output, workspace_id)
-                            } else {
-                                (output, workspace_id)
-                            }
+                            });
+
+                            pending_target.or(token_target).filter(|target| {
+                                self.niri.scene_mirror_lock.as_ref().is_some_and(|lock| {
+                                    lock.owner_mirror_id == target.owner_mirror_id
+                                })
+                            })
                         } else {
-                            (output, workspace_id)
+                            None
                         };
+
+                    let (output, workspace_id) = if let Some(target) = mirror_spawn_target.as_ref()
+                    {
+                        let workspace_id = target.workspace_id.filter(|workspace_id| {
+                            self.niri
+                                .layout
+                                .find_workspace_by_id(*workspace_id)
+                                .is_some()
+                        });
+                        let output = self.niri.output_by_name_match(&target.output_name).cloned();
+                        (output, workspace_id)
+                    } else {
+                        (output, workspace_id)
+                    };
+
+                    let activate = if mirror_spawn_target
+                        .as_ref()
+                        .is_some_and(|target| target.remote_focus_on_map)
+                    {
+                        ActivateWindow::No
+                    } else {
+                        activate
+                    };
 
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
@@ -255,6 +277,21 @@ impl CompositorHandler for State {
                         }
                     } else {
                         error!("layout is missing the window that we just added");
+                    }
+
+                    if let Some(target) =
+                        mirror_spawn_target.as_ref().filter(|target| {
+                            target.remote_focus_on_map
+                                && self.niri.scene_mirror_lock.as_ref().is_some_and(|lock| {
+                                    lock.owner_mirror_id == target.owner_mirror_id
+                                })
+                        })
+                    {
+                        self.set_mirror_keyboard_focus_override(MirrorForwardTarget {
+                            origin_mirror_id: target.owner_mirror_id,
+                            source_window_id: id,
+                        });
+                        self.remember_scene_mirror_interaction(target.owner_mirror_id);
                     }
 
                     if let Some(output) = output {

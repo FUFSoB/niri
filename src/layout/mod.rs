@@ -5921,6 +5921,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn interactive_move_end(&mut self, window: &W::Id) {
+        self.interactive_move_end_with_workspace_activation(window, true);
+    }
+
+    pub fn interactive_move_end_with_workspace_activation(
+        &mut self,
+        window: &W::Id,
+        allow_to_activate_workspace: bool,
+    ) {
         if matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
             self.refresh_interactive_move_hint(None);
         }
@@ -6016,8 +6024,9 @@ impl<W: LayoutElement> Layout<W> {
             );
         }
 
-        // Dragging in the overview shouldn't switch the workspace and so on.
-        let allow_to_activate_workspace = !self.overview_open;
+        // Dragging in the overview or via a locked scene mirror shouldn't switch the workspace
+        // and so on.
+        let allow_to_activate_workspace = allow_to_activate_workspace && !self.overview_open;
 
         match &mut self.monitor_set {
             MonitorSet::Normal {

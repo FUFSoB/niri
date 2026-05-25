@@ -16,7 +16,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Serial, SERIAL_COUNTER};
 
 use crate::input::PointerOrTouchStartData;
-use crate::niri::State;
+use crate::niri::{MirrorForwardTarget, State};
 use crate::utils::get_monotonic_time;
 use crate::window::mapped::MappedId;
 
@@ -30,6 +30,8 @@ pub struct MoveGrab {
     enable_view_offset: bool,
     move_icon: CursorIcon,
     toggle_floating_button: Option<u32>,
+    lock_owner_mirror_id: Option<MappedId>,
+    allow_workspace_activation_on_end: bool,
 
     // Accumulated and applied in frame().
     new_location: Point<f64, Logical>,
@@ -52,6 +54,17 @@ impl MoveGrab {
             .is_some_and(|keyboard| keyboard.modifier_state().ctrl)
     }
 
+    fn toggle_floating_button(start_data: &PointerOrTouchStartData<State>) -> Option<u32> {
+        match start_data {
+            PointerOrTouchStartData::Pointer(start_data) => match start_data.button {
+                0x110 => Some(0x111),
+                0x111 => Some(0x110),
+                _ => None,
+            },
+            PointerOrTouchStartData::Touch(_) => None,
+        }
+    }
+
     pub fn new(
         state: &mut State,
         start_data: PointerOrTouchStartData<State>,
@@ -61,14 +74,7 @@ impl MoveGrab {
     ) -> Option<Self> {
         let location = start_data.location();
         let (output, pos_within_output) = state.niri.output_under(location)?;
-        let toggle_floating_button = match &start_data {
-            PointerOrTouchStartData::Pointer(start_data) => match start_data.button {
-                0x110 => Some(0x111),
-                0x111 => Some(0x110),
-                _ => None,
-            },
-            PointerOrTouchStartData::Touch(_) => None,
-        };
+        let toggle_floating_button = Self::toggle_floating_button(&start_data);
 
         Some(Self {
             last_location: location,
@@ -81,10 +87,43 @@ impl MoveGrab {
             // Moving windows by their titlebars uses the default cursor by default.
             move_icon: move_icon.unwrap_or(CursorIcon::Default),
             toggle_floating_button,
+            lock_owner_mirror_id: None,
+            allow_workspace_activation_on_end: true,
             new_location: location,
             event_timestamp: None,
             relative_delta: None,
         })
+    }
+
+    pub fn new_remote(
+        start_data: PointerOrTouchStartData<State>,
+        start_output: Output,
+        start_pos_within_output: Point<f64, Logical>,
+        window: MappedId,
+        enable_view_offset: bool,
+        move_icon: Option<CursorIcon>,
+        lock_owner_mirror_id: Option<MappedId>,
+        allow_workspace_activation_on_end: bool,
+    ) -> Self {
+        let location = start_data.location();
+        let toggle_floating_button = Self::toggle_floating_button(&start_data);
+
+        Self {
+            last_location: location,
+            start_data,
+            start_output,
+            start_pos_within_output,
+            window,
+            gesture: GestureState::Recognizing,
+            enable_view_offset,
+            move_icon: move_icon.unwrap_or(CursorIcon::Default),
+            toggle_floating_button,
+            lock_owner_mirror_id,
+            allow_workspace_activation_on_end,
+            new_location: location,
+            event_timestamp: None,
+            relative_delta: None,
+        }
     }
 
     pub fn is_move(&self) -> bool {
@@ -99,37 +138,49 @@ impl MoveGrab {
         let layout = &mut data.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
-                // Activate the window on release. This is most prominent in the overview where
-                // windows are not activated on click. In the overview, we also try to do a nice
-                // synchronized workspace animation.
-                if layout.is_overview_open() {
-                    let res = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
-                        ws.windows()
-                            .any(|w| w.id() == self.window)
-                            .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
+                if let Some(owner_mirror_id) = self.lock_owner_mirror_id {
+                    data.set_mirror_keyboard_focus_override(MirrorForwardTarget {
+                        origin_mirror_id: owner_mirror_id,
+                        source_window_id: self.window,
                     });
-                    let res = res.or_else(|| {
-                        if !layout.is_sticky_window(&self.window) {
-                            return None;
+                    data.remember_scene_mirror_interaction(owner_mirror_id);
+                } else {
+                    // Activate the window on release. This is most prominent in the overview where
+                    // windows are not activated on click. In the overview, we also try to do a nice
+                    // synchronized workspace animation.
+                    if layout.is_overview_open() {
+                        let res = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
+                            ws.windows()
+                                .any(|w| w.id() == self.window)
+                                .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
+                        });
+                        let res = res.or_else(|| {
+                            if !layout.is_sticky_window(&self.window) {
+                                return None;
+                            }
+
+                            let ws = layout.workspace_under(
+                                false,
+                                &self.start_output,
+                                self.start_pos_within_output,
+                            )?;
+                            let ws_idx =
+                                layout.find_workspace_by_id(ws.id()).map(|(idx, _)| idx)?;
+                            Some((Some(self.start_output.clone()), ws_idx))
+                        });
+                        if let Some((Some(output), ws_idx)) = res {
+                            layout.focus_output(&output);
+                            layout.toggle_overview_to_workspace(ws_idx);
                         }
-
-                        let ws = layout.workspace_under(
-                            false,
-                            &self.start_output,
-                            self.start_pos_within_output,
-                        )?;
-                        let ws_idx = layout.find_workspace_by_id(ws.id()).map(|(idx, _)| idx)?;
-                        Some((Some(self.start_output.clone()), ws_idx))
-                    });
-                    if let Some((Some(output), ws_idx)) = res {
-                        layout.focus_output(&output);
-                        layout.toggle_overview_to_workspace(ws_idx);
                     }
-                }
 
-                layout.activate_window(&self.window);
+                    layout.activate_window(&self.window);
+                }
             }
-            GestureState::Move => layout.interactive_move_end(&self.window),
+            GestureState::Move => layout.interactive_move_end_with_workspace_activation(
+                &self.window,
+                self.allow_workspace_activation_on_end,
+            ),
             GestureState::ViewOffset => {
                 layout.pointer_view_offset_gesture_end();
             }

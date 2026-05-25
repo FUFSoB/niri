@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::Instant;
 use std::{io, thread};
 
 use atomic::Atomic;
@@ -11,7 +13,10 @@ use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
 use niri_config::Environment;
 use smithay::wayland::xdg_activation::XdgActivationToken;
 
+use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
+use crate::niri::MirrorSpawnTarget;
 use crate::utils::expand_home;
+use crate::window::mapped::MappedId;
 
 pub static REMOVE_ENV_RUST_BACKTRACE: AtomicBool = AtomicBool::new(false);
 pub static REMOVE_ENV_RUST_LIB_BACKTRACE: AtomicBool = AtomicBool::new(false);
@@ -20,6 +25,52 @@ pub static CHILD_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 
 static ORIGINAL_NOFILE_RLIMIT_CUR: Atomic<rlim_t> = Atomic::new(0);
 static ORIGINAL_NOFILE_RLIMIT_MAX: Atomic<rlim_t> = Atomic::new(0);
+
+#[derive(Debug)]
+struct PendingMirrorSpawn {
+    target: MirrorSpawnTarget,
+    registered_at: Instant,
+}
+
+struct SpawnedChild {
+    child: Child,
+    spawned_pid: Option<i32>,
+}
+
+fn pending_mirror_spawns() -> &'static Mutex<HashMap<i32, PendingMirrorSpawn>> {
+    static PENDING: OnceLock<Mutex<HashMap<i32, PendingMirrorSpawn>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prune_pending_mirror_spawns(spawns: &mut HashMap<i32, PendingMirrorSpawn>) {
+    let now = Instant::now();
+    spawns
+        .retain(|_, spawn| now.duration_since(spawn.registered_at) < XDG_ACTIVATION_TOKEN_TIMEOUT);
+}
+
+fn register_pending_mirror_spawn(pid: i32, target: MirrorSpawnTarget) {
+    let mut spawns = pending_mirror_spawns().lock().unwrap();
+    prune_pending_mirror_spawns(&mut spawns);
+    spawns.insert(
+        pid,
+        PendingMirrorSpawn {
+            target,
+            registered_at: Instant::now(),
+        },
+    );
+}
+
+pub(crate) fn take_pending_mirror_spawn(pid: i32) -> Option<MirrorSpawnTarget> {
+    let mut spawns = pending_mirror_spawns().lock().unwrap();
+    prune_pending_mirror_spawns(&mut spawns);
+    spawns.remove(&pid).map(|spawn| spawn.target)
+}
+
+pub fn clear_pending_mirror_spawns_for_owner(owner_mirror_id: MappedId) {
+    let mut spawns = pending_mirror_spawns().lock().unwrap();
+    prune_pending_mirror_spawns(&mut spawns);
+    spawns.retain(|_, spawn| spawn.target.owner_mirror_id != owner_mirror_id);
+}
 
 /// Increases the nofile rlimit to the maximum and stores the original value.
 pub fn store_and_increase_nofile_rlimit() {
@@ -64,6 +115,15 @@ pub fn restore_nofile_rlimit() {
 
 /// Spawns the command to run independently of the compositor.
 pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<XdgActivationToken>) {
+    spawn_with_target(command, token, None);
+}
+
+/// Spawns the command to run independently of the compositor with an optional mirror target.
+pub(crate) fn spawn_with_target<T: AsRef<OsStr> + Send + 'static>(
+    command: Vec<T>,
+    token: Option<XdgActivationToken>,
+    mirror_target: Option<MirrorSpawnTarget>,
+) {
     let _span = tracy_client::span!();
 
     if command.is_empty() {
@@ -75,7 +135,7 @@ pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<Xd
         .name("Command Spawner".to_owned())
         .spawn(move || {
             let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args, token);
+            spawn_sync(command, args, token, mirror_target);
         });
 
     if let Err(err) = res {
@@ -90,13 +150,26 @@ pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<Xd
 /// - https://github.com/swaywm/sway/blob/b3dcde8d69c3f1304b076968a7a64f54d0c958be/sway/commands/exec_always.c#L64
 /// - https://github.com/hyprwm/Hyprland/blob/1ac1ff457ab8ef1ae6a8f2ab17ee7965adfa729f/src/managers/KeybindManager.cpp#L987
 pub fn spawn_sh(command: String, token: Option<XdgActivationToken>) {
-    spawn(vec![String::from("sh"), String::from("-c"), command], token);
+    spawn_sh_with_target(command, token, None);
+}
+
+pub(crate) fn spawn_sh_with_target(
+    command: String,
+    token: Option<XdgActivationToken>,
+    mirror_target: Option<MirrorSpawnTarget>,
+) {
+    spawn_with_target(
+        vec![String::from("sh"), String::from("-c"), command],
+        token,
+        mirror_target,
+    );
 }
 
 fn spawn_sync(
     command: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     token: Option<XdgActivationToken>,
+    mirror_target: Option<MirrorSpawnTarget>,
 ) {
     let _span = tracy_client::span!();
 
@@ -156,9 +229,14 @@ fn spawn_sync(
 
     unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
 
-    let Some(mut child) = do_spawn(command, process) else {
+    let Some(spawned) = do_spawn(command, process) else {
         return;
     };
+    let mut child = spawned.child;
+
+    if let (Some(target), Some(pid)) = (mirror_target, spawned.spawned_pid) {
+        register_pending_mirror_spawn(pid, target);
+    }
 
     match child.wait() {
         Ok(status) => {
@@ -173,17 +251,44 @@ fn spawn_sync(
 }
 
 #[cfg(not(feature = "systemd"))]
-fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
+fn do_spawn(command: &OsStr, mut process: Command) -> Option<SpawnedChild> {
+    let mut pipe_fds = [-1; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        let err = io::Error::last_os_error();
+        warn!("error creating a pipe to transfer child PID: {err:?}");
+        return None;
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+
     unsafe {
+        let mut read_fd = Some(read_fd);
+        let mut write_fd = Some(write_fd);
+
         // Double-fork to avoid having to waitpid the child.
         process.pre_exec(move || {
+            if let Some(fd) = read_fd.take() {
+                libc::close(fd);
+            }
+
             match libc::fork() {
                 -1 => return Err(io::Error::last_os_error()),
                 0 => (),
-                _ => libc::_exit(0),
+                pid => {
+                    if let Some(fd) = write_fd.take() {
+                        let buf = pid.to_ne_bytes();
+                        let _ = libc::write(fd, buf.as_ptr().cast(), buf.len());
+                        libc::close(fd);
+                    }
+                    libc::_exit(0)
+                }
             }
 
             restore_nofile_rlimit();
+
+            if let Some(fd) = write_fd.take() {
+                libc::close(fd);
+            }
 
             Ok(())
         });
@@ -197,7 +302,39 @@ fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
         }
     };
 
-    Some(child)
+    unsafe {
+        libc::close(write_fd);
+    }
+
+    let mut spawned_pid = None;
+    let mut buf = [0; 4];
+    let mut offset = 0;
+    while offset < buf.len() {
+        let n = unsafe {
+            libc::read(
+                read_fd,
+                buf[offset..].as_mut_ptr().cast(),
+                (buf.len() - offset) as libc::size_t,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            warn!("error reading child PID: {err:?}");
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        offset += n as usize;
+    }
+    unsafe {
+        libc::close(read_fd);
+    }
+    if offset == buf.len() {
+        spawned_pid = Some(i32::from_ne_bytes(buf));
+    }
+
+    Some(SpawnedChild { child, spawned_pid })
 }
 
 #[cfg(feature = "systemd")]
@@ -213,7 +350,7 @@ mod systemd {
 
     use super::*;
 
-    pub fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
+    pub fn do_spawn(command: &OsStr, mut process: Command) -> Option<SpawnedChild> {
         #[cfg(target_env = "gnu")]
         use libc::close_range;
         #[cfg(target_os = "openbsd")]
@@ -340,12 +477,14 @@ mod systemd {
         drop(pipe_wait_read);
 
         // Wait for the grandchild PID.
+        let mut spawned_pid = None;
         if let Some(pipe) = pipe_pid_read {
             let mut buf = [0; 4];
             match read_all(pipe, &mut buf) {
                 Ok(()) => {
                     let pid = i32::from_ne_bytes(buf);
                     trace!("spawned PID: {pid}");
+                    spawned_pid = Some(pid);
 
                     // Start a systemd scope for the grandchild.
                     if let Err(err) = start_systemd_scope(command, child.id(), pid as u32) {
@@ -363,7 +502,7 @@ mod systemd {
         trace!("signaling child to exit");
         drop(pipe_wait_write);
 
-        Some(child)
+        Some(SpawnedChild { child, spawned_pid })
     }
 
     fn write_all(fd: impl AsFd, buf: &[u8]) -> rustix::io::Result<()> {

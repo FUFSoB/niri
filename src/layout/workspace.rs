@@ -1879,12 +1879,11 @@ impl<W: LayoutElement> Workspace<W> {
         is_focused: bool,
         activated_override: Option<&W::Id>,
     ) {
-        self.scrolling
-            .refresh(
-                is_active && !self.floating_is_active.get(),
-                is_focused,
-                activated_override,
-            );
+        self.scrolling.refresh(
+            is_active && !self.floating_is_active.get(),
+            is_focused,
+            activated_override,
+        );
         self.floating.refresh(
             is_active && self.floating_is_active.get(),
             is_focused,

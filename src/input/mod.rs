@@ -57,7 +57,7 @@ use crate::layout::{ActivateWindow, AddWindowTarget, HitType, LayoutElement as _
 use crate::niri::{CastTarget, PointContents, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
-use crate::utils::spawning::{spawn, spawn_sh};
+use crate::utils::spawning::{spawn_sh_with_target, spawn_with_target};
 use crate::utils::transaction::Transaction;
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 use crate::window::Mapped;
@@ -98,6 +98,15 @@ pub struct TabletToolPress {
 pub enum PointerOrTouchStartData<D: SeatHandler> {
     Pointer(PointerGrabStartData<D>),
     Touch(TouchGrabStartData<D>),
+}
+
+#[derive(Clone)]
+struct LockedSceneMirrorCursorContext {
+    owner_mirror_id: crate::window::mapped::MappedId,
+    output: Output,
+    workspace_id: Option<crate::layout::workspace::WorkspaceId>,
+    source_window_id: Option<crate::window::mapped::MappedId>,
+    source_pos_within_output: Option<Point<f64, Logical>>,
 }
 
 impl<D: SeatHandler> PointerOrTouchStartData<D> {
@@ -631,16 +640,12 @@ impl State {
         )
     }
 
-    fn locked_scene_mirror_context_under_cursor(
-        &self,
-    ) -> Option<(
-        Output,
-        Option<crate::layout::workspace::WorkspaceId>,
-        Option<crate::window::mapped::MappedId>,
-    )> {
+    fn locked_scene_mirror_context_under_cursor(&self) -> Option<LockedSceneMirrorCursorContext> {
         let lock = self.niri.scene_mirror_lock.as_ref()?;
         let pointer = self.niri.seat.get_pointer().unwrap();
-        let contents = self.niri.contents_under(pointer.current_location());
+        let pointer_loc = pointer.current_location();
+        let (_, pos_within_output) = self.niri.output_under(pointer_loc)?;
+        let contents = self.niri.contents_under(pointer_loc);
         let over_owner = contents
             .mirror_forward_window
             .is_some_and(|target| target.origin_mirror_id == lock.owner_mirror_id)
@@ -657,6 +662,21 @@ impl State {
             .windows()
             .find(|(_, mapped)| mapped.id() == lock.owner_mirror_id && mapped.is_scene_mirror())
             .map(|(_, mapped)| mapped)?;
+        let source_pos_within_output = contents.window.and_then(|(window, hit)| {
+            if window != lock.owner_mirror_id {
+                return None;
+            }
+
+            let HitType::Input { win_pos } = hit else {
+                return None;
+            };
+            let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
+            mapped.mirror_point_to_source(mirror_local)
+        });
+        let source_window_id = contents
+            .mirror_forward_window
+            .filter(|target| target.origin_mirror_id == lock.owner_mirror_id)
+            .map(|target| target.source_window_id);
         match mapped.mirror_source() {
             crate::window::mapped::MirrorSource::Window(_) => None,
             crate::window::mapped::MirrorSource::Output(name) => {
@@ -666,21 +686,35 @@ impl State {
                     .layout
                     .monitor_for_output(&output)
                     .map(|monitor| monitor.active_workspace_ref().id());
-                let source_window_id = contents
-                    .mirror_forward_window
-                    .filter(|target| target.origin_mirror_id == lock.owner_mirror_id)
-                    .map(|target| target.source_window_id);
-                Some((output, workspace_id, source_window_id))
+                Some(LockedSceneMirrorCursorContext {
+                    owner_mirror_id: lock.owner_mirror_id,
+                    output,
+                    workspace_id,
+                    source_window_id,
+                    source_pos_within_output,
+                })
             }
             crate::window::mapped::MirrorSource::Workspace(workspace_id) => {
                 let (_, workspace) = self.niri.layout.find_workspace_by_id(*workspace_id)?;
                 let output = workspace.current_output()?.clone();
-                let source_window_id = contents
-                    .mirror_forward_window
-                    .filter(|target| target.origin_mirror_id == lock.owner_mirror_id)
-                    .map(|target| target.source_window_id);
-                Some((output, Some(*workspace_id), source_window_id))
+                Some(LockedSceneMirrorCursorContext {
+                    owner_mirror_id: lock.owner_mirror_id,
+                    output,
+                    workspace_id: Some(*workspace_id),
+                    source_window_id,
+                    source_pos_within_output,
+                })
             }
+        }
+    }
+
+    fn refresh_locked_scene_mirror_interaction(&mut self, target: &LockedSceneMirrorCursorContext) {
+        self.remember_scene_mirror_interaction(target.owner_mirror_id);
+        if let Some(source_window_id) = target.source_window_id {
+            self.set_mirror_keyboard_focus_override(crate::niri::MirrorForwardTarget {
+                origin_mirror_id: target.owner_mirror_id,
+                source_window_id,
+            });
         }
     }
 
@@ -690,15 +724,63 @@ impl State {
             return false;
         }
 
-        let Some(window) = self
-            .locked_scene_mirror_context_under_cursor()
-            .and_then(|(_, _, window)| window)
-            .or_else(|| self.niri.window_under_cursor().map(|mapped| mapped.id()))
-        else {
-            return false;
-        };
         let is_overview_open = self.niri.layout.is_overview_open();
         let location = pointer.current_location();
+        let locked_target = self.locked_scene_mirror_context_under_cursor();
+
+        if let Some(target) = locked_target.as_ref() {
+            let Some(window) = target.source_window_id else {
+                return false;
+            };
+            let Some(source_pos_within_output) = target.source_pos_within_output else {
+                return false;
+            };
+
+            let started = self
+                .with_locked_scene_mirror_action_context(|state| {
+                    state.refresh_locked_scene_mirror_interaction(target);
+                    state.niri.layout.interactive_move_begin(
+                        window,
+                        &target.output,
+                        source_pos_within_output,
+                    )
+                })
+                .unwrap_or(false);
+            if !started {
+                return false;
+            }
+
+            let start_data = PointerGrabStartData {
+                focus: None,
+                button: button_code,
+                location,
+            };
+            let start_data = PointerOrTouchStartData::Pointer(start_data);
+            let icon = CursorIcon::Grabbing;
+            let grab = MoveGrab::new_remote(
+                start_data,
+                target.output.clone(),
+                source_pos_within_output,
+                window,
+                false,
+                Some(icon),
+                Some(target.owner_mirror_id),
+                false,
+            );
+
+            pointer.set_grab(self, grab, serial, Focus::Clear);
+            if !is_overview_open {
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::Named(icon));
+            }
+            self.niri.queue_redraw_all();
+            return true;
+        }
+
+        let Some(window) = self.niri.window_under_cursor().map(|mapped| mapped.id()) else {
+            return false;
+        };
 
         if !is_overview_open {
             self.niri.layout.activate_window(&window);
@@ -797,9 +879,10 @@ impl State {
             return false;
         }
 
-        let locked_source_window = self
-            .locked_scene_mirror_context_under_cursor()
-            .and_then(|(_, _, window)| window);
+        let locked_target = self.locked_scene_mirror_context_under_cursor();
+        let locked_source_window = locked_target
+            .as_ref()
+            .and_then(|target| target.source_window_id);
         let Some(mapped) = locked_source_window
             .and_then(|id| {
                 self.niri
@@ -818,15 +901,29 @@ impl State {
             .then(|| mapped.last_interactive_resize_start().get())
             .flatten();
         let location = pointer.current_location();
-        let (output, pos_within_output) = match self.niri.output_under(location) {
-            Some(rv) => rv,
-            None => return false,
+        let edges = if let Some(target) = locked_target.as_ref() {
+            let Some(source_pos_within_output) = target.source_pos_within_output else {
+                return false;
+            };
+            self.with_locked_scene_mirror_action_context(|state| {
+                state.refresh_locked_scene_mirror_interaction(target);
+                state
+                    .niri
+                    .layout
+                    .resize_edges_under(&target.output, source_pos_within_output)
+                    .unwrap_or(ResizeEdge::empty())
+            })
+            .unwrap_or(ResizeEdge::empty())
+        } else {
+            let (output, pos_within_output) = match self.niri.output_under(location) {
+                Some(rv) => rv,
+                None => return false,
+            };
+            self.niri
+                .layout
+                .resize_edges_under(output, pos_within_output)
+                .unwrap_or(ResizeEdge::empty())
         };
-        let edges = self
-            .niri
-            .layout
-            .resize_edges_under(output, pos_within_output)
-            .unwrap_or(ResizeEdge::empty());
         if edges.is_empty() {
             return false;
         }
@@ -835,8 +932,15 @@ impl State {
             if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
                 let intersection = edges.intersection(last_edges);
                 if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
-                    self.niri.layout.activate_window(&window);
-                    self.niri.layout.toggle_full_width();
+                    if let Some(target) = locked_target.as_ref() {
+                        self.with_locked_scene_mirror_action_context(|state| {
+                            state.refresh_locked_scene_mirror_interaction(target);
+                            state.niri.layout.toggle_full_width();
+                        });
+                    } else {
+                        self.niri.layout.activate_window(&window);
+                        self.niri.layout.toggle_full_width();
+                    }
                     self.niri.layout.with_windows_mut(|mapped, _| {
                         if mapped.id() == window {
                             mapped.last_interactive_resize_start().set(None);
@@ -846,8 +950,15 @@ impl State {
                     return true;
                 }
                 if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                    self.niri.layout.activate_window(&window);
-                    self.niri.layout.reset_window_height(Some(&window));
+                    if let Some(target) = locked_target.as_ref() {
+                        self.with_locked_scene_mirror_action_context(|state| {
+                            state.refresh_locked_scene_mirror_interaction(target);
+                            state.niri.layout.reset_window_height(Some(&window));
+                        });
+                    } else {
+                        self.niri.layout.activate_window(&window);
+                        self.niri.layout.reset_window_height(Some(&window));
+                    }
                     self.niri.layout.with_windows_mut(|mapped, _| {
                         if mapped.id() == window {
                             mapped.last_interactive_resize_start().set(None);
@@ -859,8 +970,17 @@ impl State {
             }
         }
 
-        self.niri.layout.activate_window(&window);
-        if !self.niri.layout.interactive_resize_begin(window, edges) {
+        let started = if let Some(target) = locked_target.as_ref() {
+            self.with_locked_scene_mirror_action_context(|state| {
+                state.refresh_locked_scene_mirror_interaction(target);
+                state.niri.layout.interactive_resize_begin(window, edges)
+            })
+            .unwrap_or(false)
+        } else {
+            self.niri.layout.activate_window(&window);
+            self.niri.layout.interactive_resize_begin(window, edges)
+        };
+        if !started {
             return false;
         }
 
@@ -901,17 +1021,16 @@ impl State {
         }
 
         let is_overview_open = self.niri.layout.is_overview_open();
-        let output_ws = if !is_overview_open {
-            self.locked_scene_mirror_context_under_cursor()
-                .and_then(|(output, workspace_id, _)| {
-                    let workspace_id = workspace_id?;
-                    let (_, workspace) = self.niri.layout.find_workspace_by_id(workspace_id)?;
-                    Some((output, workspace))
-                })
-        } else {
+        let locked_target = (!is_overview_open)
+            .then(|| self.locked_scene_mirror_context_under_cursor())
+            .flatten()
+            .filter(|target| target.workspace_id.is_some());
+        let output_ws = if locked_target.is_some() {
             None
+        } else {
+            Some(())
         }
-        .or_else(|| {
+        .and_then(|_| {
             if is_overview_open {
                 self.niri.workspace_under_cursor(true)
             } else {
@@ -921,12 +1040,28 @@ impl State {
                 })
             }
         });
-        let Some((output, ws)) = output_ws else {
-            return false;
+        let (output, ws_id) = if let Some(target) = locked_target.as_ref() {
+            (target.output.clone(), target.workspace_id.unwrap())
+        } else {
+            let Some((output, ws)) = output_ws else {
+                return false;
+            };
+            (output, ws.id())
         };
-        let ws_id = ws.id();
 
-        self.niri.layout.focus_output(&output);
+        if let Some(target) = locked_target.as_ref() {
+            if self
+                .with_locked_scene_mirror_action_context(|state| {
+                    state.refresh_locked_scene_mirror_interaction(target);
+                    true
+                })
+                .is_none()
+            {
+                return false;
+            }
+        } else {
+            self.niri.layout.focus_output(&output);
+        }
 
         let start_data = PointerGrabStartData {
             focus: None,
@@ -1829,22 +1964,24 @@ impl State {
                 self.niri.debug_toggle_damage();
             }
             Action::Spawn(command) => {
-                let token_data = self.niri.locked_scene_mirror_spawn_target().map(|target| {
+                let mirror_target = self.niri.locked_scene_mirror_spawn_target();
+                let token_data = mirror_target.clone().map(|target| {
                     let data = XdgActivationTokenData::default();
                     data.user_data.insert_if_missing(move || target.clone());
                     data
                 });
                 let (token, _) = self.niri.activation_state.create_external_token(token_data);
-                spawn(command, Some(token.clone()));
+                spawn_with_target(command, Some(token.clone()), mirror_target);
             }
             Action::SpawnSh(command) => {
-                let token_data = self.niri.locked_scene_mirror_spawn_target().map(|target| {
+                let mirror_target = self.niri.locked_scene_mirror_spawn_target();
+                let token_data = mirror_target.clone().map(|target| {
                     let data = XdgActivationTokenData::default();
                     data.user_data.insert_if_missing(move || target.clone());
                     data
                 });
                 let (token, _) = self.niri.activation_state.create_external_token(token_data);
-                spawn_sh(command, Some(token.clone()));
+                spawn_sh_with_target(command, Some(token.clone()), mirror_target);
             }
             Action::DoScreenTransition(delay_ms) => {
                 self.backend.with_primary_renderer(|renderer| {

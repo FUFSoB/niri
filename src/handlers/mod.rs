@@ -75,7 +75,7 @@ use smithay::{
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::ActivateWindow;
-use crate::niri::{DndIcon, NewClient, State};
+use crate::niri::{DndIcon, MirrorForwardTarget, MirrorSpawnTarget, NewClient, State};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
@@ -826,6 +826,24 @@ impl XdgActivationHandler for State {
                 let window = mapped.id();
                 if token_data.user_data.get::<UrgentOnlyMarker>().is_some() {
                     mapped.set_urgent(true);
+                    self.niri.queue_redraw_all();
+                } else if let Some(target) = token_data
+                    .user_data
+                    .get::<MirrorSpawnTarget>()
+                    .cloned()
+                    .filter(|target| {
+                        self.niri
+                            .scene_mirror_lock
+                            .as_ref()
+                            .is_some_and(|lock| lock.owner_mirror_id == target.owner_mirror_id)
+                    })
+                {
+                    self.set_mirror_keyboard_focus_override(MirrorForwardTarget {
+                        origin_mirror_id: target.owner_mirror_id,
+                        source_window_id: window,
+                    });
+                    self.remember_scene_mirror_interaction(target.owner_mirror_id);
+                    self.niri.layer_shell_on_demand_focus = None;
                     self.niri.queue_redraw_all();
                 } else {
                     self.niri.layout.activate_window(&window);

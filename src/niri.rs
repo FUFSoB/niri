@@ -176,7 +176,7 @@ use crate::ui::screenshot_ui::{
     ScreenshotUiRenderElement,
 };
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
-use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::spawning::{clear_pending_mirror_spawns_for_owner, CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::transaction::Transaction;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
@@ -603,8 +603,10 @@ struct SceneMirrorActionTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MirrorSpawnTarget {
+    pub owner_mirror_id: MappedId,
     pub output_name: String,
     pub workspace_id: Option<WorkspaceId>,
+    pub remote_focus_on_map: bool,
 }
 
 // The surfaces here are always toplevel surfaces focused as far as niri's logic is concerned, even
@@ -1249,6 +1251,11 @@ impl State {
     }
 
     pub fn set_scene_mirror_lock(&mut self, owner_mirror_id: MappedId) {
+        if let Some(lock) = &self.niri.scene_mirror_lock {
+            if lock.owner_mirror_id != owner_mirror_id {
+                clear_pending_mirror_spawns_for_owner(lock.owner_mirror_id);
+            }
+        }
         self.niri.scene_mirror_lock = Some(SceneMirrorLockState { owner_mirror_id });
         self.remember_scene_mirror_interaction(owner_mirror_id);
         self.niri.layer_shell_on_demand_focus = None;
@@ -1270,6 +1277,7 @@ impl State {
         {
             self.niri.mirror_keyboard_focus_override = None;
         }
+        clear_pending_mirror_spawns_for_owner(lock.owner_mirror_id);
         self.niri.scene_mirror_lock = None;
     }
 
@@ -4783,6 +4791,7 @@ impl Niri {
             return Some(target);
         }
 
+        clear_pending_mirror_spawns_for_owner(owner_mirror_id);
         self.scene_mirror_lock = None;
         if self
             .mirror_keyboard_focus_override
@@ -4797,8 +4806,10 @@ impl Niri {
     pub(crate) fn locked_scene_mirror_spawn_target(&mut self) -> Option<MirrorSpawnTarget> {
         let target = self.validated_scene_mirror_action_target()?;
         Some(MirrorSpawnTarget {
+            owner_mirror_id: target.owner_mirror_id,
             output_name: target.output.name(),
             workspace_id: target.workspace_id,
+            remote_focus_on_map: true,
         })
     }
 
@@ -5437,6 +5448,7 @@ impl Niri {
             .collect();
 
         for id in to_remove {
+            clear_pending_mirror_spawns_for_owner(id);
             if self
                 .scene_mirror_lock
                 .as_ref()
