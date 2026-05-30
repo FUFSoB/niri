@@ -19,13 +19,14 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
 use super::scrolling::{
-    Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
+    Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement, WindowHeight,
 };
 use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement,
-    MirrorSourceSnapshot, Options, RemovedTile, SizeFrac, StickyRestoreInfo, StickyRestorePosition,
+    LinkedMirrorPlacementSnapshot, LinkedMirrorStateSnapshot, MirrorSourceSnapshot, Options,
+    RemovedTile, SizeFrac, StickyRestoreInfo, StickyRestorePosition,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -544,6 +545,46 @@ impl<W: LayoutElement> Workspace<W> {
                         is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
                         restore_to_floating: tile.restore_to_floating,
                         sticky_restore_info: tile.sticky_restore_info.clone(),
+                    })
+            })
+    }
+
+    pub(super) fn linked_mirror_state_snapshot(
+        &self,
+        id: &W::Id,
+    ) -> Option<LinkedMirrorStateSnapshot> {
+        if let Some(tile) = self.floating.tiles().find(|tile| tile.window().id() == id) {
+            return Some(LinkedMirrorStateSnapshot {
+                placement: LinkedMirrorPlacementSnapshot::Floating {
+                    size: tile.window_size().to_i32_round(),
+                },
+                is_sticky: false,
+                is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
+                is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
+                is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                restore_to_floating: tile.restore_to_floating,
+            });
+        }
+
+        self.scrolling
+            .columns()
+            .find(|column| column.contains(id))
+            .and_then(|column| {
+                column
+                    .tiles()
+                    .enumerate()
+                    .find(|(_, (tile, _))| tile.window().id() == id)
+                    .map(|(tile_idx, (tile, _))| LinkedMirrorStateSnapshot {
+                        placement: LinkedMirrorPlacementSnapshot::Tiling {
+                            width: column.stored_width(),
+                            is_full_width: column.is_full_width(),
+                            height: column.window_height(tile_idx),
+                        },
+                        is_sticky: false,
+                        is_pending_fullscreen: column.is_pending_fullscreen(),
+                        is_pending_maximized: column.is_pending_maximized(),
+                        is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                        restore_to_floating: tile.restore_to_floating,
                     })
             })
     }
@@ -1282,6 +1323,14 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.toggle_full_width();
     }
 
+    pub fn toggle_full_width_for_window(&mut self, window: &W::Id) {
+        if self.floating.has_window(window) {
+            return;
+        }
+
+        self.scrolling.toggle_full_width_for_window(window);
+    }
+
     pub fn set_column_width(&mut self, change: SizeChange) {
         if self.floating_is_active.get() {
             self.floating.set_window_width(None, change, true);
@@ -1317,6 +1366,14 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         }
         self.scrolling.reset_window_height(window);
+    }
+
+    pub fn set_window_height_state(&mut self, window: &W::Id, height: WindowHeight) {
+        if self.floating.has_window(window) {
+            return;
+        }
+
+        self.scrolling.set_window_height_state(window, height);
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {

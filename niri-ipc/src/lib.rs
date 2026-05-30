@@ -335,6 +335,18 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Toggle whether a mirror stays synced to its real source window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Toggle syncing for the focused mirror window")
+    )]
+    ToggleWindowMirrorLink {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Set the zoom level of a mirror window.
     #[cfg_attr(
         feature = "clap",
@@ -1539,6 +1551,8 @@ pub struct Window {
     ///
     /// This is `None` for real windows.
     pub source_window_id: Option<u64>,
+    /// Whether this mirror is currently linked to its real source window.
+    pub is_mirror_linked: bool,
     /// Title, if set.
     pub title: Option<String>,
     /// Application ID, if set.

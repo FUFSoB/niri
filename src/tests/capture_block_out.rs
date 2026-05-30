@@ -335,6 +335,23 @@ fn mirror_mapped_by_id(
     (mapped.pending_sizing_mode(), mapped.size())
 }
 
+fn is_mirror_linked_by_id(f: &mut Fixture, id: MappedId) -> bool {
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == id)
+        .map(|(_, mapped)| mapped.is_mirror_linked())
+        .unwrap()
+}
+
+fn window_output_name_by_id(f: &mut Fixture, id: MappedId) -> Option<String> {
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == id)
+        .and_then(|(mon, _)| mon.map(|mon| mon.output_name().clone()))
+}
+
 fn tile_geometry_for(f: &mut Fixture, id: MappedId) -> (Point<i32, Logical>, Size<i32, Logical>) {
     let ws = f.niri().layout.active_workspace().unwrap();
     let (tile, pos, visible) = ws
@@ -1204,6 +1221,142 @@ fn mirror_from_sticky_source_starts_sticky_and_is_independent() {
 }
 
 #[test]
+fn mirror_link_enable_snaps_to_real_and_routes_floating_changes() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror(&mut f);
+
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(80));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(60));
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(!ws.is_floating(&source_id));
+    assert!(ws.is_floating(&mirror_id));
+    assert!(!is_mirror_linked_by_id(&mut f, mirror_id));
+
+    assert!(f.niri().layout.toggle_window_mirror_link(&mirror_id));
+    assert!(is_mirror_linked_by_id(&mut f, mirror_id));
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(!ws.is_floating(&source_id));
+    assert!(!ws.is_floating(&mirror_id));
+
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(ws.is_floating(&source_id));
+    assert!(ws.is_floating(&mirror_id));
+
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(!ws.is_floating(&source_id));
+    assert!(!ws.is_floating(&mirror_id));
+}
+
+#[test]
+fn mirror_link_resizes_with_real_and_linked_siblings() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+
+    let mirror1_id = create_window_mirror_for(&mut f, source_id);
+    let mirror2_id = create_window_mirror_for(&mut f, source_id);
+    assert!(f.niri().layout.toggle_window_mirror_link(&mirror1_id));
+    assert!(f.niri().layout.toggle_window_mirror_link(&mirror2_id));
+
+    f.niri()
+        .layout
+        .set_window_width(Some(&source_id), SizeChange::SetFixed(80));
+    f.niri()
+        .layout
+        .set_window_height(Some(&source_id), SizeChange::SetFixed(60));
+
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, source_id).1,
+        Size::from((80, 60))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, mirror1_id).1,
+        Size::from((80, 60))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, mirror2_id).1,
+        Size::from((80, 60))
+    );
+
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror1_id), SizeChange::SetFixed(20));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror1_id), SizeChange::SetFixed(30));
+
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, source_id).1,
+        Size::from((20, 30))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, mirror1_id).1,
+        Size::from((20, 30))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, mirror2_id).1,
+        Size::from((20, 30))
+    );
+}
+
+#[test]
+fn mirror_linked_group_does_not_mutate_unlinked_siblings() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+
+    let linked_mirror_id = create_window_mirror_for(&mut f, source_id);
+    let unlinked_mirror_id = create_window_mirror_for(&mut f, source_id);
+    assert!(f.niri().layout.toggle_window_mirror_link(&linked_mirror_id));
+    assert!(!is_mirror_linked_by_id(&mut f, unlinked_mirror_id));
+
+    f.niri()
+        .layout
+        .set_window_width(Some(&source_id), SizeChange::SetFixed(72));
+    f.niri()
+        .layout
+        .set_window_height(Some(&source_id), SizeChange::SetFixed(48));
+
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, source_id).1,
+        Size::from((72, 48))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, linked_mirror_id).1,
+        Size::from((72, 48))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, unlinked_mirror_id).1,
+        Size::from((40, 20))
+    );
+}
+
+#[test]
 fn mirror_view_tracks_source_resize_proportionally() {
     let Some(mut f) = set_up(Config::default()) else {
         return;
@@ -1572,6 +1725,41 @@ fn mirror_windows_resize_independently_from_each_other() {
     assert_eq!(
         sample_pixel(size2, &pixels2, size2.w / 2, size2.h - 16),
         [0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn mirror_link_move_to_output_stays_local() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    f.add_output(2, (120, 90));
+
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    assert!(f.niri().layout.toggle_window_mirror_link(&mirror_id));
+
+    let source_output_before = window_output_name_by_id(&mut f, source_id).unwrap();
+    assert_eq!(
+        window_output_name_by_id(&mut f, mirror_id).as_deref(),
+        Some(source_output_before.as_str())
+    );
+
+    let output2 = f.niri_output(2);
+    f.niri()
+        .layout
+        .move_to_output(Some(&mirror_id), &output2, None, ActivateWindow::No);
+
+    assert_eq!(
+        window_output_name_by_id(&mut f, source_id).as_deref(),
+        Some(source_output_before.as_str())
+    );
+    assert_ne!(
+        window_output_name_by_id(&mut f, mirror_id).as_deref(),
+        Some(source_output_before.as_str())
     );
 }
 

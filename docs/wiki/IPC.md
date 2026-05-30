@@ -69,11 +69,15 @@ They are not available over IPC because they require a live pointer/button grab 
 Mirror windows can now show a cropped, zoomed view of another window instead of always fitting the full source.
 This is useful for workflows like mirroring only the chat area of a livestream window into a separate floating window.
 New mirrors inherit the source window's current layout state when they are created.
+You can also toggle a per-mirror live link so layout changes propagate both ways between the mirror and the real window.
+When enabling the link, the real window's current layout state wins immediately.
+Workspace/output placement, floating position, and mirror viewport zoom/pan stay local to each mirror.
 
 For example:
 
 ```sh
 niri msg action create-window-mirror
+niri msg action toggle-window-mirror-link
 niri msg action set-window-mirror-zoom 2.0
 niri msg action set-window-mirror-center-x 75%
 niri msg action set-window-mirror-center-y 20%
@@ -91,6 +95,7 @@ niri msg action reset-window-mirror-view
 To target a specific mirror window instead of the focused one, use `--id`:
 
 ```sh
+niri msg action toggle-window-mirror-link --id 123
 niri msg action set-window-mirror-zoom --id 123 2.0
 ```
 

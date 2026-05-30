@@ -2888,6 +2888,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    pub fn toggle_full_width_for_window(&mut self, window: &W::Id) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let Some(col) = self.columns.iter_mut().find(|col| col.contains(window)) else {
+            return;
+        };
+
+        col.toggle_full_width();
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+    }
+
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
         if self.columns.is_empty() {
             return;
@@ -2956,6 +2969,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         };
 
         col.reset_window_height(tile_idx);
+
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+    }
+
+    pub fn set_window_height_state(&mut self, window: &W::Id, height: WindowHeight) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let Some((col, tile_idx)) = self.columns.iter_mut().find_map(|col| {
+            col.tiles
+                .iter()
+                .position(|tile| tile.window().id() == window)
+                .map(|tile_idx| (col, tile_idx))
+        }) else {
+            return;
+        };
+
+        if !matches!(height, WindowHeight::Auto { .. }) {
+            col.convert_heights_to_auto();
+        }
+
+        col.data[tile_idx].height = height;
+        col.is_pending_maximized = false;
+        col.update_tile_sizes(true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
@@ -4622,6 +4660,10 @@ impl<W: LayoutElement> Column<W> {
 
     pub fn is_full_width(&self) -> bool {
         self.is_full_width
+    }
+
+    pub fn window_height(&self, tile_idx: usize) -> WindowHeight {
+        self.data[tile_idx].height
     }
 
     pub fn pending_sizing_mode(&self) -> SizingMode {

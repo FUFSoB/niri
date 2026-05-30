@@ -834,6 +834,10 @@ fn print_window(window: &Window) {
     println!("Window ID {}:{focused}{urgent}{mirror}", window.id);
     if let Some(source_id) = window.source_window_id {
         println!("  Source window ID: {source_id}");
+        println!(
+            "  Mirror link: {}",
+            if window.is_mirror_linked { "on" } else { "off" }
+        );
     }
 
     if let Some(title) = &window.title {

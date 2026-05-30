@@ -157,6 +157,27 @@ impl State {
         }
     }
 
+    fn toggle_window_mirror_link(&mut self, id: Option<u64>) -> bool {
+        let window = match id {
+            Some(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id().get() == id && mapped.is_mirror())
+                .map(|(_, mapped)| mapped.id()),
+            None => self
+                .niri
+                .layout
+                .focus()
+                .and_then(|mapped| mapped.is_mirror().then(|| mapped.id())),
+        };
+        let Some(window) = window else {
+            return false;
+        };
+
+        self.niri.layout.toggle_window_mirror_link(&window)
+    }
+
     fn active_zoom_output(&self, requested_output: Option<&str>) -> Option<Output> {
         let output = match requested_output {
             Some(name) => self.niri.output_by_name_match(name).cloned(),
@@ -1536,6 +1557,16 @@ impl State {
             }
             Action::CreateWindowMirrorById(id) => {
                 self.create_window_mirror(Some(id));
+            }
+            Action::ToggleWindowMirrorLink => {
+                if self.toggle_window_mirror_link(None) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowMirrorLinkById(id) => {
+                if self.toggle_window_mirror_link(Some(id)) {
+                    self.niri.queue_redraw_all();
+                }
             }
             Action::SetWindowMirrorZoom(level) => {
                 if self.set_window_mirror_zoom(None, &level) {

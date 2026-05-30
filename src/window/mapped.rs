@@ -66,6 +66,9 @@ pub struct Mapped {
     /// Whether this mapped entry is only a mirror of another entry.
     is_mirror: bool,
 
+    /// Whether this mirror should stay synced to its real source window.
+    is_mirror_linked: bool,
+
     /// Current visual size for mirror entries.
     mirror_size: Size<i32, Logical>,
 
@@ -422,6 +425,7 @@ impl Mapped {
             id,
             source_id: id,
             is_mirror: false,
+            is_mirror_linked: false,
             mirror_size: Size::from((1, 1)),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
@@ -481,6 +485,7 @@ impl Mapped {
             id,
             source_id: source.source_id,
             is_mirror: true,
+            is_mirror_linked: false,
             mirror_size: source.size(),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
@@ -580,6 +585,14 @@ impl Mapped {
 
     pub fn is_mirror(&self) -> bool {
         self.is_mirror
+    }
+
+    pub fn is_mirror_linked(&self) -> bool {
+        self.is_mirror_linked
+    }
+
+    pub fn set_mirror_linked(&mut self, value: bool) {
+        self.is_mirror_linked = value;
     }
 
     pub fn element_namespace(&self) -> Option<usize> {
@@ -2405,6 +2418,22 @@ impl LayoutElement for Mapped {
 
     fn rules(&self) -> &ResolvedWindowRules {
         &self.rules
+    }
+
+    fn is_mirror(&self) -> bool {
+        self.is_mirror
+    }
+
+    fn mirror_source_id(&self) -> Option<&Self::Id> {
+        self.is_mirror.then_some(&self.source_id)
+    }
+
+    fn is_mirror_linked(&self) -> bool {
+        self.is_mirror_linked
+    }
+
+    fn set_mirror_linked(&mut self, value: bool) {
+        self.is_mirror_linked = value;
     }
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {

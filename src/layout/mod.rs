@@ -43,7 +43,7 @@ use niri_config::{
     WorkspaceReference, ZoomMovementMode,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
-use scrolling::{Column, ColumnWidth};
+use scrolling::{Column, ColumnWidth, WindowHeight};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::{Kind, NamespacedElement};
@@ -358,6 +358,22 @@ pub trait LayoutElement {
         let _ = value;
     }
 
+    fn is_mirror(&self) -> bool {
+        false
+    }
+
+    fn mirror_source_id(&self) -> Option<&Self::Id> {
+        None
+    }
+
+    fn is_mirror_linked(&self) -> bool {
+        false
+    }
+
+    fn set_mirror_linked(&mut self, value: bool) {
+        let _ = value;
+    }
+
     /// The effective geometry corner radius for this element.
     ///
     /// Returns zero when the element is in windowed fullscreen, since fullscreen windows have
@@ -424,6 +440,8 @@ pub struct Layout<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
+    /// Suppresses linked-mirror routing and fanout during internal sync application.
+    applying_linked_mirror_sync: bool,
 }
 
 #[derive(Debug)]
@@ -612,6 +630,44 @@ impl<WindowId> MirrorSourceSnapshot<WindowId> {
             ColumnWidth::Proportion(proportion) => PresetSize::Proportion(proportion),
             ColumnWidth::Fixed(fixed) => PresetSize::Fixed(fixed.round() as i32),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LinkedMirrorPlacementSnapshot {
+    Floating {
+        size: Size<i32, Logical>,
+    },
+    Tiling {
+        width: ColumnWidth,
+        is_full_width: bool,
+        height: WindowHeight,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LinkedMirrorStateSnapshot {
+    placement: LinkedMirrorPlacementSnapshot,
+    is_sticky: bool,
+    is_pending_fullscreen: bool,
+    is_pending_maximized: bool,
+    is_windowed_fullscreen: bool,
+    restore_to_floating: bool,
+}
+
+impl LinkedMirrorStateSnapshot {
+    fn is_floating(&self) -> bool {
+        matches!(
+            self.placement,
+            LinkedMirrorPlacementSnapshot::Floating { .. }
+        )
+    }
+
+    fn tiled_is_full_width(&self) -> Option<bool> {
+        match self.placement {
+            LinkedMirrorPlacementSnapshot::Floating { .. } => None,
+            LinkedMirrorPlacementSnapshot::Tiling { is_full_width, .. } => Some(is_full_width),
+        }
     }
 }
 
@@ -1304,6 +1360,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: Rc::new(options),
+            applying_linked_mirror_sync: false,
         }
     }
 
@@ -1333,6 +1390,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: opts,
+            applying_linked_mirror_sync: false,
         }
     }
 
@@ -1791,6 +1849,33 @@ impl<W: LayoutElement> Layout<W> {
         });
     }
 
+    pub fn toggle_window_mirror_link(&mut self, window: &W::Id) -> bool {
+        let Some((source_id, new_value)) = self.window_by_id(window).and_then(|mapped| {
+            mapped.is_mirror().then(|| {
+                (
+                    mapped.mirror_source_id().cloned().unwrap(),
+                    !mapped.is_mirror_linked(),
+                )
+            })
+        }) else {
+            return false;
+        };
+
+        let mut updated = false;
+        self.with_windows_mut(|mapped, _| {
+            if mapped.id() == window {
+                mapped.set_mirror_linked(new_value);
+                updated = true;
+            }
+        });
+
+        if updated && new_value {
+            self.sync_linked_mirrors_from_real(&source_id);
+        }
+
+        updated
+    }
+
     pub fn remove_window(
         &mut self,
         window: &W::Id,
@@ -1908,6 +1993,10 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(window))
+            .flatten();
+
         let mut refresh_hint = None;
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -1949,6 +2038,10 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
             }
+        }
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
         }
     }
 
@@ -4042,13 +4135,48 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_width(&mut self, forwards: bool) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target_for_focus() {
+                self.toggle_window_width(Some(&window), forwards);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_focus())
+            .flatten();
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
         workspace.toggle_width(forwards);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.toggle_window_width(Some(&window), forwards);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4076,9 +4204,33 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.toggle_window_width(window, forwards);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.toggle_window_height(Some(&window), forwards);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4106,23 +4258,78 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.toggle_window_height(window, forwards);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn toggle_full_width(&mut self) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target_for_focus() {
+                self.toggle_full_width_for_window(&window);
+                self.sync_linked_mirrors_from_real(&window);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_focus())
+            .flatten();
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
         workspace.toggle_full_width();
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn set_column_width(&mut self, change: SizeChange) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target_for_focus() {
+                self.set_window_width(Some(&window), change);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_focus())
+            .flatten();
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
         workspace.set_column_width(change);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.set_window_width(Some(&window), change);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4130,14 +4337,29 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         if let Some(window) = window {
-            if self.is_sticky_window(window) {
+            if self.is_sticky_window(window) && !self.applying_linked_mirror_sync {
                 return;
             }
         } else if self
             .active_monitor_ref()
             .is_some_and(|mon| mon.sticky_is_active())
+            && !self.applying_linked_mirror_sync
         {
             return;
+        }
+
+        if let Some(window) = window {
+            if self.applying_linked_mirror_sync {
+                if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+                    if let Some(mon) = monitors
+                        .iter_mut()
+                        .find(|mon| mon.sticky_has_window(window))
+                    {
+                        mon.sticky.set_window_width(Some(window), change, true);
+                        return;
+                    }
+                }
+            }
         }
 
         let workspace = if let Some(window) = window {
@@ -4150,9 +4372,33 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.set_window_width(window, change);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.set_window_height(Some(&window), change);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4160,14 +4406,29 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         if let Some(window) = window {
-            if self.is_sticky_window(window) {
+            if self.is_sticky_window(window) && !self.applying_linked_mirror_sync {
                 return;
             }
         } else if self
             .active_monitor_ref()
             .is_some_and(|mon| mon.sticky_is_active())
+            && !self.applying_linked_mirror_sync
         {
             return;
+        }
+
+        if let Some(window) = window {
+            if self.applying_linked_mirror_sync {
+                if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+                    if let Some(mon) = monitors
+                        .iter_mut()
+                        .find(|mon| mon.sticky_has_window(window))
+                    {
+                        mon.sticky.set_window_height(Some(window), change, true);
+                        return;
+                    }
+                }
+            }
         }
 
         let workspace = if let Some(window) = window {
@@ -4180,9 +4441,33 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.set_window_height(window, change);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.reset_window_height(Some(&window));
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4210,6 +4495,10 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.reset_window_height(window);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn expand_column_to_available_width(&mut self) {
@@ -4220,6 +4509,26 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_window_floating(&mut self, window: Option<&W::Id>) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.toggle_window_floating(Some(&window));
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         let mut refresh_hint = None;
         if let Some(state) = self.interactive_move.take() {
             match state {
@@ -4308,9 +4617,33 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.toggle_window_floating(window);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn toggle_window_sticky(&mut self, window: Option<&W::Id>) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.toggle_window_sticky(Some(&window));
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -4439,6 +4772,10 @@ impl<W: LayoutElement> Layout<W> {
                 *active_monitor_idx = target_mon_idx;
             }
 
+            if let Some(source) = sync_root.as_ref() {
+                self.sync_linked_mirrors_from_real(source);
+            }
+
             return;
         }
 
@@ -4478,9 +4815,33 @@ impl<W: LayoutElement> Layout<W> {
         if target_is_active {
             *active_monitor_idx = mon_idx;
         }
+
+        if let Some(source) = sync_root.as_ref() {
+            self.sync_linked_mirrors_from_real(source);
+        }
     }
 
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {
+        if !self.applying_linked_mirror_sync {
+            let routed = if let Some(window) = window {
+                self.linked_mirror_real_target(window)
+            } else {
+                self.linked_mirror_real_target_for_focus()
+            };
+            if let Some(window) = routed {
+                self.set_window_floating(Some(&window), floating);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| {
+                window
+                    .and_then(|window| self.linked_mirror_sync_root_for_window(window))
+                    .or_else(|| self.linked_mirror_sync_root_for_focus())
+            })
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 if move_.is_sticky {
@@ -4519,6 +4880,10 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.set_window_floating(window, floating);
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn focus_floating(&mut self) {
@@ -4952,6 +5317,17 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn set_fullscreen(&mut self, id: &W::Id, is_fullscreen: bool) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target(id) {
+                self.set_fullscreen(&window, is_fullscreen);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(id))
+            .flatten();
+
         // Check if this is a request to unset the windowed fullscreen state.
         if !is_fullscreen {
             let mut handled = false;
@@ -4962,6 +5338,9 @@ impl<W: LayoutElement> Layout<W> {
                 }
             });
             if handled {
+                if let Some(source) = sync_root {
+                    self.sync_linked_mirrors_from_real(&source);
+                }
                 return;
             }
         }
@@ -4972,30 +5351,68 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        let mut changed = false;
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.set_fullscreen(id, is_fullscreen);
-                return;
+                changed = true;
+                break;
+            }
+        }
+
+        if changed {
+            if let Some(source) = sync_root {
+                self.sync_linked_mirrors_from_real(&source);
             }
         }
     }
 
     pub fn toggle_fullscreen(&mut self, id: &W::Id) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target(id) {
+                self.toggle_fullscreen(&window);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(id))
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == id {
                 return;
             }
         }
 
+        let mut changed = false;
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.toggle_fullscreen(id);
-                return;
+                changed = true;
+                break;
+            }
+        }
+
+        if changed {
+            if let Some(source) = sync_root {
+                self.sync_linked_mirrors_from_real(&source);
             }
         }
     }
 
     pub fn toggle_windowed_fullscreen(&mut self, id: &W::Id) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target(id) {
+                self.toggle_windowed_fullscreen(&window);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(id))
+            .flatten();
+
         let (_, window) = self.windows().find(|(_, win)| win.id() == id).unwrap();
         if window.pending_sizing_mode().is_fullscreen() {
             // Remove the real fullscreen.
@@ -5013,34 +5430,76 @@ impl<W: LayoutElement> Layout<W> {
                 window.request_windowed_fullscreen(!window.is_pending_windowed_fullscreen());
             }
         });
+
+        if let Some(source) = sync_root {
+            self.sync_linked_mirrors_from_real(&source);
+        }
     }
 
     pub fn set_maximized(&mut self, id: &W::Id, maximize: bool) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target(id) {
+                self.set_maximized(&window, maximize);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(id))
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == id {
                 return;
             }
         }
 
+        let mut changed = false;
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.set_maximized(id, maximize);
-                return;
+                changed = true;
+                break;
+            }
+        }
+
+        if changed {
+            if let Some(source) = sync_root {
+                self.sync_linked_mirrors_from_real(&source);
             }
         }
     }
 
     pub fn toggle_maximized(&mut self, id: &W::Id) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(window) = self.linked_mirror_real_target(id) {
+                self.toggle_maximized(&window);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(id))
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == id {
                 return;
             }
         }
 
+        let mut changed = false;
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.toggle_maximized(id);
-                return;
+                changed = true;
+                break;
+            }
+        }
+
+        if changed {
+            if let Some(source) = sync_root {
+                self.sync_linked_mirrors_from_real(&source);
             }
         }
     }
@@ -6351,6 +6810,12 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
+        if !self.applying_linked_mirror_sync {
+            if let Some(real) = self.linked_mirror_real_target(&window) {
+                return self.interactive_resize_begin(real, edges);
+            }
+        }
+
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
@@ -6382,6 +6847,16 @@ impl<W: LayoutElement> Layout<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
+        if !self.applying_linked_mirror_sync {
+            if let Some(real) = self.linked_mirror_real_target(window) {
+                return self.interactive_resize_update(&real, delta);
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(window))
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {
                 return false;
@@ -6392,12 +6867,24 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     if mon.sticky.has_window(window) {
-                        return mon.sticky.interactive_resize_update(window, delta);
+                        let updated = mon.sticky.interactive_resize_update(window, delta);
+                        if updated {
+                            if let Some(source) = sync_root {
+                                self.sync_linked_mirrors_from_real(&source);
+                            }
+                        }
+                        return updated;
                     }
 
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            return ws.interactive_resize_update(window, delta);
+                            let updated = ws.interactive_resize_update(window, delta);
+                            if updated {
+                                if let Some(source) = sync_root {
+                                    self.sync_linked_mirrors_from_real(&source);
+                                }
+                            }
+                            return updated;
                         }
                     }
                 }
@@ -6405,7 +6892,13 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        return ws.interactive_resize_update(window, delta);
+                        let updated = ws.interactive_resize_update(window, delta);
+                        if updated {
+                            if let Some(source) = sync_root {
+                                self.sync_linked_mirrors_from_real(&source);
+                            }
+                        }
+                        return updated;
                     }
                 }
             }
@@ -6415,6 +6908,17 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn interactive_resize_end(&mut self, window: &W::Id) {
+        if !self.applying_linked_mirror_sync {
+            if let Some(real) = self.linked_mirror_real_target(window) {
+                self.interactive_resize_end(&real);
+                return;
+            }
+        }
+
+        let sync_root = (!self.applying_linked_mirror_sync)
+            .then(|| self.linked_mirror_sync_root_for_window(window))
+            .flatten();
+
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {
                 return;
@@ -6426,12 +6930,18 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     if mon.sticky.has_window(window) {
                         mon.sticky.interactive_resize_end(Some(window));
+                        if let Some(source) = sync_root {
+                            self.sync_linked_mirrors_from_real(&source);
+                        }
                         return;
                     }
 
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
                             ws.interactive_resize_end(Some(window));
+                            if let Some(source) = sync_root {
+                                self.sync_linked_mirrors_from_real(&source);
+                            }
                             return;
                         }
                     }
@@ -6441,6 +6951,9 @@ impl<W: LayoutElement> Layout<W> {
                 for ws in workspaces {
                     if ws.has_window(window) {
                         ws.interactive_resize_end(Some(window));
+                        if let Some(source) = sync_root {
+                            self.sync_linked_mirrors_from_real(&source);
+                        }
                         return;
                     }
                 }
@@ -7052,6 +7565,217 @@ impl<W: LayoutElement> Layout<W> {
                 .iter()
                 .find_map(|ws| ws.mirror_source_snapshot(window)),
         }
+    }
+
+    fn linked_mirror_state_snapshot(&self, window: &W::Id) -> Option<LinkedMirrorStateSnapshot> {
+        if self
+            .interactive_move
+            .as_ref()
+            .and_then(InteractiveMoveState::moving)
+            .is_some_and(|move_| move_.tile.window().id() == window)
+        {
+            return None;
+        }
+
+        match &self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors
+                .iter()
+                .find_map(|mon| mon.linked_mirror_state_snapshot(window)),
+            MonitorSet::NoOutputs { workspaces } => workspaces
+                .iter()
+                .find_map(|ws| ws.linked_mirror_state_snapshot(window)),
+        }
+    }
+
+    fn linked_mirror_real_target(&self, window: &W::Id) -> Option<W::Id> {
+        let window = self.window_by_id(window)?;
+        (window.is_mirror() && window.is_mirror_linked())
+            .then(|| window.mirror_source_id().cloned())
+            .flatten()
+    }
+
+    fn linked_mirror_real_target_for_focus(&self) -> Option<W::Id> {
+        self.focus().and_then(|window| {
+            (window.is_mirror() && window.is_mirror_linked())
+                .then(|| window.mirror_source_id().cloned())
+                .flatten()
+        })
+    }
+
+    fn linked_mirror_ids_for_source(&self, source: &W::Id) -> Vec<W::Id> {
+        self.windows()
+            .filter(|(_, window)| {
+                window.is_mirror()
+                    && window.is_mirror_linked()
+                    && window
+                        .mirror_source_id()
+                        .is_some_and(|mirror_source| mirror_source == source)
+            })
+            .map(|(_, window)| window.id().clone())
+            .collect()
+    }
+
+    fn linked_mirror_sync_root_for_window(&self, window: &W::Id) -> Option<W::Id> {
+        self.linked_mirror_real_target(window).or_else(|| {
+            self.windows()
+                .any(|(_, candidate)| {
+                    candidate.is_mirror()
+                        && candidate.is_mirror_linked()
+                        && candidate
+                            .mirror_source_id()
+                            .is_some_and(|source| source == window)
+                })
+                .then(|| window.clone())
+        })
+    }
+
+    fn linked_mirror_sync_root_for_focus(&self) -> Option<W::Id> {
+        self.focus()
+            .and_then(|window| self.linked_mirror_sync_root_for_window(window.id()))
+    }
+
+    fn with_linked_mirror_sync_suppressed<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let was_suppressed = mem::replace(&mut self.applying_linked_mirror_sync, true);
+        let rv = f(self);
+        self.applying_linked_mirror_sync = was_suppressed;
+        rv
+    }
+
+    fn sync_linked_mirrors_from_real(&mut self, source: &W::Id) {
+        if self.applying_linked_mirror_sync {
+            return;
+        }
+
+        let mirror_ids = self.linked_mirror_ids_for_source(source);
+        if mirror_ids.is_empty() {
+            return;
+        }
+
+        let Some(snapshot) = self.linked_mirror_state_snapshot(source) else {
+            return;
+        };
+
+        self.with_linked_mirror_sync_suppressed(|this| {
+            for mirror_id in mirror_ids {
+                this.apply_linked_mirror_state_snapshot(&mirror_id, snapshot);
+            }
+        });
+    }
+
+    fn apply_linked_mirror_state_snapshot(
+        &mut self,
+        window: &W::Id,
+        snapshot: LinkedMirrorStateSnapshot,
+    ) {
+        let Some(mut current) = self.linked_mirror_state_snapshot(window) else {
+            return;
+        };
+
+        if current.is_sticky != snapshot.is_sticky {
+            self.toggle_window_sticky(Some(window));
+            let Some(updated) = self.linked_mirror_state_snapshot(window) else {
+                return;
+            };
+            current = updated;
+        }
+
+        if current.is_floating() != snapshot.is_floating() {
+            self.set_window_floating(Some(window), snapshot.is_floating());
+            let Some(updated) = self.linked_mirror_state_snapshot(window) else {
+                return;
+            };
+            current = updated;
+        }
+
+        match snapshot.placement {
+            LinkedMirrorPlacementSnapshot::Floating { size } => {
+                self.set_window_width(Some(window), SizeChange::SetFixed(size.w));
+                self.set_window_height(Some(window), SizeChange::SetFixed(size.h));
+            }
+            LinkedMirrorPlacementSnapshot::Tiling {
+                width,
+                is_full_width,
+                height,
+            } => {
+                let width_change = match width {
+                    ColumnWidth::Fixed(fixed) => SizeChange::SetFixed(fixed.round() as i32),
+                    ColumnWidth::Proportion(proportion) => {
+                        SizeChange::SetProportion(proportion * 100.)
+                    }
+                };
+                self.set_window_width(Some(window), width_change);
+                self.set_window_height_state(window, height);
+
+                if self
+                    .linked_mirror_state_snapshot(window)
+                    .and_then(|snapshot| snapshot.tiled_is_full_width())
+                    .is_some_and(|current_full_width| current_full_width != is_full_width)
+                {
+                    self.toggle_full_width_for_window(window);
+                }
+            }
+        }
+
+        if snapshot.is_windowed_fullscreen {
+            self.with_windows_mut(|mapped, _| {
+                if mapped.id() == window {
+                    mapped.request_windowed_fullscreen(true);
+                }
+            });
+        } else {
+            if current.is_windowed_fullscreen {
+                self.with_windows_mut(|mapped, _| {
+                    if mapped.id() == window {
+                        mapped.request_windowed_fullscreen(false);
+                    }
+                });
+            }
+
+            if current.is_pending_fullscreen && !snapshot.is_pending_fullscreen {
+                self.set_fullscreen(window, false);
+            }
+            if current.is_pending_maximized && !snapshot.is_pending_maximized {
+                self.set_maximized(window, false);
+            }
+            if snapshot.is_pending_maximized {
+                self.set_maximized(window, true);
+            }
+            if snapshot.is_pending_fullscreen {
+                self.set_fullscreen(window, true);
+            }
+        }
+
+        self.with_tile_mut(window, |tile| {
+            tile.restore_to_floating = snapshot.restore_to_floating;
+        });
+    }
+
+    fn set_window_height_state(&mut self, window: &W::Id, height: WindowHeight) {
+        if self.is_sticky_window(window) {
+            return;
+        }
+
+        let Some(workspace) = self.workspace_for_window_mut(window) else {
+            return;
+        };
+        workspace.set_window_height_state(window, height);
+    }
+
+    fn toggle_full_width_for_window(&mut self, window: &W::Id) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if move_.tile.window().id() == window {
+                return;
+            }
+        }
+
+        if self.is_sticky_window(window) {
+            return;
+        }
+
+        let Some(workspace) = self.workspace_for_window_mut(window) else {
+            return;
+        };
+        workspace.toggle_full_width_for_window(window);
     }
 
     fn with_tile_mut(&mut self, window: &W::Id, f: impl FnOnce(&mut Tile<W>)) -> bool {

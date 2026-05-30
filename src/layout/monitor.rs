@@ -19,8 +19,8 @@ use super::workspace::{
     WorkspaceRenderElement,
 };
 use super::{
-    compute_overview_zoom, ActivateWindow, HitType, LayoutElement, MirrorSourceSnapshot, Options,
-    RemovedTile,
+    compute_overview_zoom, ActivateWindow, HitType, LayoutElement, LinkedMirrorPlacementSnapshot,
+    LinkedMirrorStateSnapshot, MirrorSourceSnapshot, Options, RemovedTile,
 };
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -484,6 +484,32 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspaces
             .iter()
             .find_map(|ws| ws.mirror_source_snapshot(window))
+    }
+
+    pub(super) fn linked_mirror_state_snapshot(
+        &self,
+        window: &W::Id,
+    ) -> Option<LinkedMirrorStateSnapshot> {
+        if let Some(tile) = self
+            .sticky
+            .tiles()
+            .find(|tile| tile.window().id() == window)
+        {
+            return Some(LinkedMirrorStateSnapshot {
+                placement: LinkedMirrorPlacementSnapshot::Floating {
+                    size: tile.window_size().to_i32_round(),
+                },
+                is_sticky: true,
+                is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
+                is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
+                is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                restore_to_floating: tile.restore_to_floating,
+            });
+        }
+
+        self.workspaces
+            .iter()
+            .find_map(|ws| ws.linked_mirror_state_snapshot(window))
     }
 
     pub fn activate_sticky_window(&mut self, window: &W::Id) -> bool {

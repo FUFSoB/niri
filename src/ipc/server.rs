@@ -616,6 +616,7 @@ fn make_ipc_window(
         id: mapped.id().get(),
         is_mirror: mapped.is_mirror(),
         source_window_id: mapped.is_mirror().then(|| mapped.source_id().get()),
+        is_mirror_linked: mapped.is_mirror_linked(),
         title: role.title.clone(),
         app_id: role.app_id.clone(),
         pid: mapped.credentials().map(|c| c.pid),

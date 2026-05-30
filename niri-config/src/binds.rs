@@ -162,6 +162,9 @@ pub enum Action {
     CreateWindowMirror,
     #[knuffel(skip)]
     CreateWindowMirrorById(u64),
+    ToggleWindowMirrorLink,
+    #[knuffel(skip)]
+    ToggleWindowMirrorLinkById(u64),
     SetWindowMirrorZoom(#[knuffel(argument)] String),
     #[knuffel(skip)]
     SetWindowMirrorZoomById {
@@ -505,6 +508,10 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::CreateWindowMirror { id: None } => Self::CreateWindowMirror,
             niri_ipc::Action::CreateWindowMirror { id: Some(id) } => {
                 Self::CreateWindowMirrorById(id)
+            }
+            niri_ipc::Action::ToggleWindowMirrorLink { id: None } => Self::ToggleWindowMirrorLink,
+            niri_ipc::Action::ToggleWindowMirrorLink { id: Some(id) } => {
+                Self::ToggleWindowMirrorLinkById(id)
             }
             niri_ipc::Action::SetWindowMirrorZoom { id: None, level } => {
                 Self::SetWindowMirrorZoom(level)
