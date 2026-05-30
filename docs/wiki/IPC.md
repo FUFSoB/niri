@@ -68,6 +68,7 @@ They are not available over IPC because they require a live pointer/button grab 
 
 Mirror windows can now show a cropped, zoomed view of another window instead of always fitting the full source.
 This is useful for workflows like mirroring only the chat area of a livestream window into a separate floating window.
+New mirrors inherit the source window's current layout state when they are created.
 
 For example:
 

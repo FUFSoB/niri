@@ -312,14 +312,10 @@ fn create_window_mirror_for(f: &mut Fixture, source_id: MappedId) -> MappedId {
         .unwrap();
     let mirror = Mapped::new_mirror(mapped);
     let mirror_id = mirror.id();
-    niri.layout.add_window(
+    niri.layout.add_window_mirror(
+        &source_id,
         mirror,
         AddWindowTarget::NextTo(&source_id),
-        None,
-        None,
-        false,
-        false,
-        false,
         ActivateWindow::Smart,
     );
     mirror_id
@@ -1156,6 +1152,55 @@ fn mirror_created_from_mirror_inherits_view_state() {
         (transforms[0].1, transforms[1].1)
     };
     assert_eq!(transform1, transform2);
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(ws.is_floating(&mirror1_id));
+    assert!(ws.is_floating(&mirror2_id));
+}
+
+#[test]
+fn mirror_from_floating_source_starts_floating_and_is_independent() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+
+    let mirror_id = create_window_mirror(&mut f);
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(ws.is_floating(&source_id));
+    assert!(ws.is_floating(&mirror_id));
+
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    assert!(!ws.is_floating(&source_id));
+    assert!(ws.is_floating(&mirror_id));
+}
+
+#[test]
+fn mirror_from_sticky_source_starts_sticky_and_is_independent() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_sticky(Some(&source_id));
+
+    let mirror_id = create_window_mirror(&mut f);
+
+    assert!(f.niri().layout.is_sticky_window(&source_id));
+    assert!(f.niri().layout.is_sticky_window(&mirror_id));
+
+    f.niri().layout.toggle_window_sticky(Some(&source_id));
+
+    assert!(!f.niri().layout.is_sticky_window(&source_id));
+    assert!(f.niri().layout.is_sticky_window(&mirror_id));
 }
 
 #[test]
@@ -1740,7 +1785,7 @@ fn hidden_source_does_not_clear_visible_mirror_primary_scanout() {
 }
 
 #[test]
-fn mirror_from_fullscreen_source_starts_normal_and_can_fullscreen() {
+fn mirror_from_fullscreen_source_inherits_fullscreen_state() {
     let mut config = Config::default();
     config.layout.gaps = 0.;
     let Some(mut f) = set_up(config) else {
@@ -1755,18 +1800,18 @@ fn mirror_from_fullscreen_source_starts_normal_and_can_fullscreen() {
     let mirror_id = create_window_mirror(&mut f);
 
     let (source_mode, _) = mirror_mapped_by_id(&mut f, source_id);
-    let (mirror_mode, _) = mirror_mapped_by_id(&mut f, mirror_id);
-    assert!(source_mode.is_fullscreen());
-    assert!(mirror_mode.is_normal());
-
-    f.niri().layout.toggle_fullscreen(&mirror_id);
     let (mirror_mode, mirror_size) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(source_mode.is_fullscreen());
     assert!(mirror_mode.is_fullscreen());
     assert_eq!(mirror_size, Size::from((100, 100)));
+
+    f.niri().layout.toggle_fullscreen(&mirror_id);
+    let (mirror_mode, _) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(mirror_mode.is_normal());
 }
 
 #[test]
-fn mirror_from_maximized_source_starts_normal_and_can_resize() {
+fn mirror_from_maximized_source_inherits_maximized_state() {
     let Some(mut f) = set_up(Config::default()) else {
         return;
     };
@@ -1781,6 +1826,10 @@ fn mirror_from_maximized_source_starts_normal_and_can_resize() {
     let (source_mode, _) = mirror_mapped_by_id(&mut f, source_id);
     let (mirror_mode, _) = mirror_mapped_by_id(&mut f, mirror_id);
     assert!(source_mode.is_maximized());
+    assert!(mirror_mode.is_maximized());
+
+    f.niri().layout.toggle_maximized(&mirror_id);
+    let (mirror_mode, _) = mirror_mapped_by_id(&mut f, mirror_id);
     assert!(mirror_mode.is_normal());
 
     f.niri().layout.toggle_window_floating(Some(&mirror_id));

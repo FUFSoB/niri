@@ -77,14 +77,10 @@ fn create_window_mirror_next_to(
         .unwrap();
     let mirror = Mapped::new_mirror(mapped);
     let mirror_id = mirror.id();
-    niri.layout.add_window(
+    niri.layout.add_window_mirror(
+        &source_id,
         mirror,
         AddWindowTarget::NextTo(&next_to),
-        None,
-        None,
-        false,
-        false,
-        false,
         ActivateWindow::No,
     );
     mirror_id

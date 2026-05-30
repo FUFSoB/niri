@@ -497,7 +497,7 @@ impl Mapped {
             is_activated: false,
             is_active_in_column: true,
             is_floating: source.is_floating,
-            is_sticky: false,
+            is_sticky: source.is_sticky,
             is_window_cast_target: false,
             is_screen_cast_target: false,
             ignore_opacity_window_rule: source.ignore_opacity_window_rule,

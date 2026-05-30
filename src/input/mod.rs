@@ -147,14 +147,10 @@ impl State {
         };
 
         if let Some((source_id, mirror)) = window {
-            self.niri.layout.add_window(
+            self.niri.layout.add_window_mirror(
+                &source_id,
                 mirror,
                 AddWindowTarget::NextTo(&source_id),
-                None,
-                None,
-                false,
-                false,
-                false,
                 ActivateWindow::Smart,
             );
             self.niri.queue_redraw_all();

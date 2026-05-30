@@ -453,6 +453,7 @@ binds {
 <sup>Since: own-patches</sup>
 
 `create-window-mirror` creates a mirror of the focused window.
+The new mirror starts with the source window's current layout state, such as floating, sticky, fullscreen, or maximized.
 After that, you can resize the mirror window independently, then zoom and pan the mirrored contents to show only a specific region of the source window.
 
 The mirror view actions operate on the focused mirror window:

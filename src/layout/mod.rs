@@ -593,6 +593,28 @@ pub(super) struct StickyRestoreInfo<WindowId> {
     next_to: Option<WindowId>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct MirrorSourceSnapshot<WindowId> {
+    width: Option<ColumnWidth>,
+    is_full_width: bool,
+    is_floating: bool,
+    is_sticky: bool,
+    is_pending_fullscreen: bool,
+    is_pending_maximized: bool,
+    is_windowed_fullscreen: bool,
+    restore_to_floating: bool,
+    sticky_restore_info: Option<StickyRestoreInfo<WindowId>>,
+}
+
+impl<WindowId> MirrorSourceSnapshot<WindowId> {
+    fn width_as_preset_size(&self) -> Option<PresetSize> {
+        self.width.map(|width| match width {
+            ColumnWidth::Proportion(proportion) => PresetSize::Proportion(proportion),
+            ColumnWidth::Fixed(fixed) => PresetSize::Fixed(fixed.round() as i32),
+        })
+    }
+}
+
 /// Whether to activate a newly added window.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ActivateWindow {
@@ -1725,6 +1747,48 @@ impl<W: LayoutElement> Layout<W> {
                 None
             }
         }
+    }
+
+    pub fn add_window_mirror(
+        &mut self,
+        source: &W::Id,
+        window: W,
+        target: AddWindowTarget<W>,
+        activate: ActivateWindow,
+    ) {
+        let snapshot = self.mirror_source_snapshot(source).unwrap();
+        let id = window.id().clone();
+
+        self.add_window(
+            window,
+            target,
+            snapshot.width_as_preset_size(),
+            None,
+            snapshot.is_full_width,
+            snapshot.is_floating,
+            snapshot.is_sticky,
+            activate,
+        );
+
+        if snapshot.is_windowed_fullscreen {
+            self.with_windows_mut(|window, _| {
+                if window.id() == &id {
+                    window.request_windowed_fullscreen(true);
+                }
+            });
+        } else {
+            if snapshot.is_pending_maximized {
+                self.set_maximized(&id, true);
+            }
+            if snapshot.is_pending_fullscreen {
+                self.set_fullscreen(&id, true);
+            }
+        }
+
+        self.with_tile_mut(&id, |tile| {
+            tile.restore_to_floating = snapshot.restore_to_floating;
+            tile.sticky_restore_info = snapshot.sticky_restore_info.clone();
+        });
     }
 
     pub fn remove_window(
@@ -6957,6 +7021,81 @@ impl<W: LayoutElement> Layout<W> {
 
     fn workspace_for_window_mut(&mut self, window: &W::Id) -> Option<&mut Workspace<W>> {
         self.workspaces_mut().find(|ws| ws.has_window(window))
+    }
+
+    fn mirror_source_snapshot(&self, window: &W::Id) -> Option<MirrorSourceSnapshot<W::Id>> {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == window {
+                return Some(MirrorSourceSnapshot {
+                    width: (!move_.is_floating && !move_.is_sticky).then_some(move_.width),
+                    is_full_width: move_.is_full_width,
+                    is_floating: move_.is_floating,
+                    is_sticky: move_.is_sticky,
+                    is_pending_fullscreen: move_
+                        .tile
+                        .window()
+                        .pending_sizing_mode()
+                        .is_fullscreen(),
+                    is_pending_maximized: move_.tile.window().pending_sizing_mode().is_maximized(),
+                    is_windowed_fullscreen: move_.tile.window().is_pending_windowed_fullscreen(),
+                    restore_to_floating: move_.tile.restore_to_floating,
+                    sticky_restore_info: move_.tile.sticky_restore_info.clone(),
+                });
+            }
+        }
+
+        match &self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors
+                .iter()
+                .find_map(|mon| mon.mirror_source_snapshot(window)),
+            MonitorSet::NoOutputs { workspaces } => workspaces
+                .iter()
+                .find_map(|ws| ws.mirror_source_snapshot(window)),
+        }
+    }
+
+    fn with_tile_mut(&mut self, window: &W::Id, f: impl FnOnce(&mut Tile<W>)) -> bool {
+        let mut f = Some(f);
+
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if move_.tile.window().id() == window {
+                f.take().unwrap()(&mut move_.tile);
+                return true;
+            }
+        }
+
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    if let Some(tile) = mon
+                        .sticky
+                        .tiles_mut()
+                        .find(|tile| tile.window().id() == window)
+                    {
+                        f.take().unwrap()(tile);
+                        return true;
+                    }
+
+                    for ws in &mut mon.workspaces {
+                        if let Some(tile) = ws.tiles_mut().find(|tile| tile.window().id() == window)
+                        {
+                            f.take().unwrap()(tile);
+                            return true;
+                        }
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                for ws in workspaces {
+                    if let Some(tile) = ws.tiles_mut().find(|tile| tile.window().id() == window) {
+                        f.take().unwrap()(tile);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     pub fn windows(&self) -> impl Iterator<Item = (Option<&Monitor<W>>, &W)> {

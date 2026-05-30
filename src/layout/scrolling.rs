@@ -4616,6 +4616,14 @@ impl<W: LayoutElement> Column<W> {
         self.is_pending_maximized
     }
 
+    pub fn stored_width(&self) -> ColumnWidth {
+        self.width
+    }
+
+    pub fn is_full_width(&self) -> bool {
+        self.is_full_width
+    }
+
     pub fn pending_sizing_mode(&self) -> SizingMode {
         if self.is_pending_fullscreen {
             SizingMode::Fullscreen

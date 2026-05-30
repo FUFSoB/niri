@@ -24,8 +24,8 @@ use super::scrolling::{
 use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
-    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac, StickyRestoreInfo, StickyRestorePosition,
+    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement,
+    MirrorSourceSnapshot, Options, RemovedTile, SizeFrac, StickyRestoreInfo, StickyRestorePosition,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -510,6 +510,42 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             None
         }
+    }
+
+    pub(super) fn mirror_source_snapshot(&self, id: &W::Id) -> Option<MirrorSourceSnapshot<W::Id>> {
+        if let Some(tile) = self.floating.tiles().find(|tile| tile.window().id() == id) {
+            return Some(MirrorSourceSnapshot {
+                width: None,
+                is_full_width: false,
+                is_floating: true,
+                is_sticky: false,
+                is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
+                is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
+                is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                restore_to_floating: tile.restore_to_floating,
+                sticky_restore_info: tile.sticky_restore_info.clone(),
+            });
+        }
+
+        self.scrolling
+            .columns()
+            .find(|column| column.contains(id))
+            .and_then(|column| {
+                column
+                    .tiles()
+                    .find(|(tile, _)| tile.window().id() == id)
+                    .map(|(tile, _)| MirrorSourceSnapshot {
+                        width: Some(column.stored_width()),
+                        is_full_width: column.is_full_width(),
+                        is_floating: false,
+                        is_sticky: false,
+                        is_pending_fullscreen: column.is_pending_fullscreen(),
+                        is_pending_maximized: column.is_pending_maximized(),
+                        is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                        restore_to_floating: tile.restore_to_floating,
+                        sticky_restore_info: tile.sticky_restore_info.clone(),
+                    })
+            })
     }
 
     pub(super) fn tiling_column_len(&self, column_idx: usize) -> Option<usize> {

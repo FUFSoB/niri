@@ -18,7 +18,10 @@ use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
-use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options, RemovedTile};
+use super::{
+    compute_overview_zoom, ActivateWindow, HitType, LayoutElement, MirrorSourceSnapshot, Options,
+    RemovedTile,
+};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::ZoomTransition;
@@ -454,6 +457,33 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn sticky_has_window(&self, window: &W::Id) -> bool {
         self.sticky.has_window(window)
+    }
+
+    pub(super) fn mirror_source_snapshot(
+        &self,
+        window: &W::Id,
+    ) -> Option<MirrorSourceSnapshot<W::Id>> {
+        if let Some(tile) = self
+            .sticky
+            .tiles()
+            .find(|tile| tile.window().id() == window)
+        {
+            return Some(MirrorSourceSnapshot {
+                width: None,
+                is_full_width: false,
+                is_floating: true,
+                is_sticky: true,
+                is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
+                is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
+                is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
+                restore_to_floating: tile.restore_to_floating,
+                sticky_restore_info: tile.sticky_restore_info.clone(),
+            });
+        }
+
+        self.workspaces
+            .iter()
+            .find_map(|ws| ws.mirror_source_snapshot(window))
     }
 
     pub fn activate_sticky_window(&mut self, window: &W::Id) -> bool {
