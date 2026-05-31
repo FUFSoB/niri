@@ -36,6 +36,7 @@ use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{
     encompassing_geo, render_to_vec as render_pixels, RenderCtx, RenderTarget,
 };
+use crate::utils::center_preferring_top_left_in_area;
 use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
@@ -2330,6 +2331,65 @@ fn mirror_from_fullscreen_source_inherits_fullscreen_state() {
     f.niri().layout.toggle_fullscreen(&mirror_id);
     let (mirror_mode, _) = mirror_mapped_by_id(&mut f, mirror_id);
     assert!(mirror_mode.is_normal());
+}
+
+#[test]
+fn hidden_fullscreen_born_mirror_uses_default_floating_placement() {
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), RED);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.set_fullscreen(&source_id, true);
+
+    let mirror_id = create_window_mirror(&mut f);
+
+    let ws = f.niri().layout.active_workspace().unwrap();
+    let (_, _, visible) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == mirror_id)
+        .unwrap();
+    assert!(!visible);
+
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+
+    let working_area = f.niri().layout.active_workspace().unwrap().working_area();
+    let (pos, size) = tile_geometry_for(&mut f, mirror_id);
+    let expected = center_preferring_top_left_in_area(working_area, size.to_f64()).to_i32_round();
+
+    assert_eq!(pos, expected);
+}
+
+#[test]
+fn mirror_from_fullscreen_source_inherits_floating_restore_size() {
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), RED);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&source_id), SizeChange::SetFixed(60));
+    f.niri()
+        .layout
+        .set_window_height(Some(&source_id), SizeChange::SetFixed(50));
+    f.niri().layout.set_fullscreen(&source_id, true);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+
+    let (mirror_mode, mirror_size) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(mirror_mode.is_normal());
+    assert_eq!(mirror_size, Size::from((60, 50)));
 }
 
 #[test]

@@ -473,6 +473,7 @@ impl<W: LayoutElement> Monitor<W> {
                 is_full_width: false,
                 is_floating: true,
                 is_sticky: true,
+                floating_window_size: tile.floating_window_size,
                 is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
                 is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
                 is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),

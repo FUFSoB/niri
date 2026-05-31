@@ -520,6 +520,7 @@ impl<W: LayoutElement> Workspace<W> {
                 is_full_width: false,
                 is_floating: true,
                 is_sticky: false,
+                floating_window_size: tile.floating_window_size,
                 is_pending_fullscreen: tile.window().pending_sizing_mode().is_fullscreen(),
                 is_pending_maximized: tile.window().pending_sizing_mode().is_maximized(),
                 is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
@@ -540,6 +541,7 @@ impl<W: LayoutElement> Workspace<W> {
                         is_full_width: column.is_full_width(),
                         is_floating: false,
                         is_sticky: false,
+                        floating_window_size: tile.floating_window_size,
                         is_pending_fullscreen: column.is_pending_fullscreen(),
                         is_pending_maximized: column.is_pending_maximized(),
                         is_windowed_fullscreen: tile.window().is_pending_windowed_fullscreen(),
@@ -1540,7 +1542,7 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         };
 
-        let (_, render_pos, _) = self
+        let (_, render_pos, was_visible) = self
             .tiles_with_render_positions()
             .find(|(tile, _, _)| *tile.window().id() == id)
             .unwrap();
@@ -1563,9 +1565,11 @@ impl<W: LayoutElement> Workspace<W> {
             let mut removed = self.scrolling.remove_tile(&id, Transaction::new());
             removed.tile.stop_move_animations();
 
-            // Come up with a default floating position close to the tile position.
+            // Use the current tile position only if the tile is actually visible. Hidden tiles,
+            // such as mirrors in off-screen fullscreen columns, should fall back to the default
+            // floating placement computed after the floating size is restored.
             let stored_or_default = self.floating.stored_or_default_tile_pos(&removed.tile);
-            if stored_or_default.is_none() {
+            if stored_or_default.is_none() && was_visible {
                 let offset =
                     if self.options.layout.center_focused_column == CenterFocusedColumn::Always {
                         Point::from((0., 0.))
@@ -1573,7 +1577,7 @@ impl<W: LayoutElement> Workspace<W> {
                         Point::from((50., 50.))
                     };
                 let pos = render_pos + offset;
-                let size = removed.tile.tile_size();
+                let size = removed.tile.estimated_floating_tile_size();
                 let pos = self.floating.clamp_within_working_area(pos, size);
                 let pos = self.floating.logical_to_size_frac(pos);
                 removed.tile.floating_pos = Some(pos);

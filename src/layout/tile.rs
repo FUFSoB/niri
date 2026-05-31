@@ -35,7 +35,8 @@ use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
+    baba_is_float_offset, ensure_min_max_size_maybe_zero, round_logical_in_physical,
+    round_logical_in_physical_max1,
 };
 
 /// Toplevel window with decorations.
@@ -889,6 +890,45 @@ impl<W: LayoutElement> Tile<W> {
         size = size
             .to_physical_precise_round(self.scale)
             .to_logical(self.scale);
+        size
+    }
+
+    pub fn estimated_floating_tile_size(&self) -> Size<f64, Logical> {
+        let mut size = if !self.window.pending_sizing_mode().is_normal() {
+            self.floating_window_size.unwrap_or_default()
+        } else {
+            self.floating_window_size
+                .unwrap_or_else(|| self.window.expected_size().unwrap_or_default())
+        };
+
+        let min_size = self.window.min_size();
+        let max_size = self.window.max_size();
+        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+
+        let fallback = self
+            .floating_window_size
+            .or_else(|| self.window.expected_size())
+            .unwrap_or_else(|| self.window.size());
+        if size.w == 0 {
+            size.w = fallback.w.max(1);
+        }
+        if size.h == 0 {
+            size.h = fallback.h.max(1);
+        }
+
+        let mut size = size.to_f64();
+        let border = self
+            .options
+            .layout
+            .border
+            .merged_with(&self.window.rules().border);
+        if !border.off {
+            let border_width = round_logical_in_physical_max1(self.scale, border.width);
+            size.w += border_width * 2.;
+            size.h += border_width * 2.;
+        }
+
         size
     }
 

@@ -617,6 +617,7 @@ pub(super) struct MirrorSourceSnapshot<WindowId> {
     is_full_width: bool,
     is_floating: bool,
     is_sticky: bool,
+    floating_window_size: Option<Size<i32, Logical>>,
     is_pending_fullscreen: bool,
     is_pending_maximized: bool,
     is_windowed_fullscreen: bool,
@@ -1844,6 +1845,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.with_tile_mut(&id, |tile| {
+            tile.floating_window_size = snapshot.floating_window_size;
             tile.restore_to_floating = snapshot.restore_to_floating;
             tile.sticky_restore_info = snapshot.sticky_restore_info.clone();
         });
@@ -7544,6 +7546,7 @@ impl<W: LayoutElement> Layout<W> {
                     is_full_width: move_.is_full_width,
                     is_floating: move_.is_floating,
                     is_sticky: move_.is_sticky,
+                    floating_window_size: move_.tile.floating_window_size,
                     is_pending_fullscreen: move_
                         .tile
                         .window()
