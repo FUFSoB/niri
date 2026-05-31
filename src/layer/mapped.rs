@@ -3,7 +3,7 @@ use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
@@ -242,6 +242,7 @@ impl MappedLayer {
             ctx.as_gles(),
             ns,
             geometry,
+            geometry.loc,
             self.scale,
             false,
             surface,
@@ -251,6 +252,8 @@ impl MappedLayer {
             radius,
             self.rules.background_effect,
             false,
+            Transform::Normal,
+            Size::from((0., 0.)),
             xray_pos,
             &mut |elem| push(elem.into()),
         );
@@ -311,6 +314,7 @@ impl MappedLayer {
                 ctx.as_gles(),
                 ns,
                 geometry,
+                geometry.loc,
                 self.scale,
                 false,
                 surface,
@@ -320,6 +324,8 @@ impl MappedLayer {
                 popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
+                Transform::Normal,
+                Size::from((0., 0.)),
                 xray_pos,
                 &mut |elem| push(elem.into()),
             );

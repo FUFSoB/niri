@@ -71,7 +71,7 @@ This is useful for workflows like mirroring only the chat area of a livestream w
 New mirrors inherit the source window's current layout state when they are created.
 You can also toggle a per-mirror live link so layout changes propagate both ways between the mirror and the real window.
 When enabling the link, the real window's current layout state wins immediately.
-Workspace/output placement, floating position, and mirror viewport zoom/pan stay local to each mirror.
+Workspace/output placement, floating position, and mirror viewport zoom/pan/transform stay local to each mirror.
 
 For example:
 
@@ -79,11 +79,12 @@ For example:
 niri msg action create-window-mirror
 niri msg action toggle-window-mirror-link
 niri msg action set-window-mirror-zoom 2.0
+niri msg action set-window-mirror-transform 90
 niri msg action set-window-mirror-center-x 75%
 niri msg action set-window-mirror-center-y 20%
 ```
 
-Directional helpers pan by 10% of the currently visible source region:
+Directional helpers pan by 10% of the currently visible region in screen space:
 
 ```sh
 niri msg action move-window-mirror-view-right
@@ -97,6 +98,7 @@ To target a specific mirror window instead of the focused one, use `--id`:
 ```sh
 niri msg action toggle-window-mirror-link --id 123
 niri msg action set-window-mirror-zoom --id 123 2.0
+niri msg action set-window-mirror-transform --id 123 flipped-90
 ```
 
 ### Backwards Compatibility

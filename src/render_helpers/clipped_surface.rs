@@ -37,6 +37,10 @@ pub type NamespacedClippedSurfaceRenderElement<R> =
 
 pub trait ClippedSurfaceInner<R: NiriRenderer>: Element {
     fn surface_render_element(&self) -> &WaylandSurfaceRenderElement<R>;
+
+    fn sample_transform(&self) -> Transform {
+        Transform::Normal
+    }
 }
 
 impl<R: NiriRenderer> ClippedSurfaceInner<R> for WaylandSurfaceRenderElement<R> {
@@ -58,6 +62,18 @@ pub struct RoundedCornerDamage {
 }
 
 impl<R: NiriRenderer, E: ClippedSurfaceInner<R>> ClippedSurfaceRenderElement<R, E> {
+    fn shader_transform_matrix(transform: Transform) -> Mat3 {
+        // HACK: ??? for some reason flipped ones are fine.
+        let transform = match transform {
+            Transform::_90 => Transform::_270,
+            Transform::_270 => Transform::_90,
+            x => x,
+        };
+        Mat3::from_translation(Vec2::new(0.5, 0.5))
+            * Mat3::from_cols_array(transform.matrix().as_ref())
+            * Mat3::from_translation(-Vec2::new(0.5, 0.5))
+    }
+
     pub fn new(
         elem: E,
         scale: Scale<f64>,
@@ -94,16 +110,8 @@ impl<R: NiriRenderer, E: ClippedSurfaceInner<R>> ClippedSurfaceRenderElement<R, 
         let src_loc = Vec2::new(view.src.loc.x as f32, view.src.loc.y as f32);
         let src_size = Vec2::new(view.src.size.w as f32, view.src.size.h as f32);
 
-        let transform = inner.transform();
-        // HACK: ??? for some reason flipped ones are fine.
-        let transform = match transform {
-            Transform::_90 => Transform::_270,
-            Transform::_270 => Transform::_90,
-            x => x,
-        };
-        let transform_matrix = Mat3::from_translation(Vec2::new(0.5, 0.5))
-            * Mat3::from_cols_array(transform.matrix().as_ref())
-            * Mat3::from_translation(-Vec2::new(0.5, 0.5));
+        let transform_matrix = Self::shader_transform_matrix(self.inner.transform());
+        let sample_transform = Self::shader_transform_matrix(self.inner.sample_transform());
 
         let y_invert = if buffer_y_inverted(inner.buffer()).unwrap_or(false) {
             Mat3::from_scale(Vec2::new(1., -1.))
@@ -125,6 +133,7 @@ impl<R: NiriRenderer, E: ClippedSurfaceInner<R>> ClippedSurfaceRenderElement<R, 
             Uniform::new("geo_size", geo_size),
             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
             mat3_uniform("input_to_geo", input_to_geo),
+            mat3_uniform("sample_transform", sample_transform),
         ]
     }
 

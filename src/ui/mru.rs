@@ -36,7 +36,7 @@ use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderEleme
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
+use crate::render_helpers::scaled_surface::NamespacedScaledTransformedWaylandSurfaceRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderCtx;
@@ -115,7 +115,7 @@ niri_render_elements! {
         LayoutElement = LayoutElementRenderElement<R>,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
         NamespacedClippedSurface = NamespacedClippedSurfaceRenderElement<R>,
-        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
+        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledTransformedWaylandSurfaceRenderElement<R>>,
         Border = BorderRenderElement,
     }
 }

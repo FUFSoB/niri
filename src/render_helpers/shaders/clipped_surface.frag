@@ -25,15 +25,17 @@ uniform float niri_scale;
 uniform vec2 geo_size;
 uniform vec4 corner_radius;
 uniform mat3 input_to_geo;
+uniform mat3 sample_transform;
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 vec4 postprocess(vec4 color);
 
 void main() {
+    vec3 sample_coords = sample_transform * vec3(v_coords, 1.0);
     vec3 coords_geo = input_to_geo * vec3(v_coords, 1.0);
 
     // Sample the texture.
-    vec4 color = texture2D(tex, v_coords);
+    vec4 color = texture2D(tex, sample_coords.xy);
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0);
 #endif

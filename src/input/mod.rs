@@ -58,7 +58,9 @@ use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::transaction::Transaction;
-use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::utils::{
+    center, get_monotonic_time, ipc_transform_to_smithay, CastSessionId, ResizeEdge,
+};
 use crate::window::Mapped;
 
 pub mod backend_ext;
@@ -268,6 +270,16 @@ impl State {
         };
         self.with_target_mirror_window(Some(window.get()), |mapped| {
             mapped.set_mirror_zoom(target_level);
+        })
+    }
+
+    fn set_window_mirror_transform(
+        &mut self,
+        id: Option<u64>,
+        transform: niri_ipc::Transform,
+    ) -> bool {
+        self.with_target_mirror_window(id, |mapped| {
+            mapped.set_mirror_transform(ipc_transform_to_smithay(transform));
         })
     }
 
@@ -1575,6 +1587,16 @@ impl State {
             }
             Action::SetWindowMirrorZoomById { id, level } => {
                 if self.set_window_mirror_zoom(Some(id), &level) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorTransform(transform) => {
+                if self.set_window_mirror_transform(None, transform) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowMirrorTransformById { id, transform } => {
+                if self.set_window_mirror_transform(Some(id), transform) {
                     self.niri.queue_redraw_all();
                 }
             }
@@ -4018,9 +4040,12 @@ impl State {
                         .windows()
                         .find(|(_, mapped)| mapped.id() == window_id)
                         .and_then(|(_, mapped)| {
-                            mapped
-                                .is_mirror()
-                                .then(|| mapped.mirror_content_transform().1)
+                            mapped.is_mirror().then(|| {
+                                (
+                                    mapped.mirror_content_transform().1,
+                                    mapped.mirror_view_transform().invert(),
+                                )
+                            })
                         })?;
                     let location = pointer.current_location();
                     let start_surface_local = location - surface.1;
@@ -4032,7 +4057,8 @@ impl State {
                     Some(MirrorClickGrab::new(
                         start_data,
                         start_surface_local,
-                        mirror_scale,
+                        mirror_scale.0,
+                        mirror_scale.1,
                     ))
                 })
                 .flatten();

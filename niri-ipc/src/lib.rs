@@ -363,6 +363,22 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
         level: String,
     },
+    /// Set the transform of a mirror window.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Set the transform of the focused mirror window")
+    )]
+    SetWindowMirrorTransform {
+        /// Id of the mirror window.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+
+        /// Transform to apply, counter-clockwise.
+        #[cfg_attr(feature = "clap", arg())]
+        transform: Transform,
+    },
     /// Change the horizontal center point of a mirror window.
     #[cfg_attr(
         feature = "clap",

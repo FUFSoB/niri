@@ -5,7 +5,7 @@ use smithay::input::pointer::{
     PointerInnerHandle, RelativeMotionEvent,
 };
 use smithay::input::SeatHandler;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Size, Transform};
 
 use crate::niri::State;
 
@@ -13,6 +13,7 @@ pub struct MirrorClickGrab {
     start_data: PointerGrabStartData<State>,
     start_surface_local: Point<f64, Logical>,
     mirror_scale: f64,
+    inverse_transform: Transform,
 }
 
 impl MirrorClickGrab {
@@ -20,12 +21,20 @@ impl MirrorClickGrab {
         start_data: PointerGrabStartData<State>,
         start_surface_local: Point<f64, Logical>,
         mirror_scale: f64,
+        inverse_transform: Transform,
     ) -> Self {
         Self {
             start_data,
             start_surface_local,
             mirror_scale,
+            inverse_transform,
         }
+    }
+
+    fn source_delta_for_location(&self, location: Point<f64, Logical>) -> Point<f64, Logical> {
+        let delta = (location - self.start_data.location).downscale(self.mirror_scale);
+        self.inverse_transform
+            .transform_point_in(delta, &Size::from((0., 0.)))
     }
 
     fn focus_for_location(
@@ -33,8 +42,7 @@ impl MirrorClickGrab {
         location: Point<f64, Logical>,
     ) -> Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)> {
         let (focus, _) = self.start_data.focus.as_ref()?;
-        let surface_local = self.start_surface_local
-            + (location - self.start_data.location).downscale(self.mirror_scale);
+        let surface_local = self.start_surface_local + self.source_delta_for_location(location);
         Some((focus.clone(), location - surface_local))
     }
 }
@@ -167,16 +175,20 @@ impl PointerGrab<State> for MirrorClickGrab {
 
 #[cfg(test)]
 mod tests {
-    use smithay::utils::{Logical, Point};
+    use smithay::utils::{Logical, Point, Size, Transform};
 
     fn focus_origin_for_location(
         start_location: Point<f64, Logical>,
         start_surface_local: Point<f64, Logical>,
         mirror_scale: f64,
+        inverse_transform: Transform,
         location: Point<f64, Logical>,
     ) -> Point<f64, Logical> {
-        let surface_local =
-            start_surface_local + (location - start_location).downscale(mirror_scale);
+        let surface_local = start_surface_local
+            + inverse_transform.transform_point_in(
+                (location - start_location).downscale(mirror_scale),
+                &Size::from((0., 0.)),
+            );
         location - surface_local
     }
 
@@ -189,6 +201,7 @@ mod tests {
             start_location,
             start_surface_local,
             2.,
+            Transform::Normal,
             Point::from((106., 100.)),
         );
 
@@ -204,6 +217,7 @@ mod tests {
             start_location,
             start_surface_local,
             1.,
+            Transform::Normal,
             Point::from((106., 104.)),
         );
 

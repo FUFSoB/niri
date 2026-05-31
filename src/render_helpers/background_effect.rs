@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
@@ -207,12 +207,15 @@ impl BackgroundEffect {
 
 fn render_params_for_tile(
     geometry: Rectangle<f64, Logical>,
+    surface_root_loc: Point<f64, Logical>,
     scale: f64,
     clip_to_geometry: bool,
     block_out: bool,
     blur_region: Option<Arc<Vec<Rectangle<i32, Logical>>>>,
     surface_geo: Rectangle<f64, Logical>,
     surface_anim_scale: Scale<f64>,
+    surface_transform: Transform,
+    transformed_area: Size<f64, Logical>,
 ) -> Option<RenderParams> {
     // Effects not requested by the surface itself are drawn to match the geometry.
     let mut clip = true;
@@ -234,12 +237,22 @@ fn render_params_for_tile(
                 clip = true;
             } else {
                 let mut surface_geo = surface_geo.upscale(surface_anim_scale);
-                surface_geo.loc += geometry.loc;
+                let pre_transform_offset = surface_geo.loc;
+
+                if surface_transform != Transform::Normal {
+                    surface_geo =
+                        surface_transform.transform_rect_in(surface_geo, &transformed_area);
+                }
+
+                surface_geo.loc += surface_root_loc;
 
                 subregion = Some(TransformedRegion {
                     rects,
                     scale: surface_anim_scale,
-                    offset: surface_geo.loc,
+                    offset: pre_transform_offset,
+                    post_transform_offset: surface_root_loc,
+                    transform: surface_transform,
+                    transform_area: transformed_area,
                 });
 
                 surface_geo = surface_geo
@@ -285,6 +298,7 @@ pub fn render_for_tile(
     ctx: RenderCtx<GlesRenderer>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
+    surface_root_loc: Point<f64, Logical>,
     scale: f64,
     clip_to_geometry: bool,
     surface: &WlSurface,
@@ -294,6 +308,8 @@ pub fn render_for_tile(
     radius: CornerRadius,
     effect: niri_config::BackgroundEffect,
     should_block_out: bool,
+    surface_transform: Transform,
+    surface_transform_area: Size<f64, Logical>,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
@@ -313,15 +329,19 @@ pub fn render_for_tile(
 
         let mut surface_geo = surface_geo(states).unwrap_or_default().to_f64();
         surface_geo.loc += surface_off;
+        let transformed_area = surface_transform_area.upscale(surface_anim_scale);
 
         let Some(params) = render_params_for_tile(
             geometry,
+            surface_root_loc,
             scale,
             clip_to_geometry,
             should_block_out,
             blur_region,
             surface_geo,
             surface_anim_scale,
+            surface_transform,
+            transformed_area,
         ) else {
             return;
         };

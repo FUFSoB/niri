@@ -457,14 +457,15 @@ The new mirror starts with the source window's current layout state, such as flo
 After that, you can resize the mirror window independently, then zoom and pan the mirrored contents to show only a specific region of the source window.
 `toggle-window-mirror-link` turns a mirror into a live-linked copy of the real window for layout state.
 When enabled, the real window wins immediately and then floating, sticky, fullscreen, maximized, and resize changes propagate both ways.
-Workspace/output placement, floating drag position, and mirror zoom/pan remain local to each mirror.
+Workspace/output placement, floating drag position, and mirror zoom/pan/transform remain local to each mirror.
 
 The mirror view actions operate on the focused mirror window:
 
 - `toggle-window-mirror-link`: toggle live layout syncing for the focused mirror;
 - `set-window-mirror-zoom`: set the mirror zoom, for example `2.0`, `+0.25`, `-0.25`;
+- `set-window-mirror-transform`: set the mirror transform, for example `90`, `270`, `flipped`, `flipped-90`;
 - `set-window-mirror-center-x`, `set-window-mirror-center-y`: set or adjust the viewport center inside the source window, for example `75%`, `+10%`, `-100`;
-- `move-window-mirror-view-left`, `move-window-mirror-view-right`, `move-window-mirror-view-up`, `move-window-mirror-view-down`: pan by 10% of the currently visible source region;
+- `move-window-mirror-view-left`, `move-window-mirror-view-right`, `move-window-mirror-view-up`, `move-window-mirror-view-down`: pan by 10% of the currently visible region in screen space;
 - `zoom-window-mirror-in`, `zoom-window-mirror-out`: zoom by the configured zoom increment type using `+0.25` or `-0.25`;
 - `reset-window-mirror-view`: reset the mirror back to the full-window view.
 
@@ -477,6 +478,7 @@ binds {
 
     Mod+BracketRight { zoom-window-mirror-in; }
     Mod+BracketLeft  { zoom-window-mirror-out; }
+    Mod+Ctrl+T       { set-window-mirror-transform "90"; }
 
     Mod+Ctrl+Left  { move-window-mirror-view-left; }
     Mod+Ctrl+Right { move-window-mirror-view-right; }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use niri_config::{BlockOutFrom, Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::{Kind, NamespacedElement};
+use smithay::backend::renderer::element::{Element as _, Kind, NamespacedElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
@@ -36,7 +36,9 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
+use crate::render_helpers::scaled_surface::{
+    ScaledWaylandSurfaceRenderElement, TransformedWaylandSurfaceRenderElement,
+};
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::{
@@ -385,6 +387,7 @@ struct MirrorViewState {
     zoom: f64,
     center_x: f64,
     center_y: f64,
+    transform: Transform,
 }
 
 impl Default for MirrorViewState {
@@ -393,6 +396,7 @@ impl Default for MirrorViewState {
             zoom: 1.,
             center_x: 0.5,
             center_y: 0.5,
+            transform: Transform::Normal,
         }
     }
 }
@@ -400,9 +404,23 @@ impl Default for MirrorViewState {
 #[derive(Debug, Clone, Copy)]
 struct MirrorContentTransform {
     source_geometry: Rectangle<f64, Logical>,
+    transformed_source_size: Size<f64, Logical>,
     content_rect: Rectangle<f64, Logical>,
     visible_rect: Rectangle<f64, Logical>,
     scale: f64,
+    element_transform: Transform,
+}
+
+impl MirrorContentTransform {
+    fn source_rect_to_mirror_rect(self, rect: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        let rect = self
+            .element_transform
+            .transform_rect_in(rect, &self.source_geometry.size);
+        Rectangle::new(
+            self.content_rect.loc + rect.loc.upscale(self.scale),
+            rect.size.upscale(self.scale),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -604,6 +622,10 @@ impl Mapped {
         self.mirror_transform_for_size(self.mirror_size.to_f64())
     }
 
+    fn mirror_element_transform(&self) -> Transform {
+        self.mirror_view.transform
+    }
+
     fn mirror_source_geometry(&self) -> Rectangle<f64, Logical> {
         let mut source_geometry = self.window.geometry().to_f64();
         source_geometry.size.w = source_geometry.size.w.max(1.);
@@ -629,6 +651,32 @@ impl Mapped {
         ))
     }
 
+    fn mirror_transform_vector(
+        transform: Transform,
+        vector: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        transform.transform_point_in(vector, &Size::from((0., 0.)))
+    }
+
+    fn mirror_source_point_to_transformed_local(
+        &self,
+        source_point: Point<f64, Logical>,
+        source_size: Size<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        self.mirror_element_transform()
+            .transform_point_in(source_point, &source_size)
+    }
+
+    fn mirror_transformed_point_to_source_local(
+        &self,
+        transformed_point: Point<f64, Logical>,
+        transformed_source_size: Size<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        self.mirror_element_transform()
+            .invert()
+            .transform_point_in(transformed_point, &transformed_source_size)
+    }
+
     fn clamp_mirror_content_axis(offset: f64, dst: f64, rendered: f64) -> f64 {
         if rendered <= dst {
             (dst - rendered) / 2.
@@ -643,12 +691,14 @@ impl Mapped {
         source_geometry: Rectangle<f64, Logical>,
         scale: f64,
     ) -> MirrorContentTransform {
-        let rendered = source_geometry.size.upscale(scale);
-        let focus = self.mirror_focus_point(source_geometry);
-        let desired_offset: Point<f64, Logical> = Point::from((
-            dst.w / 2. - (focus.x - source_geometry.loc.x) * scale,
-            dst.h / 2. - (focus.y - source_geometry.loc.y) * scale,
-        ));
+        let source_size = source_geometry.size;
+        let element_transform = self.mirror_element_transform();
+        let transformed_source_size = element_transform.transform_size(source_size);
+        let rendered = transformed_source_size.upscale(scale);
+        let focus = self.mirror_focus_point(source_geometry) - source_geometry.loc;
+        let focus = self.mirror_source_point_to_transformed_local(focus, source_size);
+        let desired_offset: Point<f64, Logical> =
+            Point::from((dst.w / 2. - focus.x * scale, dst.h / 2. - focus.y * scale));
         let offset = Point::from((
             Self::clamp_mirror_content_axis(desired_offset.x, dst.w, rendered.w),
             Self::clamp_mirror_content_axis(desired_offset.y, dst.h, rendered.h),
@@ -660,19 +710,21 @@ impl Mapped {
 
         MirrorContentTransform {
             source_geometry,
+            transformed_source_size,
             content_rect,
             visible_rect,
             scale,
+            element_transform,
         }
     }
 
     fn mirror_nearest_scale_candidate(
         &self,
         dst: Size<f64, Logical>,
-        source_geometry: Rectangle<f64, Logical>,
+        source_size: Size<f64, Logical>,
     ) -> Option<f64> {
-        let scale_x = dst.w / source_geometry.size.w;
-        let scale_y = dst.h / source_geometry.size.h;
+        let scale_x = dst.w / source_size.w;
+        let scale_y = dst.h / source_size.h;
         let contain_scale = f64::min(scale_x, scale_y).max(0.0001);
 
         let candidate = if contain_scale >= 1. {
@@ -686,7 +738,7 @@ impl Mapped {
             return Some(candidate);
         }
 
-        let rendered = source_geometry.size.upscale(candidate);
+        let rendered = source_size.upscale(candidate);
         let width_is_constraining = scale_x <= scale_y + f64::EPSILON;
         let height_is_constraining = scale_y <= scale_x + f64::EPSILON;
 
@@ -708,19 +760,22 @@ impl Mapped {
         source_geometry: Rectangle<f64, Logical>,
         zoom: f64,
     ) -> f64 {
+        let transformed_source_size = self
+            .mirror_element_transform()
+            .transform_size(source_geometry.size);
         // Mirrors look crisper when the viewport is effectively asking for an integer upscale or
         // reciprocal downscale. If the contain-fit size differs by at most one logical pixel on
         // the constraining axis, prefer that nearest-neighbour-friendly scale and clip/pad the
         // remainder instead of resampling the whole window.
         if zoom <= 1. + f64::EPSILON {
-            if let Some(scale) = self.mirror_nearest_scale_candidate(dst, source_geometry) {
+            if let Some(scale) = self.mirror_nearest_scale_candidate(dst, transformed_source_size) {
                 return scale;
             }
         }
 
         f64::min(
-            dst.w / source_geometry.size.w,
-            dst.h / source_geometry.size.h,
+            dst.w / transformed_source_size.w,
+            dst.h / transformed_source_size.h,
         )
         .max(0.0001)
             * zoom
@@ -743,8 +798,16 @@ impl Mapped {
         let content_loc = location + transform.content_rect.loc;
         let visible_loc = location + transform.visible_rect.loc;
         let content_origin = content_loc.to_physical_precise_round(scale);
-        let surface_origin =
-            (content_loc - transform.source_geometry.loc).to_physical_precise_round(scale);
+        let surface_origin = (content_loc
+            + Self::mirror_transform_vector(
+                transform.element_transform,
+                Point::from((
+                    -transform.source_geometry.loc.x,
+                    -transform.source_geometry.loc.y,
+                )),
+            )
+            .upscale(transform.scale))
+        .to_physical_precise_round(scale);
 
         MirrorRenderLayout {
             transform,
@@ -783,24 +846,41 @@ impl Mapped {
         let clip_radius = self
             .geometry_corner_radius()
             .fit_to(clip_geo.size.w as f32, clip_geo.size.h as f32);
+        let needs_transform_shader = layout.transform.element_transform != Transform::Normal;
         let surface = self.toplevel().wl_surface();
         let mut push = |elem: WaylandSurfaceRenderElement<R>| {
-            let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
+            let area = layout
+                .transform
+                .source_geometry
+                .size
+                .to_physical_precise_round(scale);
+            let elem = TransformedWaylandSurfaceRenderElement::new(
                 NamespacedElement::new(elem, namespace),
+                layout.content_origin,
+                area,
+                layout.transform.element_transform,
+            );
+            let elem = ScaledWaylandSurfaceRenderElement::new(
+                elem,
                 layout.content_origin,
                 Scale::from(layout.transform.scale),
             );
-            if let Some(shader) = clip_shader.clone() {
-                if ClippedSurfaceRenderElement::will_clip(&elem, scale, clip_geo, clip_radius) {
+            let clip = ClippedSurfaceRenderElement::will_clip(&elem, scale, clip_geo, clip_radius);
+            if needs_transform_shader || clip {
+                if let Some(shader) = clip_shader.clone() {
+                    let geometry = if clip {
+                        clip_geo
+                    } else {
+                        elem.geometry(scale).to_f64().to_logical(scale)
+                    };
+                    let radius = if clip {
+                        clip_radius
+                    } else {
+                        CornerRadius::default()
+                    };
                     push(
-                        ClippedSurfaceRenderElement::new(
-                            elem,
-                            scale,
-                            clip_geo,
-                            shader,
-                            clip_radius,
-                        )
-                        .into(),
+                        ClippedSurfaceRenderElement::new(elem, scale, geometry, shader, radius)
+                            .into(),
                     );
                     return;
                 }
@@ -826,6 +906,18 @@ impl Mapped {
 
     pub fn mirror_zoom(&self) -> f64 {
         self.mirror_zoom_level()
+    }
+
+    pub fn mirror_view_transform(&self) -> Transform {
+        self.mirror_element_transform()
+    }
+
+    pub fn set_mirror_transform(&mut self, transform: Transform) {
+        if !self.is_mirror {
+            return;
+        }
+
+        self.mirror_view.transform = transform;
     }
 
     pub fn set_mirror_zoom(&mut self, zoom: f64) {
@@ -866,51 +958,47 @@ impl Mapped {
         let dst = self.mirror_size.to_f64();
         let zoom = zoom.max(1.);
         let scale = self.mirror_scale_for_size_and_zoom(dst, source_geometry, zoom);
-        let visible_source: Size<f64, Logical> = Size::from((
-            (dst.w / scale).min(source_size.w),
-            (dst.h / scale).min(source_size.h),
+        let element_transform = self.mirror_element_transform();
+        let transformed_source_size = element_transform.transform_size(source_size);
+        let visible_transformed: Size<f64, Logical> = Size::from((
+            (dst.w / scale).min(transformed_source_size.w),
+            (dst.h / scale).min(transformed_source_size.h),
+        ));
+        let anchor = self.mirror_source_point_to_transformed_local(source_local, source_size);
+        let mut center = Point::from((
+            anchor.x - (mirror_point.x - dst.w / 2.) / scale,
+            anchor.y - (mirror_point.y - dst.h / 2.) / scale,
         ));
 
-        let anchor_center = |source_size: f64,
-                             visible_size: f64,
-                             source_coord: f64,
-                             dst: f64,
-                             mirror_coord: f64| {
-            if source_size <= f64::EPSILON {
-                return 0.5;
-            }
-
-            let center = source_coord - (mirror_coord - dst / 2.) / scale;
-            let min_center = if visible_size >= source_size - f64::EPSILON {
-                source_size / 2.
+        let clamp_center = |center: &mut f64, transformed_size: f64, visible_size: f64| {
+            let min_center = if visible_size >= transformed_size - f64::EPSILON {
+                transformed_size / 2.
             } else {
                 visible_size / 2.
             };
-            let max_center = if visible_size >= source_size - f64::EPSILON {
-                source_size / 2.
+            let max_center = if visible_size >= transformed_size - f64::EPSILON {
+                transformed_size / 2.
             } else {
-                source_size - visible_size / 2.
+                transformed_size - visible_size / 2.
             };
-            (center.clamp(min_center, max_center) / source_size).clamp(0., 1.)
+            *center = center.clamp(min_center, max_center);
         };
+        clamp_center(
+            &mut center.x,
+            transformed_source_size.w,
+            visible_transformed.w,
+        );
+        clamp_center(
+            &mut center.y,
+            transformed_source_size.h,
+            visible_transformed.h,
+        );
 
-        self.mirror_view = MirrorViewState {
-            zoom,
-            center_x: anchor_center(
-                source_size.w,
-                visible_source.w,
-                source_local.x,
-                dst.w,
-                mirror_point.x,
-            ),
-            center_y: anchor_center(
-                source_size.h,
-                visible_source.h,
-                source_local.y,
-                dst.h,
-                mirror_point.y,
-            ),
-        };
+        let source_center =
+            self.mirror_transformed_point_to_source_local(center, transformed_source_size);
+        self.mirror_view.zoom = zoom;
+        self.mirror_view.center_x = (source_center.x / source_size.w).clamp(0., 1.);
+        self.mirror_view.center_y = (source_center.y / source_size.h).clamp(0., 1.);
     }
 
     fn set_mirror_center_component(current: &mut f64, axis_size: f64, change: PositionChange) {
@@ -963,60 +1051,66 @@ impl Mapped {
         }
 
         let transform = self.mirror_transform();
-        let source_geometry = transform.source_geometry;
-        let visible_source = transform.visible_rect.size.downscale(transform.scale);
-        let (source_size, visible_size, current, target) = if x_axis {
+        let (transformed_size, visible_size, current, delta) = if x_axis {
             (
-                source_geometry.size.w,
-                visible_source.w,
-                source_geometry.loc.x
-                    + (self.mirror_size.w as f64 / 2. - transform.content_rect.loc.x)
-                        / transform.scale,
-                &mut self.mirror_view.center_x,
+                transform.transformed_source_size.w,
+                transform.visible_rect.size.w / transform.scale,
+                (self.mirror_size.w as f64 / 2. - transform.content_rect.loc.x) / transform.scale,
+                Point::from((
+                    transform.visible_rect.size.w / transform.scale * delta_fraction,
+                    0.,
+                )),
             )
         } else {
             (
-                source_geometry.size.h,
-                visible_source.h,
-                source_geometry.loc.y
-                    + (self.mirror_size.h as f64 / 2. - transform.content_rect.loc.y)
-                        / transform.scale,
-                &mut self.mirror_view.center_y,
+                transform.transformed_source_size.h,
+                transform.visible_rect.size.h / transform.scale,
+                (self.mirror_size.h as f64 / 2. - transform.content_rect.loc.y) / transform.scale,
+                Point::from((
+                    0.,
+                    transform.visible_rect.size.h / transform.scale * delta_fraction,
+                )),
             )
         };
 
-        if source_size <= f64::EPSILON {
+        if transformed_size <= f64::EPSILON {
             return;
         }
 
-        let movable = (source_size - visible_size).max(0.);
+        let movable = (transformed_size - visible_size).max(0.);
         let current = if movable <= f64::EPSILON {
-            source_size / 2.
-        } else {
-            current
-                - if x_axis {
-                    source_geometry.loc.x
-                } else {
-                    source_geometry.loc.y
-                }
-        };
-        let current = if movable <= f64::EPSILON {
-            source_size / 2.
+            transformed_size / 2.
         } else {
             current
         };
         let min_center = if movable <= f64::EPSILON {
-            source_size / 2.
+            transformed_size / 2.
         } else {
             visible_size / 2.
         };
         let max_center = if movable <= f64::EPSILON {
-            source_size / 2.
+            transformed_size / 2.
         } else {
-            source_size - visible_size / 2.
+            transformed_size - visible_size / 2.
         };
-        let new_center = (current + visible_size * delta_fraction).clamp(min_center, max_center);
-        *target = (new_center / source_size).clamp(0., 1.);
+        let mut center = if x_axis {
+            Point::from((current, transform.transformed_source_size.h / 2.))
+        } else {
+            Point::from((transform.transformed_source_size.w / 2., current))
+        };
+        center += delta;
+        if x_axis {
+            center.x = center.x.clamp(min_center, max_center);
+        } else {
+            center.y = center.y.clamp(min_center, max_center);
+        }
+
+        let source_center = self
+            .mirror_transformed_point_to_source_local(center, transform.transformed_source_size);
+        self.mirror_view.center_x =
+            (source_center.x / transform.source_geometry.size.w).clamp(0., 1.);
+        self.mirror_view.center_y =
+            (source_center.y / transform.source_geometry.size.h).clamp(0., 1.);
     }
 
     pub fn pan_mirror_view_x_by_visible_fraction(&mut self, delta_fraction: f64) {
@@ -1032,7 +1126,9 @@ impl Mapped {
             return;
         }
 
-        self.mirror_view = MirrorViewState::default();
+        self.mirror_view.zoom = 1.;
+        self.mirror_view.center_x = 0.5;
+        self.mirror_view.center_y = 0.5;
     }
 
     pub fn mirror_point_to_source(
@@ -1043,7 +1139,12 @@ impl Mapped {
         if !transform.visible_rect.contains(point) {
             return None;
         }
-        let point = (point - transform.content_rect.loc).downscale(transform.scale)
+        let point = (point - transform.content_rect.loc).downscale(transform.scale);
+        if !Rectangle::from_size(transform.transformed_source_size).contains(point) {
+            return None;
+        }
+        let point = self
+            .mirror_transformed_point_to_source_local(point, transform.transformed_source_size)
             + transform.source_geometry.loc;
         transform.source_geometry.contains(point).then_some(point)
     }
@@ -1169,9 +1270,10 @@ impl Mapped {
 
             for baked in &mut contents {
                 let logical_size = baked_texture_logical_size(baked);
-                baked.location = transform.content_rect.loc
-                    + (baked.location - transform.source_geometry.loc).upscale(transform.scale);
-                baked.dst = Some(logical_size.upscale(transform.scale).to_i32_round());
+                let rect = Rectangle::new(baked.location - source_geometry.loc, logical_size);
+                let rect = transform.source_rect_to_mirror_rect(rect);
+                baked.location = rect.loc;
+                baked.dst = Some(rect.size.to_i32_round());
             }
             contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, transform.visible_rect));
         } else {
@@ -1439,9 +1541,16 @@ impl LayoutElement for Mapped {
     fn buf_loc(&self) -> Point<i32, Logical> {
         if self.is_mirror {
             let transform = self.mirror_transform();
-            return (transform.content_rect.loc
-                - transform.source_geometry.loc.upscale(transform.scale))
-            .to_i32_round();
+            let surface_origin = transform.content_rect.loc
+                + Self::mirror_transform_vector(
+                    transform.element_transform,
+                    Point::from((
+                        -transform.source_geometry.loc.x,
+                        -transform.source_geometry.loc.y,
+                    )),
+                )
+                .upscale(transform.scale);
+            return surface_origin.to_i32_round();
         }
 
         Point::from((0, 0)) - self.window.geometry().loc
@@ -1529,6 +1638,10 @@ impl LayoutElement for Mapped {
             let namespace = self.element_namespace().unwrap();
             let content_loc = location + transform.content_rect.loc;
             let content_origin = content_loc.to_physical_precise_round(scale);
+            let area = transform
+                .source_geometry
+                .size
+                .to_physical_precise_round(scale);
             let root = self.toplevel().wl_surface();
 
             for (popup, offset) in PopupManager::popups_for_surface(root) {
@@ -1543,6 +1656,9 @@ impl LayoutElement for Mapped {
                 let surface_loc = (content_loc - transform.source_geometry.loc
                     + (offset - popup_geo.loc).to_f64())
                 .to_physical_precise_round(scale);
+                let transform_shader = (transform.element_transform != Transform::Normal)
+                    .then(|| ClippedSurfaceRenderElement::shader(ctx.renderer).cloned())
+                    .flatten();
 
                 push_elements_from_surface_tree(
                     ctx.renderer,
@@ -1552,21 +1668,43 @@ impl LayoutElement for Mapped {
                     alpha,
                     Kind::Unspecified,
                     &mut |elem| {
-                        let elem = NamespacedScaledWaylandSurfaceRenderElement::new(
+                        let elem = TransformedWaylandSurfaceRenderElement::new(
                             NamespacedElement::new(elem, namespace),
+                            content_origin,
+                            area,
+                            transform.element_transform,
+                        );
+                        let elem = ScaledWaylandSurfaceRenderElement::new(
+                            elem,
                             content_origin,
                             Scale::from(transform.scale),
                         );
+                        if transform.element_transform != Transform::Normal {
+                            if let Some(shader) = transform_shader.clone() {
+                                let geometry = elem.geometry(scale).to_f64().to_logical(scale);
+                                push(
+                                    ClippedSurfaceRenderElement::new(
+                                        elem,
+                                        scale,
+                                        geometry,
+                                        shader,
+                                        CornerRadius::default(),
+                                    )
+                                    .into(),
+                                );
+                                return;
+                            }
+                        }
+
                         push(elem.into())
                     },
                 );
 
-                let geometry = Rectangle::new(
-                    content_loc
-                        + (offset.to_f64() - transform.source_geometry.loc)
-                            .upscale(transform.scale),
-                    popup_geo.size.to_f64().upscale(transform.scale),
-                );
+                let geometry = transform.source_rect_to_mirror_rect(Rectangle::new(
+                    offset.to_f64() - transform.source_geometry.loc,
+                    popup_geo.size.to_f64(),
+                ));
+                let geometry = Rectangle::new(location + geometry.loc, geometry.size);
                 let surface_off = popup_geo.loc.upscale(-1).to_f64();
                 let surface_anim_scale = Scale::from(transform.scale);
                 let mut effect = popup_rules.background_effect;
@@ -1579,6 +1717,7 @@ impl LayoutElement for Mapped {
                     ctx.as_gles(),
                     None,
                     geometry,
+                    content_loc,
                     scale.x,
                     false,
                     surface,
@@ -1588,6 +1727,8 @@ impl LayoutElement for Mapped {
                     popup_rules.geometry_corner_radius.unwrap_or_default(),
                     effect,
                     false,
+                    transform.element_transform,
+                    transform.source_geometry.size,
                     xray_pos,
                     &mut |elem| push(elem.into()),
                 );
@@ -1632,6 +1773,7 @@ impl LayoutElement for Mapped {
                 ctx.as_gles(),
                 None,
                 geometry,
+                geometry.loc,
                 scale.x,
                 false,
                 surface,
@@ -1641,6 +1783,8 @@ impl LayoutElement for Mapped {
                 popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
+                Transform::Normal,
+                Size::from((0., 0.)),
                 xray_pos,
                 &mut |elem| push(elem.into()),
             );
@@ -1669,6 +1813,8 @@ impl LayoutElement for Mapped {
                 geometry.loc + transform.visible_rect.loc,
                 transform.visible_rect.size,
             );
+            let surface_root_loc =
+                geometry.loc + transform.content_rect.loc - transform.visible_rect.loc;
             let surface_anim_scale = Scale {
                 x: surface_anim_scale.x * transform.scale,
                 y: surface_anim_scale.y * transform.scale,
@@ -1677,6 +1823,7 @@ impl LayoutElement for Mapped {
                 ctx,
                 None,
                 geometry,
+                surface_root_loc,
                 scale,
                 clip_to_geometry,
                 self.toplevel().wl_surface(),
@@ -1686,6 +1833,8 @@ impl LayoutElement for Mapped {
                 radius,
                 self.rules.background_effect,
                 false,
+                transform.element_transform,
+                transform.source_geometry.size,
                 xray_pos.offset(transform.visible_rect.loc),
                 push,
             );
@@ -1696,6 +1845,7 @@ impl LayoutElement for Mapped {
             ctx,
             None,
             geometry,
+            geometry.loc,
             scale,
             clip_to_geometry,
             self.toplevel().wl_surface(),
@@ -1705,6 +1855,8 @@ impl LayoutElement for Mapped {
             radius,
             self.rules.background_effect,
             should_block_out,
+            Transform::Normal,
+            Size::from((0., 0.)),
             xray_pos,
             push,
         );

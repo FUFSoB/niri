@@ -27,7 +27,7 @@ use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
-use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
+use crate::render_helpers::scaled_surface::NamespacedScaledTransformedWaylandSurfaceRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -140,7 +140,7 @@ niri_render_elements! {
         Shadow = ShadowRenderElement,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
         NamespacedClippedSurface = NamespacedClippedSurfaceRenderElement<R>,
-        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
+        ScaledClippedSurface = ClippedSurfaceRenderElement<R, NamespacedScaledTransformedWaylandSurfaceRenderElement<R>>,
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,

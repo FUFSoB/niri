@@ -2,7 +2,7 @@ use std::cmp::{max, min};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
 
 /// Helper for fractionally transforming an i32 region while preserving adjacent rects.
@@ -16,35 +16,31 @@ pub struct TransformedRegion {
     pub rects: Arc<Vec<Rectangle<i32, Logical>>>,
     /// Scale to apply to each rect.
     pub scale: Scale<f64>,
-    /// Translation to apply to each rect after scaling.
+    /// Translation to apply to each rect after scaling, before any transform.
     pub offset: Point<f64, Logical>,
+    /// Translation to apply after the transform.
+    pub post_transform_offset: Point<f64, Logical>,
+    /// Additional compositor transform to apply after scaling and offsetting.
+    pub transform: Transform,
+    /// Area to transform inside, in the same coordinate space as the scaled+offset rects.
+    pub transform_area: Size<f64, Logical>,
 }
 
 impl TransformedRegion {
     /// Returns an iterator over the top-left and bottom-right corners of transformed rects.
     pub fn iter(&self) -> impl Iterator<Item = (Point<f64, Logical>, Point<f64, Logical>)> + '_ {
         self.rects.iter().map(|r| {
-            // Here we start in a happy i32 world where everything lines up, and rectangle loc +
-            // size is exactly equal to the adjacent rectangle's loc.
-            //
-            // Unfortunately, we're about to descend to the floating point hell. And we *really*
-            // want adjacent rects to remain adjacent no matter what. So we'll convert our rects to
-            // their extremities (rather than loc and size), and operate on those. Coordinates from
-            // adjacent rects will undergo exactly the same floating point operations, so when
-            // they're ultimately rounded to physical pixels, they will remain adjacent.
-            let r = r.to_f64();
+            let mut r = r.to_f64();
+            r.loc = r.loc.upscale(self.scale) + self.offset;
+            r.size = r.size.upscale(self.scale);
 
-            let mut a = r.loc;
-            // f64 is enough to represent this i32 addition exactly.
-            let mut b = r.loc + r.size.to_point();
+            if self.transform != Transform::Normal {
+                r = self.transform.transform_rect_in(r, &self.transform_area);
+            }
 
-            a = a.upscale(self.scale);
-            b = b.upscale(self.scale);
+            r.loc += self.post_transform_offset;
 
-            a += self.offset;
-            b += self.offset;
-
-            (a, b)
+            (r.loc, r.loc + r.size.to_point())
         })
     }
 
@@ -197,13 +193,14 @@ pub fn region_to_non_overlapping_rects(
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::sync::Arc;
 
     use insta::assert_snapshot;
     use proptest::prelude::*;
-    use smithay::utils::{Logical, Point, Rectangle, Size};
+    use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
     use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
 
-    use super::region_to_non_overlapping_rects;
+    use super::{region_to_non_overlapping_rects, TransformedRegion};
 
     #[allow(clippy::type_complexity)]
     fn check(rects: &[(RectangleKind, (i32, i32, i32, i32))]) -> String {
@@ -276,6 +273,28 @@ mod tests {
         assert_snapshot!(
             check(&[(Add, (0, 0, 10, 10)), (Add, (10, 0, 20, 10))]),
             @" 0  0 - 20 10"
+        );
+    }
+
+    #[test]
+    fn transformed_region_applies_post_transform_offset_last() {
+        let region = TransformedRegion {
+            rects: Arc::new(vec![Rectangle::new(
+                Point::from((0, 0)),
+                Size::from((4, 2)),
+            )]),
+            scale: Scale::from(1.),
+            offset: Point::from((10., 0.)),
+            post_transform_offset: Point::from((100., 50.)),
+            transform: Transform::_180,
+            transform_area: Size::from((20., 10.)),
+        };
+
+        let rects = region.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            rects,
+            vec![(Point::from((106., 58.)), Point::from((110., 60.)))]
         );
     }
 

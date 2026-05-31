@@ -66,7 +66,7 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::scaled_surface::NamespacedScaledWaylandSurfaceRenderElement;
+use crate::render_helpers::scaled_surface::NamespacedScaledTransformedWaylandSurfaceRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureBuffer;
@@ -138,8 +138,8 @@ niri_render_elements! {
     LayoutElementRenderElement<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamespacedWayland = NamespacedElement<WaylandSurfaceRenderElement<R>>,
-        MirrorScaledWayland = NamespacedScaledWaylandSurfaceRenderElement<R>,
-        MirrorScaledClippedWayland = ClippedSurfaceRenderElement<R, NamespacedScaledWaylandSurfaceRenderElement<R>>,
+        MirrorScaledWayland = NamespacedScaledTransformedWaylandSurfaceRenderElement<R>,
+        MirrorScaledClippedWayland = ClippedSurfaceRenderElement<R, NamespacedScaledTransformedWaylandSurfaceRenderElement<R>>,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
     }

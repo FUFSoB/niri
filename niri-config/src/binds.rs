@@ -171,6 +171,12 @@ pub enum Action {
         id: u64,
         level: String,
     },
+    SetWindowMirrorTransform(#[knuffel(argument, str)] niri_ipc::Transform),
+    #[knuffel(skip)]
+    SetWindowMirrorTransformById {
+        id: u64,
+        transform: niri_ipc::Transform,
+    },
     SetWindowMirrorCenterX(#[knuffel(argument, str)] PositionChange),
     #[knuffel(skip)]
     SetWindowMirrorCenterXById {
@@ -520,6 +526,14 @@ impl From<niri_ipc::Action> for Action {
                 id: Some(id),
                 level,
             } => Self::SetWindowMirrorZoomById { id, level },
+            niri_ipc::Action::SetWindowMirrorTransform {
+                id: None,
+                transform,
+            } => Self::SetWindowMirrorTransform(transform),
+            niri_ipc::Action::SetWindowMirrorTransform {
+                id: Some(id),
+                transform,
+            } => Self::SetWindowMirrorTransformById { id, transform },
             niri_ipc::Action::SetWindowMirrorCenterX { id: None, change } => {
                 Self::SetWindowMirrorCenterX(change)
             }
