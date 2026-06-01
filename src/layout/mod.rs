@@ -2011,39 +2011,48 @@ impl<W: LayoutElement> Layout<W> {
                 refresh_hint = Some(move_.output.clone());
             }
         }
-        if let Some(output) = refresh_hint.as_ref() {
-            self.refresh_interactive_move_hint(Some(output));
-            return;
-        }
 
-        match &mut self.monitor_set {
-            MonitorSet::Normal { monitors, .. } => {
-                for mon in monitors {
-                    if mon.sticky.has_window(window) {
-                        mon.sticky.update_window(window, serial);
-                        return;
+        let mut updated = refresh_hint.is_some();
+
+        if !updated {
+            match &mut self.monitor_set {
+                MonitorSet::Normal { monitors, .. } => {
+                    'monitors: for mon in monitors {
+                        if mon.sticky.has_window(window) {
+                            mon.sticky.update_window(window, serial);
+                            updated = true;
+                            break;
+                        }
+
+                        for ws in &mut mon.workspaces {
+                            if ws.has_window(window) {
+                                ws.update_window(window, serial);
+                                updated = true;
+                                break 'monitors;
+                            }
+                        }
                     }
-
-                    for ws in &mut mon.workspaces {
+                }
+                MonitorSet::NoOutputs { workspaces, .. } => {
+                    for ws in workspaces {
                         if ws.has_window(window) {
                             ws.update_window(window, serial);
-                            return;
+                            updated = true;
+                            break;
                         }
                     }
                 }
             }
-            MonitorSet::NoOutputs { workspaces, .. } => {
-                for ws in workspaces {
-                    if ws.has_window(window) {
-                        ws.update_window(window, serial);
-                        return;
-                    }
-                }
-            }
         }
 
-        if let Some(source) = sync_root {
-            self.sync_linked_mirrors_from_real(&source);
+        if let Some(output) = refresh_hint.as_ref() {
+            self.refresh_interactive_move_hint(Some(output));
+        }
+
+        if updated {
+            if let Some(source) = sync_root {
+                self.sync_linked_mirrors_from_real(&source);
+            }
         }
     }
 

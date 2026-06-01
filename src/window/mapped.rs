@@ -311,6 +311,30 @@ fn baked_texture_logical_size(
         .unwrap_or_else(|| baked.buffer.logical_size())
 }
 
+fn transform_texture_vector(
+    transform: Transform,
+    vector: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    transform.transform_point_in(vector, &Size::from((0, 0)))
+}
+
+fn compose_texture_transforms(first: Transform, second: Transform) -> Transform {
+    let x = transform_texture_vector(second, transform_texture_vector(first, Point::from((1, 0))));
+    let y = transform_texture_vector(second, transform_texture_vector(first, Point::from((0, 1))));
+
+    match (x, y) {
+        (Point { x: 1, y: 0, .. }, Point { x: 0, y: 1, .. }) => Transform::Normal,
+        (Point { x: 0, y: 1, .. }, Point { x: -1, y: 0, .. }) => Transform::_90,
+        (Point { x: -1, y: 0, .. }, Point { x: 0, y: -1, .. }) => Transform::_180,
+        (Point { x: 0, y: -1, .. }, Point { x: 1, y: 0, .. }) => Transform::_270,
+        (Point { x: -1, y: 0, .. }, Point { x: 0, y: 1, .. }) => Transform::Flipped,
+        (Point { x: 0, y: 1, .. }, Point { x: 1, y: 0, .. }) => Transform::Flipped90,
+        (Point { x: 1, y: 0, .. }, Point { x: 0, y: -1, .. }) => Transform::Flipped180,
+        (Point { x: 0, y: -1, .. }, Point { x: -1, y: 0, .. }) => Transform::Flipped270,
+        _ => unreachable!("unexpected transform composition"),
+    }
+}
+
 fn crop_baked_texture_to_rect(
     baked: &mut BakedBuffer<TextureBuffer<GlesTexture>>,
     clip: Rectangle<f64, Logical>,
@@ -1274,6 +1298,12 @@ impl Mapped {
                 let rect = transform.source_rect_to_mirror_rect(rect);
                 baked.location = rect.loc;
                 baked.dst = Some(rect.size.to_i32_round());
+                baked
+                    .buffer
+                    .set_texture_transform(compose_texture_transforms(
+                        baked.buffer.texture_transform(),
+                        transform.element_transform,
+                    ));
             }
             contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, transform.visible_rect));
         } else {

@@ -5839,41 +5839,67 @@ impl Niri {
             );
         }
 
-        // Windows usually have a single mapped instance per output. Mirrors can have several
-        // mapped instances for one shared surface tree on the same output, with only a subset of
-        // them actually visible. Aggregate those instances first so a hidden mirror cannot clear
-        // the primary scanout state after a visible sibling sets it.
-        let mut mapped_by_source = HashMap::<MappedId, Vec<&Mapped>>::new();
-        for mapped in self.layout.windows_for_output(output) {
-            mapped_by_source
-                .entry(mapped.source_id())
-                .or_default()
-                .push(mapped);
-        }
+        let has_mirrors = self
+            .layout
+            .windows_for_output(output)
+            .any(Mapped::is_mirror);
+        if has_mirrors {
+            // Windows usually have a single mapped instance per output. Mirrors can have several
+            // mapped instances for one shared surface tree on the same output, with only a subset
+            // of them actually visible. Aggregate those instances first so a hidden mirror cannot
+            // clear the primary scanout state after a visible sibling sets it.
+            let mut mapped_by_source = HashMap::<MappedId, Vec<&Mapped>>::new();
+            for mapped in self.layout.windows_for_output(output) {
+                mapped_by_source
+                    .entry(mapped.source_id())
+                    .or_default()
+                    .push(mapped);
+            }
 
-        for mapped_group in mapped_by_source.into_values() {
-            let mapped = mapped_group[0];
-            mapped.window.with_surfaces(|surface, states| {
-                let primary_scanout_output = states
-                    .data_map
-                    .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
-                let mut primary_scanout_output = primary_scanout_output.lock().unwrap();
+            for mapped_group in mapped_by_source.into_values() {
+                let mapped = mapped_group[0];
+                mapped.window.with_surfaces(|surface, states| {
+                    let primary_scanout_output = states
+                        .data_map
+                        .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
+                    let mut primary_scanout_output = primary_scanout_output.lock().unwrap();
 
-                let id = mapped_group
-                    .iter()
-                    .map(|mapped| primary_scanout_element_id_for_mapped(mapped, surface))
-                    .find(|id| id.was_presented(render_element_states))
-                    .unwrap_or_else(|| primary_scanout_element_id_for_mapped(mapped, surface));
-                let PrimaryScanoutElementId { id, namespace } = id;
+                    let id = mapped_group
+                        .iter()
+                        .map(|mapped| primary_scanout_element_id_for_mapped(mapped, surface))
+                        .find(|id| id.was_presented(render_element_states))
+                        .unwrap_or_else(|| primary_scanout_element_id_for_mapped(mapped, surface));
+                    let PrimaryScanoutElementId { id, namespace } = id;
 
-                primary_scanout_output.update_from_render_element_states(
-                    id,
-                    output,
-                    namespace,
-                    render_element_states,
-                    |_, _, output, _| output,
-                );
-            });
+                    primary_scanout_output.update_from_render_element_states(
+                        id,
+                        output,
+                        namespace,
+                        render_element_states,
+                        |_, _, output, _| output,
+                    );
+                });
+            }
+        } else {
+            for mapped in self.layout.windows_for_output(output) {
+                mapped.window.with_surfaces(|surface, states| {
+                    let primary_scanout_output = states
+                        .data_map
+                        .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
+                    let mut primary_scanout_output = primary_scanout_output.lock().unwrap();
+
+                    let PrimaryScanoutElementId { id, namespace } =
+                        primary_scanout_element_id_for_mapped(mapped, surface);
+
+                    primary_scanout_output.update_from_render_element_states(
+                        id,
+                        output,
+                        namespace,
+                        render_element_states,
+                        |_, _, output, _| output,
+                    );
+                });
+            }
         }
 
         let xray = &self.output_state[output].xray;
@@ -6285,10 +6311,6 @@ impl Niri {
     ///
     /// This function therefore sends callbacks to surfaces associated with `output`
     /// unconditionally (still subject to the per-surface throttling done inside `send_frame`).
-    ///
-    /// Note: this deliberately does not send callbacks for global/pointer-related surfaces (cursor
-    /// image, drag-and-drop icon) because those rely on the normal primary-output based
-    /// deduplication.
     pub fn send_frame_callbacks_for_virtual_output(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks_for_virtual_output");
 
@@ -6315,6 +6337,26 @@ impl Niri {
         if let Some(surface) = &self.output_state[output].lock_surface {
             send_frames_surface_tree(
                 surface.wl_surface(),
+                output,
+                frame_callback_time,
+                FRAME_CALLBACK_THROTTLE,
+                |_, _| Some(output.clone()),
+            );
+        }
+
+        if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
+            send_frames_surface_tree(
+                surface,
+                output,
+                frame_callback_time,
+                FRAME_CALLBACK_THROTTLE,
+                |_, _| Some(output.clone()),
+            );
+        }
+
+        if let CursorImageStatus::Surface(surface) = self.cursor_manager.cursor_image() {
+            send_frames_surface_tree(
+                surface,
                 output,
                 frame_callback_time,
                 FRAME_CALLBACK_THROTTLE,

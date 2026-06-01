@@ -546,21 +546,12 @@ impl State {
 
 impl Niri {
     pub fn refresh_mapped_cast_targets(&mut self) {
-        let mut window_targets = HashSet::new();
-        let mut workspace_targets = HashSet::new();
-
-        // Find regardless of cast.is_active.
-        for cast in &self.casting.casts {
-            match cast.target {
-                CastTarget::Window { id } => {
-                    window_targets.insert(id);
-                }
-                CastTarget::Workspace { id, .. } => {
-                    workspace_targets.insert(id);
-                }
-                CastTarget::Nothing | CastTarget::Output { .. } => (),
-            }
-        }
+        let (window_targets, workspace_targets) = collect_active_cast_targets(
+            self.casting
+                .casts
+                .iter()
+                .map(|cast| (cast.is_active(), &cast.target)),
+        );
 
         let mut screen_targets = HashSet::new();
         self.layout.with_windows(|mapped, _, workspace_id, _| {
@@ -1036,6 +1027,72 @@ impl Niri {
         let output = workspace.current_output()?.clone();
         let (size, refresh) = cast_params_for_output(&output);
         Some((output, size, refresh))
+    }
+}
+
+fn collect_active_cast_targets<'a>(
+    casts: impl IntoIterator<Item = (bool, &'a CastTarget)>,
+) -> (HashSet<u64>, HashSet<WorkspaceId>) {
+    let mut window_targets = HashSet::new();
+    let mut workspace_targets = HashSet::new();
+
+    for (is_active, target) in casts {
+        if !is_active {
+            continue;
+        }
+
+        match target {
+            CastTarget::Window { id } => {
+                window_targets.insert(*id);
+            }
+            CastTarget::Workspace { id, .. } => {
+                workspace_targets.insert(*id);
+            }
+            CastTarget::Nothing | CastTarget::Output { .. } => (),
+        }
+    }
+
+    (window_targets, workspace_targets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_casts_do_not_mark_targets() {
+        let (window_targets, workspace_targets) = collect_active_cast_targets([
+            (false, &CastTarget::Window { id: 7 }),
+            (
+                false,
+                &CastTarget::Workspace {
+                    id: WorkspaceId::specific(3),
+                    output: None,
+                },
+            ),
+        ]);
+
+        assert!(window_targets.is_empty());
+        assert!(workspace_targets.is_empty());
+    }
+
+    #[test]
+    fn active_casts_mark_window_and_workspace_targets() {
+        let (window_targets, workspace_targets) = collect_active_cast_targets([
+            (true, &CastTarget::Window { id: 7 }),
+            (
+                true,
+                &CastTarget::Workspace {
+                    id: WorkspaceId::specific(3),
+                    output: None,
+                },
+            ),
+            (false, &CastTarget::Window { id: 99 }),
+            (true, &CastTarget::Nothing),
+        ]);
+
+        assert_eq!(window_targets, HashSet::from([7]));
+        assert_eq!(workspace_targets, HashSet::from([WorkspaceId::specific(3)]));
     }
 }
 

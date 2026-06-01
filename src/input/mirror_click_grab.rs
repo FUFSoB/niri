@@ -9,6 +9,14 @@ use smithay::utils::{Logical, Point, Size, Transform};
 
 use crate::niri::State;
 
+fn transform_relative_delta(
+    delta: Point<f64, Logical>,
+    mirror_scale: f64,
+    inverse_transform: Transform,
+) -> Point<f64, Logical> {
+    inverse_transform.transform_point_in(delta.downscale(mirror_scale), &Size::from((0., 0.)))
+}
+
 pub struct MirrorClickGrab {
     start_data: PointerGrabStartData<State>,
     start_surface_local: Point<f64, Logical>,
@@ -32,9 +40,11 @@ impl MirrorClickGrab {
     }
 
     fn source_delta_for_location(&self, location: Point<f64, Logical>) -> Point<f64, Logical> {
-        let delta = (location - self.start_data.location).downscale(self.mirror_scale);
-        self.inverse_transform
-            .transform_point_in(delta, &Size::from((0., 0.)))
+        transform_relative_delta(
+            location - self.start_data.location,
+            self.mirror_scale,
+            self.inverse_transform,
+        )
     }
 
     fn focus_for_location(
@@ -65,7 +75,16 @@ impl PointerGrab<State> for MirrorClickGrab {
         _focus: Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
-        handle.relative_motion(data, self.start_data.focus.clone(), event);
+        let mut event = event.clone();
+        event.delta =
+            transform_relative_delta(event.delta, self.mirror_scale, self.inverse_transform);
+        event.delta_unaccel = transform_relative_delta(
+            event.delta_unaccel,
+            self.mirror_scale,
+            self.inverse_transform,
+        );
+
+        handle.relative_motion(data, self.start_data.focus.clone(), &event);
     }
 
     fn button(
@@ -177,6 +196,8 @@ impl PointerGrab<State> for MirrorClickGrab {
 mod tests {
     use smithay::utils::{Logical, Point, Size, Transform};
 
+    use super::transform_relative_delta;
+
     fn focus_origin_for_location(
         start_location: Point<f64, Logical>,
         start_surface_local: Point<f64, Logical>,
@@ -190,6 +211,20 @@ mod tests {
                 &Size::from((0., 0.)),
             );
         location - surface_local
+    }
+
+    #[test]
+    fn mirror_relative_delta_rotates_with_transform() {
+        let delta = transform_relative_delta(Point::from((4., 8.)), 2., Transform::_270);
+
+        assert_eq!(delta, Point::from((4., -2.)));
+    }
+
+    #[test]
+    fn mirror_relative_delta_flips_and_scales_with_transform() {
+        let delta = transform_relative_delta(Point::from((6., 10.)), 2., Transform::Flipped);
+
+        assert_eq!(delta, Point::from((-3., 5.)));
     }
 
     #[test]

@@ -104,3 +104,56 @@ fn touch_input_targets_virtual_output_when_focused() {
     let touch_output = f.niri().output_for_touch().unwrap().clone();
     assert_eq!(touch_output, virt);
 }
+
+#[test]
+fn removing_off_virtual_output_does_not_panic() {
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(&mut state.niri, 1920, 1080, 60, Some("virt".to_owned()))
+            .unwrap()
+    };
+
+    let output = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    let output_id = {
+        let state = f.niri_state();
+        *state
+            .backend
+            .ipc_outputs()
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, ipc_output)| ipc_output.name == name)
+            .map(|(id, _)| id)
+            .unwrap()
+    };
+
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(&name, niri_ipc::OutputAction::Off);
+        assert!(!state.niri.output_exists(&output));
+
+        state
+            .backend
+            .remove_virtual_output(&mut state.niri, &name)
+            .unwrap();
+    }
+
+    assert!(!f
+        .niri_state()
+        .backend
+        .ipc_outputs()
+        .lock()
+        .unwrap()
+        .contains_key(&output_id));
+}

@@ -15,7 +15,7 @@ use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement,
 };
 use smithay::backend::renderer::element::{
-    Element as _, Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
+    Element as _, Id, Kind, RenderElementPresentationState, RenderElementState, RenderElementStates,
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::utils::surface_primary_scanout_output;
@@ -31,7 +31,9 @@ use super::client::{ClientId, LayerConfigureProps};
 use super::*;
 use crate::layout::{
     ActivateWindow, AddWindowTarget, HitType, LayoutElement as _, LayoutElementRenderElement,
+    LayoutElementRenderSnapshot,
 };
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{
     encompassing_geo, render_to_vec as render_pixels, RenderCtx, RenderTarget,
@@ -349,6 +351,43 @@ fn render_window_output_pixels_for(
             (geo.size, pixels)
         })
         .unwrap()
+}
+
+fn render_snapshot_texture_pixels(
+    renderer: &mut GlesRenderer,
+    snapshot: &LayoutElementRenderSnapshot,
+    scale: Scale<f64>,
+) -> (Size<i32, Physical>, Vec<u8>) {
+    let (texture, geo) = {
+        let mut ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::Screencast,
+            block_out_enabled: false,
+            xray: None,
+        };
+        snapshot.texture(ctx.r(), scale).cloned().unwrap()
+    };
+
+    let buffer = TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, vec![]);
+    let element = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::from((0., 0.)),
+        1.,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let pixels = render_pixels(
+        renderer,
+        geo.size,
+        scale,
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(&element),
+    )
+    .unwrap();
+
+    (geo.size, pixels)
 }
 
 fn create_window_mirror(f: &mut Fixture) -> MappedId {
@@ -1551,6 +1590,36 @@ fn mirror_linked_group_does_not_mutate_unlinked_siblings() {
 }
 
 #[test]
+fn mirror_linked_group_tracks_commit_driven_source_resize() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.toggle_window_floating(Some(&source_id));
+
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    assert!(f.niri().layout.toggle_window_mirror_link(&mirror_id));
+
+    let window = f.client(id).window(&surface);
+    window.attach_rgba_buffer(GREEN);
+    window.set_size(72, 48);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, source_id).1,
+        Size::from((72, 48))
+    );
+    assert_eq!(
+        mirror_mapped_by_id(&mut f, mirror_id).1,
+        Size::from((72, 48))
+    );
+}
+
+#[test]
 fn mirror_linked_group_does_not_sync_transform() {
     let Some(mut f) = set_up(Config::default()) else {
         return;
@@ -2166,6 +2235,50 @@ fn mirror_animation_snapshot_uses_window_geometry_not_buffer_extents() {
             assert_eq!(snapshot.contents[0].dst, Some(Size::from((96, 56))));
         })
         .unwrap();
+}
+
+#[test]
+fn mirror_animation_snapshot_preserves_rotation() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(40));
+    f.niri()
+        .layout
+        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+
+    let output = f.niri_output(1);
+    let (live_size, live_pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
+
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    let (snapshot_size, snapshot_pixels) = backend
+        .with_primary_renderer(|renderer| {
+            let mapped = niri
+                .layout
+                .windows_for_output_mut(&output)
+                .find(|mapped| mapped.id() == mirror_id)
+                .unwrap();
+
+            mapped.store_animation_snapshot(renderer);
+            let snapshot = mapped.take_animation_snapshot().unwrap();
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            render_snapshot_texture_pixels(renderer, &snapshot, scale)
+        })
+        .unwrap();
+
+    assert_eq!(snapshot_size, live_size);
+    assert_eq!(snapshot_pixels, live_pixels);
 }
 
 #[test]

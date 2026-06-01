@@ -149,9 +149,12 @@ pub(super) fn remove_virtual_output_from_map(
     let (output, output_id) = outputs
         .remove(name)
         .ok_or_else(|| format!("{kind} '{name}' not found"))?;
+    let is_connected = niri.output_exists(&output);
 
     ipc_outputs.lock().unwrap().remove(&output_id);
-    niri.remove_output(&output);
+    if is_connected {
+        niri.remove_output(&output);
+    }
 
     Ok(())
 }

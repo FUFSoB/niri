@@ -1,4 +1,6 @@
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use niri_config::utils::RegexEq;
@@ -7,14 +9,15 @@ use niri_config::{Action, Config};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
+use smithay::wayland::compositor::with_states;
 
-use super::client::LayerConfigureProps;
+use super::client::{LayerConfigureProps, SyncData};
 use super::*;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::LayoutElement;
@@ -645,6 +648,75 @@ fn force_cursor_shape_overrides_client_surface() {
     set_cursor_image(&mut f, CursorImageStatus::Surface(surface));
 
     assert_named_cursor(output_cursor_image(&mut f), CursorIcon::Crosshair);
+}
+
+#[test]
+fn virtual_output_frame_callbacks_tick_cursor_surfaces() {
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(&mut state.niri, 100, 100, 60, Some("virt".to_owned()))
+            .unwrap()
+    };
+
+    let output = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let client_surface = window.surface.clone();
+    window.set_title("cursor-source");
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&client_surface);
+    window.attach_rgba_buffer(WINDOW_COLOR);
+    window.set_size(20, 20);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let mapped = f.niri().layout.focus().unwrap().id();
+    let server_surface = window_surface(&mut f, mapped);
+
+    let window = f.client(id).window(&client_surface);
+    window.attach_null();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let frame_done = Arc::new(SyncData::default());
+    {
+        let client = f.client(id);
+        client_surface.frame(&client.qh, frame_done.clone());
+        client_surface.commit();
+        client.connection.flush().unwrap();
+    }
+    f.dispatch();
+
+    set_cursor_image(&mut f, CursorImageStatus::Surface(server_surface.clone()));
+    with_states(&server_surface, |states| {
+        states
+            .data_map
+            .insert_if_missing_threadsafe(CursorImageSurfaceData::default);
+    });
+    f.niri().send_frame_callbacks_for_virtual_output(&output);
+    f.niri_state().refresh_and_flush_clients();
+
+    for _ in 0..10 {
+        if frame_done.done.load(Ordering::Relaxed) {
+            break;
+        }
+        f.dispatch();
+    }
+
+    assert!(frame_done.done.load(Ordering::Relaxed));
 }
 
 #[test]
