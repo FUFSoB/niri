@@ -1,4 +1,5 @@
-use fixture::Fixture;
+pub(crate) use client::SyncData;
+pub(crate) use fixture::Fixture;
 
 mod client;
 mod fixture;

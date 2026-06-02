@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,6 +122,7 @@ pub struct LayerConfigureProps {
 #[derive(Default)]
 pub struct SyncData {
     pub done: AtomicBool,
+    pub count: AtomicUsize,
 }
 
 static CLIENT_ID_COUNTER: IdCounter = IdCounter::new();
@@ -496,7 +497,10 @@ impl Dispatch<WlCallback, Arc<SyncData>> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            wl_callback::Event::Done { .. } => data.done.store(true, Ordering::Relaxed),
+            wl_callback::Event::Done { .. } => {
+                data.done.store(true, Ordering::Relaxed);
+                data.count.fetch_add(1, Ordering::Relaxed);
+            }
             _ => unreachable!(),
         }
     }

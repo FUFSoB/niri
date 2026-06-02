@@ -70,8 +70,9 @@ impl MirrorViewGrab {
         let mirror_local = self.start_mirror_local + delta;
         let max_zoom = data.niri.config.borrow().zoom.max_zoom;
 
+        let mut redraw_output = None;
         let mut updated = false;
-        data.niri.layout.with_windows_mut(|mapped, _| {
+        data.niri.layout.with_windows_mut(|mapped, output| {
             if mapped.id() != self.window {
                 return;
             }
@@ -83,11 +84,12 @@ impl MirrorViewGrab {
                 }
             };
             mapped.set_mirror_view_from_anchor(zoom, mirror_local, self.start_source_point);
+            redraw_output = output.cloned();
             updated = true;
         });
 
-        if updated {
-            data.niri.queue_redraw_all();
+        if let Some(output) = redraw_output {
+            data.niri.queue_redraw(&output);
         }
 
         updated
@@ -240,7 +242,51 @@ impl PointerGrab<State> for MirrorViewGrab {
 
 #[cfg(test)]
 mod tests {
-    use super::MirrorViewGrab;
+    use std::time::Duration;
+
+    use smithay::utils::Point;
+
+    use super::*;
+    use crate::layout::{ActivateWindow, AddWindowTarget};
+    use crate::niri::RedrawState;
+    use crate::tests::Fixture;
+    use crate::window::Mapped;
+
+    fn create_window(f: &mut Fixture, title: &str, size: (u16, u16)) -> MappedId {
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.set_title(title);
+        window.commit();
+        f.roundtrip(id);
+
+        let window = f.client(id).window(&surface);
+        window.attach_rgba_buffer([0, u32::MAX, 0, u32::MAX]);
+        window.set_size(size.0, size.1);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        f.niri().layout.focus().unwrap().id()
+    }
+
+    fn create_window_mirror_for(f: &mut Fixture, source_id: MappedId) -> MappedId {
+        let niri = f.niri();
+        let mapped = niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == source_id)
+            .map(|(_, mapped)| mapped)
+            .unwrap();
+        let mirror = Mapped::new_mirror(mapped);
+        let mirror_id = mirror.id();
+        niri.layout.add_window_mirror(
+            &source_id,
+            mirror,
+            AddWindowTarget::NextTo(&source_id),
+            ActivateWindow::Smart,
+        );
+        mirror_id
+    }
 
     #[test]
     fn zoom_for_delta_y_is_exponential() {
@@ -251,5 +297,50 @@ mod tests {
     #[test]
     fn zoom_for_delta_y_clamps_to_max() {
         assert_eq!(MirrorViewGrab::zoom_for_delta_y(4., -120., 6.), 6.);
+    }
+
+    #[test]
+    fn on_frame_redraws_only_the_mirror_output() {
+        let mut f = Fixture::new();
+        f.add_output(1, (100, 100));
+        f.add_output(2, (100, 100));
+
+        let source_id = create_window(&mut f, "source", (40, 30));
+        let mirror_id = create_window_mirror_for(&mut f, source_id);
+        let output1 = f.niri_output(1);
+        let output2 = f.niri_output(2);
+
+        f.niri()
+            .layout
+            .move_to_output(Some(&mirror_id), &output2, None, ActivateWindow::No);
+        for state in f.niri().output_state.values_mut() {
+            state.redraw_state = RedrawState::Idle;
+        }
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: 0,
+            location: Point::from((10., 10.)),
+        };
+        let mut grab = MirrorViewGrab::new(
+            start_data,
+            mirror_id,
+            MirrorViewGrabMode::Pan,
+            Point::from((10., 10.)),
+            Point::from((10., 10.)),
+            1.,
+        );
+        grab.new_location = Point::from((18., 14.));
+        grab.event_timestamp = Some(Duration::from_millis(1));
+
+        assert!(grab.on_frame(f.niri_state()));
+        assert!(matches!(
+            f.niri().output_state.get(&output1).unwrap().redraw_state,
+            RedrawState::Idle
+        ));
+        assert!(matches!(
+            f.niri().output_state.get(&output2).unwrap().redraw_state,
+            RedrawState::Queued
+        ));
     }
 }

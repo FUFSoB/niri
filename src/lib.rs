@@ -27,4 +27,4 @@ pub mod window;
 pub mod zoom;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

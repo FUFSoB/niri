@@ -31,9 +31,13 @@ impl Server {
     }
 
     pub fn dispatch(&mut self) {
+        self.dispatch_without_refresh();
+        self.state.refresh_and_flush_clients();
+    }
+
+    pub fn dispatch_without_refresh(&mut self) {
         self.event_loop
             .dispatch(Duration::ZERO, &mut self.state)
             .unwrap();
-        self.state.refresh_and_flush_clients();
     }
 }

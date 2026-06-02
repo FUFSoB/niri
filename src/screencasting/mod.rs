@@ -234,10 +234,12 @@ impl State {
                 let mut elements = Vec::new();
                 let mut pointer_location = Point::default();
 
-                if self
-                    .niri
-                    .should_render_pointer_for_target(RenderTarget::Screencast, Some(mapped.id()))
-                {
+                let cursor_rules = Niri::cursor_window_rules(mapped);
+                if self.niri.should_render_pointer_for_target_with_rules(
+                    RenderTarget::Screencast,
+                    Some(mapped.id()),
+                    Some(cursor_rules),
+                ) {
                     if let Some((pointer_pos, win_pos)) =
                         self.niri.pointer_pos_for_window_cast(mapped)
                     {
@@ -251,11 +253,12 @@ impl State {
                         pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
 
                         let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                        self.niri.render_pointer(
+                        self.niri.render_pointer_with_rules(
                             renderer,
                             output,
                             RenderTarget::Screencast,
                             Some(mapped.id()),
+                            Some(cursor_rules),
                             &mut |elem| {
                                 let elem = RelocateRenderElement::from_element(
                                     elem,
@@ -319,12 +322,16 @@ impl State {
                 }
             }
             CastTarget::Window { id } => {
-                let mut windows = self.niri.layout.windows();
-                if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
-                    if let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.id()) {
-                        refresh = Some(output.current_mode().unwrap().refresh as u32);
-                    }
-                }
+                refresh = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find_map(|(monitor, mapped)| {
+                        (mapped.id().get() == *id)
+                            .then(|| monitor.map(|monitor| monitor.output()))
+                            .flatten()
+                    })
+                    .map(|output| output.current_mode().unwrap().refresh as u32);
             }
         }
 
@@ -545,6 +552,14 @@ impl State {
 }
 
 impl Niri {
+    fn clear_inactive_cast_state(&mut self) {
+        self.casting.mapped_cast_output.clear();
+        self.layout.with_windows_mut(|mapped, _| {
+            mapped.set_is_window_cast_target(false);
+            mapped.set_is_screen_cast_target(false);
+        });
+    }
+
     pub fn refresh_mapped_cast_targets(&mut self) {
         let (window_targets, workspace_targets) = collect_active_cast_targets(
             self.casting
@@ -899,7 +914,12 @@ impl Niri {
             let mut elements = Vec::new();
             let mut pointer_location = Point::default();
 
-            if self.should_render_pointer_for_target(RenderTarget::Screencast, Some(mapped.id())) {
+            let cursor_rules = Niri::cursor_window_rules(mapped);
+            if self.should_render_pointer_for_target_with_rules(
+                RenderTarget::Screencast,
+                Some(mapped.id()),
+                Some(cursor_rules),
+            ) {
                 if let Some((pointer_pos, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
                     // Pointer location must be relative to the screencast buffer.
                     // - win_pos is the position of the main window surface in output-local
@@ -910,11 +930,12 @@ impl Niri {
                     pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
 
                     let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                    self.render_pointer(
+                    self.render_pointer_with_rules(
                         renderer,
                         output,
                         RenderTarget::Screencast,
                         Some(mapped.id()),
+                        Some(cursor_rules),
                         &mut |elem| {
                             let elem =
                                 RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
@@ -960,6 +981,10 @@ impl Niri {
             if let Err(err) = cast.stream.disconnect() {
                 warn!("error disconnecting stream: {err:?}");
             }
+        }
+
+        if self.casting.casts.is_empty() {
+            self.clear_inactive_cast_state();
         }
 
         let dbus = &self.dbus.as_ref().unwrap();
@@ -1008,11 +1033,11 @@ impl Niri {
     }
 
     fn cast_params_for_window(&self, window_id: u64) -> Option<(Size<i32, Physical>, u32)> {
-        let (_, mapped) = self
-            .layout
-            .windows()
-            .find(|(_, m)| m.id().get() == window_id)?;
-        let output = self.casting.mapped_cast_output.get(&mapped.id())?;
+        let (output, mapped) = self.layout.windows().find_map(|(monitor, mapped)| {
+            (mapped.id().get() == window_id)
+                .then(|| monitor.map(|monitor| (monitor.output(), mapped)))
+                .flatten()
+        })?;
         let scale = Scale::from(output.current_scale().fractional_scale());
         let size = mapped.window_cast_bbox(scale).size;
         let refresh = output.current_mode().unwrap().refresh as u32;
@@ -1058,6 +1083,24 @@ fn collect_active_cast_targets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::Fixture;
+
+    fn create_window(f: &mut Fixture, title: &str, size: (u16, u16)) -> MappedId {
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.set_title(title);
+        window.commit();
+        f.roundtrip(id);
+
+        let window = f.client(id).window(&surface);
+        window.attach_rgba_buffer([0, u32::MAX, 0, u32::MAX]);
+        window.set_size(size.0, size.1);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        f.niri().layout.focus().unwrap().id()
+    }
 
     #[test]
     fn inactive_casts_do_not_mark_targets() {
@@ -1093,6 +1136,22 @@ mod tests {
 
         assert_eq!(window_targets, HashSet::from([7]));
         assert_eq!(workspace_targets, HashSet::from([WorkspaceId::specific(3)]));
+    }
+
+    #[test]
+    fn cast_params_for_window_do_not_require_cached_output() {
+        let mut f = Fixture::new();
+        f.add_output(1, (100, 100));
+
+        let window_id = create_window(&mut f, "window-cast", (40, 30));
+        let expected = f.niri().cast_params_for_window(window_id.get()).unwrap();
+
+        f.niri().casting.mapped_cast_output.clear();
+
+        assert_eq!(
+            f.niri().cast_params_for_window(window_id.get()),
+            Some(expected),
+        );
     }
 }
 

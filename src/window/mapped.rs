@@ -1479,6 +1479,26 @@ impl Mapped {
         output: &Output,
         time: T,
         throttle: Option<Duration>,
+        primary_scan_out_output: F,
+    ) where
+        T: Into<Duration>,
+        F: FnMut(&WlSurface, &SurfaceData) -> Option<Output> + Copy,
+    {
+        self.send_frame_with_hidden_fallback(
+            output,
+            time,
+            throttle,
+            Some(output.clone()),
+            primary_scan_out_output,
+        );
+    }
+
+    pub(crate) fn send_frame_with_hidden_fallback<T, F>(
+        &mut self,
+        output: &Output,
+        time: T,
+        throttle: Option<Duration>,
+        hidden_fallback_output: Option<Output>,
         mut primary_scan_out_output: F,
     ) where
         T: Into<Duration>,
@@ -1486,6 +1506,7 @@ impl Mapped {
     {
         let needs_frame_callback = self.needs_frame_callback;
         self.needs_frame_callback = false;
+        let hidden_fallback_output = hidden_fallback_output.as_ref();
 
         let should_send = move |surface: &WlSurface, states: &SurfaceData| {
             // Let primary_scan_out_output() run its logic and update internal state.
@@ -1494,7 +1515,9 @@ impl Mapped {
             }
 
             // Send unconditionally to all surfaces if the window needs a surface callback.
-            needs_frame_callback.then(|| output.clone())
+            needs_frame_callback
+                .then(|| hidden_fallback_output.cloned())
+                .flatten()
         };
         self.window.send_frame(output, time, throttle, should_send);
     }

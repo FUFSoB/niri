@@ -601,16 +601,24 @@ pub struct PointContents {
     pub surface: Option<(WlSurface, Point<f64, Logical>)>,
     // If surface belongs to a window, this is that layout entry.
     pub window: Option<(MappedId, HitType)>,
+    // Cursor-related rules for the window under the pointer.
+    window_rules: Option<CursorWindowRules>,
     // If surface belongs to a layer surface, this is that layer surface.
     pub layer: Option<LayerSurface>,
     // Pointer is over a hot corner.
     pub hot_corner: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct CursorWindowRules {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorWindowRules {
     draw_cursor: Option<DrawCursor>,
     force_cursor_shape: Option<ForceCursorShape>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorWindowInfo {
+    id: MappedId,
+    rules: CursorWindowRules,
 }
 
 #[derive(Debug, Default)]
@@ -1003,13 +1011,13 @@ impl State {
         ext_workspace::refresh(self);
 
         #[cfg(feature = "xdp-gnome-screencast")]
-        self.niri.refresh_mapped_cast_outputs();
-        #[cfg(feature = "xdp-gnome-screencast")]
-        self.niri.refresh_workspace_cast_targets();
-        // Should happen before refresh_window_rules(), but after anything that can start or stop
-        // screencasts.
-        #[cfg(feature = "xdp-gnome-screencast")]
-        self.niri.refresh_mapped_cast_targets();
+        if !self.niri.casting.casts.is_empty() {
+            self.niri.refresh_mapped_cast_outputs();
+            self.niri.refresh_workspace_cast_targets();
+            // Should happen before refresh_window_rules(), but after anything that can start or
+            // stop screencasts.
+            self.niri.refresh_mapped_cast_targets();
+        }
         self.ipc_refresh_casts();
 
         self.niri.refresh_window_rules();
@@ -3897,7 +3905,7 @@ impl Niri {
                             )
                         })
                 })
-                .map(|(s, l)| (Some(s), (None, Some(l.clone()))))
+                .map(|(s, l)| (Some(s), (None, None, Some(l.clone()))))
         };
 
         let layer_toplevel_under = |layer| layer_surface_under(layer, false);
@@ -3923,7 +3931,11 @@ impl Niri {
             } else {
                 None
             };
-            (surface_and_pos, (Some((mapped.id(), hit)), None))
+            let rules = Self::cursor_window_rules(mapped);
+            (
+                surface_and_pos,
+                (Some((mapped.id(), hit)), Some(rules), None),
+            )
         };
 
         let interactive_moved_window_under = || {
@@ -3983,7 +3995,7 @@ impl Niri {
             }
         }
 
-        let Some((mut surface_and_pos, (window, layer))) = under else {
+        let Some((mut surface_and_pos, (window, window_rules, layer))) = under else {
             return rv;
         };
 
@@ -3993,44 +4005,47 @@ impl Niri {
 
         rv.surface = surface_and_pos;
         rv.window = window;
+        rv.window_rules = window_rules;
         rv.layer = layer;
         rv
     }
 
-    fn cursor_window_under_pointer(&self) -> Option<MappedId> {
+    pub(crate) fn cursor_window_rules(mapped: &Mapped) -> CursorWindowRules {
+        CursorWindowRules {
+            draw_cursor: mapped.rules().draw_cursor,
+            force_cursor_shape: mapped.rules().force_cursor_shape,
+        }
+    }
+
+    fn cursor_window_info(contents: &PointContents) -> Option<CursorWindowInfo> {
+        let (id, _) = contents.window?;
+        Some(CursorWindowInfo {
+            id,
+            rules: contents.window_rules.unwrap_or_default(),
+        })
+    }
+
+    fn cursor_window_under_pointer(&self) -> Option<CursorWindowInfo> {
         let pointer_pos = self
             .tablet_cursor_location
             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
         let contents = self.contents_under_with_niri_ui(pointer_pos, true);
-        let window_id = if self.tablet_cursor_location.is_some() {
-            contents.window.map(|(id, _)| id)
+        let window = if self.tablet_cursor_location.is_some() {
+            Self::cursor_window_info(&contents)
         } else if self.cursor_window_transition_active(&contents) {
-            self.pointer_contents
-                .window
-                .map(|(id, _)| id)
-                .or_else(|| contents.window.map(|(id, _)| id))
+            Self::cursor_window_info(&self.pointer_contents)
+                .or_else(|| Self::cursor_window_info(&contents))
                 .or_else(|| self.cursor_window_transition_fallback_window(pointer_pos, &contents))
         } else {
-            contents.window.map(|(id, _)| id)
+            Self::cursor_window_info(&contents)
         };
 
-        window_id
+        window
     }
 
     fn cursor_window_rules_under_pointer(&self) -> CursorWindowRules {
         self.cursor_window_under_pointer()
-            .map(|window_id| self.cursor_window_rules_for_window(window_id))
-            .unwrap_or_default()
-    }
-
-    fn cursor_window_rules_for_window(&self, window_id: MappedId) -> CursorWindowRules {
-        self.layout
-            .windows()
-            .find(|(_, mapped)| mapped.id() == window_id)
-            .map(|(_, mapped)| CursorWindowRules {
-                draw_cursor: mapped.rules().draw_cursor,
-                force_cursor_shape: mapped.rules().force_cursor_shape,
-            })
+            .map(|window| window.rules)
             .unwrap_or_default()
     }
 
@@ -4038,10 +4053,13 @@ impl Niri {
         &self,
         target: RenderTarget,
         cursor_owner: Option<MappedId>,
+        cursor_owner_rules: Option<CursorWindowRules>,
     ) -> CursorWindowRules {
-        let mut rules = cursor_owner
-            .map(|window_id| self.cursor_window_rules_for_window(window_id))
-            .unwrap_or_else(|| self.cursor_window_rules_under_pointer());
+        let mut rules = if cursor_owner.is_some() {
+            cursor_owner_rules.unwrap_or_default()
+        } else {
+            self.cursor_window_rules_under_pointer()
+        };
 
         if self.screenshot_ui.is_open() && target == RenderTarget::Output && cursor_owner.is_none()
         {
@@ -4067,7 +4085,7 @@ impl Niri {
         &self,
         pointer_pos: Point<f64, Logical>,
         contents: &PointContents,
-    ) -> Option<MappedId> {
+    ) -> Option<CursorWindowInfo> {
         let output = contents.output.as_ref()?;
         let mon = self.layout.monitor_for_output(output)?;
         if !mon.are_transitions_ongoing() {
@@ -4103,7 +4121,10 @@ impl Niri {
 
         self.layout
             .window_under(output, fallback_pos)
-            .map(|(mapped, _)| mapped.id())
+            .map(|(mapped, _)| CursorWindowInfo {
+                id: mapped.id(),
+                rules: Self::cursor_window_rules(mapped),
+            })
     }
 
     pub(crate) fn cursor_image_for_target(
@@ -4111,9 +4132,18 @@ impl Niri {
         target: RenderTarget,
         cursor_owner: Option<MappedId>,
     ) -> CursorImageStatus {
+        self.cursor_image_for_target_with_rules(target, cursor_owner, None)
+    }
+
+    fn cursor_image_for_target_with_rules(
+        &self,
+        target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+        cursor_owner_rules: Option<CursorWindowRules>,
+    ) -> CursorImageStatus {
         let cursor_image = self.cursor_manager.cursor_image().clone();
         let cursor_source = self.cursor_manager.cursor_source();
-        let rules = self.cursor_window_rules_for_target(target, cursor_owner);
+        let rules = self.cursor_window_rules_for_target(target, cursor_owner, cursor_owner_rules);
 
         let cursor_image = match rules.draw_cursor {
             Some(DrawCursor::AlwaysHidden) => CursorImageStatus::Hidden,
@@ -4145,10 +4175,19 @@ impl Niri {
         target: RenderTarget,
         cursor_owner: Option<MappedId>,
     ) -> bool {
+        self.should_render_pointer_for_target_with_rules(target, cursor_owner, None)
+    }
+
+    pub(crate) fn should_render_pointer_for_target_with_rules(
+        &self,
+        target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+        cursor_owner_rules: Option<CursorWindowRules>,
+    ) -> bool {
         match self.pointer_visibility {
             PointerVisibility::Visible => true,
             PointerVisibility::Hidden => {
-                self.cursor_window_rules_for_target(target, cursor_owner)
+                self.cursor_window_rules_for_target(target, cursor_owner, cursor_owner_rules)
                     .draw_cursor
                     == Some(DrawCursor::AlwaysShown)
             }
@@ -4206,13 +4245,15 @@ impl Niri {
             .map(|_| pointer_loc - output_geo.loc)
     }
 
-    fn render_cursor_for_target(
+    fn render_cursor_for_target_with_rules(
         &self,
         target: RenderTarget,
         scale: i32,
         cursor_owner: Option<MappedId>,
+        cursor_owner_rules: Option<CursorWindowRules>,
     ) -> RenderCursor {
-        let cursor_image = self.cursor_image_for_target(target, cursor_owner);
+        let cursor_image =
+            self.cursor_image_for_target_with_rules(target, cursor_owner, cursor_owner_rules);
         self.cursor_manager
             .get_render_cursor_for_image(cursor_image, scale)
     }
@@ -4498,6 +4539,18 @@ impl Niri {
         cursor_owner: Option<MappedId>,
         push: &mut dyn FnMut(PointerRenderElements<R>),
     ) {
+        self.render_pointer_with_rules(renderer, output, target, cursor_owner, None, push)
+    }
+
+    pub(crate) fn render_pointer_with_rules<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        target: RenderTarget,
+        cursor_owner: Option<MappedId>,
+        cursor_owner_rules: Option<CursorWindowRules>,
+        push: &mut dyn FnMut(PointerRenderElements<R>),
+    ) {
         let _span = tracy_client::span!("Niri::render_pointer");
         let output_scale = output.current_scale();
         let output_pos = self.global_space.output_geometry(output).unwrap().loc;
@@ -4522,7 +4575,12 @@ impl Niri {
         };
         // Get the render cursor to draw.
         let cursor_scale = output_scale.integer_scale();
-        let render_cursor = self.render_cursor_for_target(target, cursor_scale, cursor_owner);
+        let render_cursor = self.render_cursor_for_target_with_rules(
+            target,
+            cursor_scale,
+            cursor_owner,
+            cursor_owner_rules,
+        );
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
         let cursor_hotspot_pos = pointer_pos.to_physical_precise_round(output_scale);
@@ -6118,6 +6176,32 @@ impl Niri {
         );
     }
 
+    fn frame_callback_output(
+        states: &SurfaceData,
+        sequence: u32,
+        current_output: &Output,
+        owner_output: Option<Output>,
+    ) -> Option<Output> {
+        let owner_output = owner_output?;
+        if owner_output != *current_output {
+            return None;
+        }
+
+        let frame_throttling_state = states
+            .data_map
+            .get_or_insert(SurfaceFrameThrottlingState::default);
+        let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
+
+        if let Some((last_output, last_sequence)) = &*last_sent_at {
+            if last_output == &owner_output && *last_sequence == sequence {
+                return None;
+            }
+        }
+
+        *last_sent_at = Some((owner_output.clone(), sequence));
+        Some(owner_output)
+    }
+
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks");
 
@@ -6128,33 +6212,12 @@ impl Niri {
             // Do the standard primary scanout output check. For pointer surfaces it deduplicates
             // the frame callbacks across potentially multiple outputs, and for regular windows and
             // layer-shell surfaces it avoids sending frame callbacks to invisible surfaces.
-            let current_primary_output = surface_primary_scanout_output(surface, states);
-            if current_primary_output.as_ref() != Some(output) {
-                return None;
-            }
-
-            // Next, check the throttling status.
-            let frame_throttling_state = states
-                .data_map
-                .get_or_insert(SurfaceFrameThrottlingState::default);
-            let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
-
-            let mut send = true;
-
-            // If we already sent a frame callback to this surface this output refresh
-            // cycle, don't send one again to prevent empty-damage commit busy loops.
-            if let Some((last_output, last_sequence)) = &*last_sent_at {
-                if last_output == output && *last_sequence == sequence {
-                    send = false;
-                }
-            }
-
-            if send {
-                *last_sent_at = Some((output.clone(), sequence));
-                Some(output.clone())
-            } else {
-                None
-            }
+            Self::frame_callback_output(
+                states,
+                sequence,
+                output,
+                surface_primary_scanout_output(surface, states),
+            )
         };
 
         let frame_callback_time = get_monotonic_time();
@@ -6214,29 +6277,8 @@ impl Niri {
                         if on_primary {
                             force_render_state_borrow.remove(&surface.id().protocol_id());
                         }
-                        //Fps unlimited branch.
-                        let frame_throttling_state = states
-                            .data_map
-                            .get_or_insert(SurfaceFrameThrottlingState::default);
-
-                        // Next, check the throttling status.
-                        let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
-                        let mut send = true;
-
-                        // If we already sent a frame callback to this surface this output refresh
-                        // cycle, don't send one again to prevent empty-damage commit busy loops.
-                        if let Some((last_output, last_sequence)) = &*last_sent_at {
-                            if last_output == output && *last_sequence == sequence {
-                                send = false;
-                            }
-                        }
-
-                        if send {
-                            *last_sent_at = Some((output.clone(), sequence));
-                            Some(output.clone())
-                        } else {
-                            None
-                        }
+                        // Fps unlimited branch.
+                        Self::frame_callback_output(states, sequence, output, Some(output.clone()))
                     }
                 };
 
@@ -6307,61 +6349,116 @@ impl Niri {
     ///
     /// Virtual outputs (e.g. HEADLESS-*) don't go through the normal scanout/render pipeline that
     /// updates `surface_primary_scanout_output`, so the regular `send_frame_callbacks` visibility
-    /// filtering would often suppress callbacks entirely.
+    /// filtering would often suppress callbacks entirely. At the same time, the same surface tree
+    /// can be visible on multiple virtual outputs, so the callback ownership still needs to be
+    /// deduplicated to a single output.
     ///
-    /// This function therefore sends callbacks to surfaces associated with `output`
-    /// unconditionally (still subject to the per-surface throttling done inside `send_frame`).
+    /// This function therefore elects a single owner output per surface tree when scanout data is
+    /// unavailable, while preserving the normal per-surface throttling.
     pub fn send_frame_callbacks_for_virtual_output(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks_for_virtual_output");
 
+        let state = self.output_state.get(output).unwrap();
+        let sequence = state.frame_callback_sequence;
         let frame_callback_time = get_monotonic_time();
+        let first_virtual_output = self
+            .layout
+            .outputs()
+            .find(|candidate| crate::backend::VirtualOutputMarker::is_virtual(candidate))
+            .cloned();
+        let should_send_on_owner = |_: &WlSurface, states: &SurfaceData| {
+            Self::frame_callback_output(states, sequence, output, Some(output.clone()))
+        };
+        let mut source_frame_callback_output = HashMap::new();
+        for (monitor, mapped) in self.layout.windows() {
+            let Some(output) = monitor.map(|monitor| monitor.output()) else {
+                continue;
+            };
+            source_frame_callback_output
+                .entry(mapped.source_id())
+                .or_insert_with(|| output.clone());
+        }
 
         for mapped in self.layout.windows_for_output_mut(output) {
-            mapped.send_frame(
+            let owner_output = source_frame_callback_output
+                .get(&mapped.source_id())
+                .cloned();
+            if owner_output.as_ref() != Some(output) {
+                continue;
+            }
+
+            mapped.send_frame_with_hidden_fallback(
                 output,
                 frame_callback_time,
                 FRAME_CALLBACK_THROTTLE,
-                |_, _| Some(output.clone()),
+                Some(output.clone()),
+                should_send_on_owner,
             );
         }
 
         for surface in layer_map_for_output(output).layers() {
+            let owner_output = with_states(surface.wl_surface(), |states| {
+                surface_primary_scanout_output(surface.wl_surface(), states)
+            })
+            .or_else(|| first_virtual_output.clone());
+            if owner_output.as_ref() != Some(output) {
+                continue;
+            }
+
             surface.send_frame(
                 output,
                 frame_callback_time,
                 FRAME_CALLBACK_THROTTLE,
-                |_, _| Some(output.clone()),
+                should_send_on_owner,
             );
         }
 
         if let Some(surface) = &self.output_state[output].lock_surface {
-            send_frames_surface_tree(
-                surface.wl_surface(),
-                output,
-                frame_callback_time,
-                FRAME_CALLBACK_THROTTLE,
-                |_, _| Some(output.clone()),
-            );
+            let owner_output = with_states(surface.wl_surface(), |states| {
+                surface_primary_scanout_output(surface.wl_surface(), states)
+            })
+            .or_else(|| first_virtual_output.clone());
+            if owner_output.as_ref() == Some(output) {
+                send_frames_surface_tree(
+                    surface.wl_surface(),
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_on_owner,
+                );
+            }
         }
 
         if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
-            send_frames_surface_tree(
-                surface,
-                output,
-                frame_callback_time,
-                FRAME_CALLBACK_THROTTLE,
-                |_, _| Some(output.clone()),
-            );
+            let owner_output = with_states(surface, |states| {
+                surface_primary_scanout_output(surface, states)
+            })
+            .or_else(|| first_virtual_output.clone());
+            if owner_output.as_ref() == Some(output) {
+                send_frames_surface_tree(
+                    surface,
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_on_owner,
+                );
+            }
         }
 
         if let CursorImageStatus::Surface(surface) = self.cursor_manager.cursor_image() {
-            send_frames_surface_tree(
-                surface,
-                output,
-                frame_callback_time,
-                FRAME_CALLBACK_THROTTLE,
-                |_, _| Some(output.clone()),
-            );
+            let owner_output = with_states(surface, |states| {
+                surface_primary_scanout_output(surface, states)
+            })
+            .or_else(|| first_virtual_output.clone());
+            if owner_output.as_ref() == Some(output) {
+                send_frames_surface_tree(
+                    surface,
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_on_owner,
+                );
+            }
         }
     }
 
