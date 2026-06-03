@@ -1553,6 +1553,28 @@ fn mirror_link_resizes_with_real_and_linked_siblings() {
 }
 
 #[test]
+fn unlinked_mirror_inherits_tiled_height_from_source() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri()
+        .layout
+        .set_window_height(Some(&source_id), SizeChange::SetFixed(48));
+
+    let source_height = mirror_mapped_by_id(&mut f, source_id).1.h;
+    assert_eq!(source_height, 48);
+
+    let mirror_id = create_window_mirror_for(&mut f, source_id);
+    assert!(!is_mirror_linked_by_id(&mut f, mirror_id));
+
+    assert_eq!(mirror_mapped_by_id(&mut f, mirror_id).1.h, source_height);
+}
+
+#[test]
 fn mirror_linked_group_does_not_mutate_unlinked_siblings() {
     let Some(mut f) = set_up(Config::default()) else {
         return;

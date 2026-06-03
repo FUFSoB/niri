@@ -739,22 +739,39 @@ impl State {
         }
 
         if self.niri.active_tablet_grab.as_ref() == Some(press) {
-            let serial = SERIAL_COUNTER.next_serial();
-            let pointer = self.niri.seat.get_pointer().unwrap();
-            pointer.button(
-                self,
-                &ButtonEvent {
-                    button: press.button,
-                    state: ButtonState::Released,
-                    serial,
-                    time,
-                },
-            );
-            pointer.frame(self);
-            self.niri.active_tablet_grab = None;
+            self.release_active_tablet_grab(time);
         }
 
         true
+    }
+
+    fn release_active_tablet_grab(&mut self, time: u32) -> bool {
+        let Some(press) = self.niri.active_tablet_grab.take() else {
+            return false;
+        };
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button: press.button,
+                state: ButtonState::Released,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        true
+    }
+
+    pub(crate) fn abort_active_tablet_drag_action(&mut self, time: u32) -> bool {
+        let Some(press) = self.niri.active_tablet_grab.clone() else {
+            return false;
+        };
+
+        self.niri.suppressed_tablet_presses.remove(&press);
+        self.release_active_tablet_grab(time)
     }
 
     fn clear_suppressed_tablet_presses_for_tool(&mut self, tool: &TabletToolDescriptor, time: u32) {
@@ -1221,6 +1238,7 @@ impl State {
                         .unwrap_or(false)
                     {
                         pointer.unset_grab(this, serial, time);
+                        this.abort_active_tablet_drag_action(time);
                         this.niri.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
@@ -6399,8 +6417,31 @@ fn confined_pointer_move_should_be_prevented(
 mod tests {
     use std::cell::Cell;
 
+    use smithay::backend::input::{TabletToolCapabilities, TabletToolDescriptor, TabletToolType};
+    use smithay::utils::{Point, SERIAL_COUNTER};
+
     use super::*;
     use crate::animation::Clock;
+    use crate::tests::Fixture;
+
+    fn set_up_window() -> Fixture {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+
+        let window = f.client(id).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        f
+    }
 
     #[test]
     fn bindings_suppress_keys() {
@@ -7004,5 +7045,36 @@ mod tests {
             .as_ref(),
             Some(&bind),
         );
+    }
+
+    #[test]
+    fn aborting_pointer_grab_clears_active_tablet_drag_state() {
+        let mut f = set_up_window();
+        let press = TabletToolPress {
+            tool: TabletToolDescriptor {
+                tool_type: TabletToolType::Pen,
+                hardware_serial: 1,
+                hardware_id_wacom: 1,
+                capabilities: TabletToolCapabilities::empty(),
+            },
+            button: 0x110,
+        };
+
+        let state = f.niri_state();
+        state.move_cursor(Point::from((50., 50.)));
+        assert!(
+            state.try_start_move_window_interactively(press.button, SERIAL_COUNTER.next_serial(),)
+        );
+        state.niri.suppressed_tablet_presses.insert(press.clone());
+        state.niri.active_tablet_grab = Some(press.clone());
+
+        let pointer = state.niri.seat.get_pointer().unwrap();
+        assert!(pointer.is_grabbed());
+        pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), 1);
+        state.abort_active_tablet_drag_action(1);
+
+        assert!(!pointer.is_grabbed());
+        assert!(state.niri.active_tablet_grab.is_none());
+        assert!(!state.niri.suppressed_tablet_presses.contains(&press));
     }
 }

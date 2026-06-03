@@ -470,6 +470,7 @@ impl<W: LayoutElement> Monitor<W> {
         {
             return Some(MirrorSourceSnapshot {
                 width: None,
+                height: None,
                 is_full_width: false,
                 is_floating: true,
                 is_sticky: true,

@@ -601,6 +601,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         RemovedTile {
             tile,
             width,
+            height: None,
             is_full_width: false,
             is_floating: true,
             is_sticky: false,

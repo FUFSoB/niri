@@ -504,6 +504,8 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) pointer_pos_within_output: Point<f64, Logical>,
     /// Window column width.
     pub(self) width: ColumnWidth,
+    /// Window height state if the move targets the tiling layout.
+    pub(self) height: Option<WindowHeight>,
     /// Whether the window column was full-width.
     pub(self) is_full_width: bool,
     /// Whether the window targets the floating layout.
@@ -590,6 +592,8 @@ pub struct RemovedTile<W: LayoutElement> {
     tile: Tile<W>,
     /// Width of the column the tile was in.
     width: ColumnWidth,
+    /// Height state of the tile if it was in tiling layout.
+    height: Option<WindowHeight>,
     /// Whether the column the tile was in was full-width.
     is_full_width: bool,
     /// Whether the tile was floating.
@@ -614,6 +618,7 @@ pub(super) struct StickyRestoreInfo<WindowId> {
 #[derive(Debug, Clone)]
 pub(super) struct MirrorSourceSnapshot<WindowId> {
     width: Option<ColumnWidth>,
+    height: Option<WindowHeight>,
     is_full_width: bool,
     is_floating: bool,
     is_sticky: bool,
@@ -1829,6 +1834,10 @@ impl<W: LayoutElement> Layout<W> {
             activate,
         );
 
+        if let Some(height) = snapshot.height {
+            self.set_window_height_state(&id, height);
+        }
+
         if snapshot.is_windowed_fullscreen {
             self.with_windows_mut(|window, _| {
                 if window.id() == &id {
@@ -1910,6 +1919,7 @@ impl<W: LayoutElement> Layout<W> {
                         return Some(RemovedTile {
                             tile: move_.tile,
                             width: move_.width,
+                            height: move_.height,
                             is_full_width: move_.is_full_width,
                             is_floating: move_.is_floating,
                             is_sticky: move_.is_sticky,
@@ -6328,6 +6338,7 @@ impl<W: LayoutElement> Layout<W> {
                 let RemovedTile {
                     mut tile,
                     width,
+                    height,
                     is_full_width,
                     is_floating,
                     is_sticky,
@@ -6370,6 +6381,7 @@ impl<W: LayoutElement> Layout<W> {
                     output,
                     pointer_pos_within_output,
                     width,
+                    height,
                     is_full_width,
                     is_floating,
                     is_sticky,
@@ -7552,6 +7564,7 @@ impl<W: LayoutElement> Layout<W> {
             if move_.tile.window().id() == window {
                 return Some(MirrorSourceSnapshot {
                     width: (!move_.is_floating && !move_.is_sticky).then_some(move_.width),
+                    height: move_.height,
                     is_full_width: move_.is_full_width,
                     is_floating: move_.is_floating,
                     is_sticky: move_.is_sticky,

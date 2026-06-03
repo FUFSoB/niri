@@ -1107,12 +1107,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         transaction: Transaction,
         anim_config: Option<niri_config::Animation>,
     ) -> RemovedTile<W> {
+        let height = self.columns[column_idx].window_height(tile_idx);
+
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
             let mut column = self.remove_column_by_idx(column_idx, anim_config);
             return RemovedTile {
                 tile: column.tiles.remove(tile_idx),
                 width: column.width,
+                height: Some(height),
                 is_full_width: column.is_full_width,
                 is_floating: false,
                 is_sticky: false,
@@ -1166,6 +1169,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let tile = RemovedTile {
             tile,
             width: column.width,
+            height: Some(height),
             is_full_width: column.is_full_width,
             is_floating: false,
             is_sticky: false,

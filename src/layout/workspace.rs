@@ -517,6 +517,7 @@ impl<W: LayoutElement> Workspace<W> {
         if let Some(tile) = self.floating.tiles().find(|tile| tile.window().id() == id) {
             return Some(MirrorSourceSnapshot {
                 width: None,
+                height: None,
                 is_full_width: false,
                 is_floating: true,
                 is_sticky: false,
@@ -535,9 +536,11 @@ impl<W: LayoutElement> Workspace<W> {
             .and_then(|column| {
                 column
                     .tiles()
-                    .find(|(tile, _)| tile.window().id() == id)
-                    .map(|(tile, _)| MirrorSourceSnapshot {
+                    .enumerate()
+                    .find(|(_, (tile, _))| tile.window().id() == id)
+                    .map(|(tile_idx, (tile, _))| MirrorSourceSnapshot {
                         width: Some(column.stored_width()),
+                        height: Some(column.window_height(tile_idx)),
                         is_full_width: column.is_full_width(),
                         is_floating: false,
                         is_sticky: false,

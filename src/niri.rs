@@ -1533,6 +1533,7 @@ impl State {
                         SERIAL_COUNTER.next_serial(),
                         get_monotonic_time().as_millis() as u32,
                     );
+                    self.abort_active_tablet_drag_action(get_monotonic_time().as_millis() as u32);
                     self.niri.popup_grab = None;
                 }
             }
@@ -2236,6 +2237,7 @@ impl State {
             SERIAL_COUNTER.next_serial(),
             get_monotonic_time().as_millis() as u32,
         );
+        self.abort_active_tablet_drag_action(get_monotonic_time().as_millis() as u32);
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.unset_grab(self);
         }
@@ -6400,7 +6402,7 @@ impl Niri {
             let owner_output = with_states(surface.wl_surface(), |states| {
                 surface_primary_scanout_output(surface.wl_surface(), states)
             })
-            .or_else(|| first_virtual_output.clone());
+            .or_else(|| Some(output.clone()));
             if owner_output.as_ref() != Some(output) {
                 continue;
             }
@@ -6417,7 +6419,7 @@ impl Niri {
             let owner_output = with_states(surface.wl_surface(), |states| {
                 surface_primary_scanout_output(surface.wl_surface(), states)
             })
-            .or_else(|| first_virtual_output.clone());
+            .or_else(|| Some(output.clone()));
             if owner_output.as_ref() == Some(output) {
                 send_frames_surface_tree(
                     surface.wl_surface(),
