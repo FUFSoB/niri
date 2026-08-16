@@ -78,6 +78,7 @@
           dbus,
           libGL,
           libdisplay-info,
+          libdisplay-info_0_3 ? libdisplay-info,
           libinput,
           seatd,
           libxkbcommon,
@@ -141,7 +142,7 @@
             cairo
             dbus
             libGL
-            libdisplay-info
+            libdisplay-info_0_3
             libinput
             seatd
             libxkbcommon
