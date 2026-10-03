@@ -13,7 +13,7 @@ use niri_ipc::{LayoutSwitchTarget, PositionChange};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
-    InputEvent, KeyState, KeyboardKeyEvent, Keycode, MouseButton, PointerAxisEvent,
+    InputEvent, InputTime, KeyState, KeyboardKeyEvent, Keycode, MouseButton, PointerAxisEvent,
     PointerButtonEvent, PointerMotionEvent, ProximityState, Switch, SwitchState, SwitchToggleEvent,
     TabletToolButtonEvent, TabletToolDescriptor, TabletToolEvent, TabletToolProximityEvent,
     TabletToolTipEvent, TabletToolTipState, TouchEvent,
@@ -27,10 +27,12 @@ use smithay::input::pointer::{
     GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab, RelativeMotionEvent,
 };
+use smithay::input::tablet::tool::GrabStartData as TabletToolGrabStartData;
+use smithay::input::tablet::{TabletDescriptor, TabletSeatHandler, TabletSeatTrait};
 use smithay::input::touch::{
     DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, UpEvent,
 };
-use smithay::input::SeatHandler;
+use smithay::input::{tablet, SeatHandler};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -39,7 +41,6 @@ use smithay::utils::{
 };
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
-use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::mirror_click_grab::MirrorClickGrab;
@@ -64,6 +65,7 @@ use crate::utils::{
 use crate::window::Mapped;
 
 pub mod backend_ext;
+pub mod click_grab;
 pub mod mirror_click_grab;
 pub mod mirror_view_grab;
 pub mod move_grab;
@@ -75,7 +77,6 @@ pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod touch_overview_grab;
-pub mod touch_resize_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
@@ -96,30 +97,45 @@ pub struct TabletToolPress {
     pub button: u32,
 }
 
-pub enum PointerOrTouchStartData<D: SeatHandler> {
+pub enum AnyStartData<D: SeatHandler + TabletSeatHandler> {
     Pointer(PointerGrabStartData<D>),
     Touch(TouchGrabStartData<D>),
+    TabletTool(TabletToolGrabStartData<D>),
 }
 
-impl<D: SeatHandler> PointerOrTouchStartData<D> {
+impl<D: SeatHandler + TabletSeatHandler> AnyStartData<D> {
     pub fn location(&self) -> Point<f64, Logical> {
         match self {
-            PointerOrTouchStartData::Pointer(x) => x.location,
-            PointerOrTouchStartData::Touch(x) => x.location,
+            AnyStartData::Pointer(x) => x.location,
+            AnyStartData::Touch(x) => x.location,
+            AnyStartData::TabletTool(x) => x.location,
         }
     }
 
     pub fn unwrap_pointer(&self) -> &PointerGrabStartData<D> {
         match self {
-            PointerOrTouchStartData::Pointer(x) => x,
-            PointerOrTouchStartData::Touch(_) => panic!("start_data is not Pointer"),
+            AnyStartData::Pointer(x) => x,
+            AnyStartData::Touch(_) | AnyStartData::TabletTool(_) => {
+                panic!("start_data is not Pointer")
+            }
         }
     }
 
     pub fn unwrap_touch(&self) -> &TouchGrabStartData<D> {
         match self {
-            PointerOrTouchStartData::Pointer(_) => panic!("start_data is not Touch"),
-            PointerOrTouchStartData::Touch(x) => x,
+            AnyStartData::Pointer(_) | AnyStartData::TabletTool(_) => {
+                panic!("start_data is not Touch")
+            }
+            AnyStartData::Touch(x) => x,
+        }
+    }
+
+    pub fn unwrap_tablet_tool(&self) -> &TabletToolGrabStartData<D> {
+        match self {
+            AnyStartData::Pointer(_) | AnyStartData::Touch(_) => {
+                panic!("start_data is not TabletTool")
+            }
+            AnyStartData::TabletTool(x) => x,
         }
     }
 
@@ -129,6 +145,10 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 
     pub fn is_touch(&self) -> bool {
         matches!(self, Self::Touch(_))
+    }
+
+    pub fn is_tablet_tool(&self) -> bool {
+        matches!(self, Self::TabletTool(_))
     }
 }
 
@@ -360,7 +380,7 @@ impl State {
             button: button_code,
             location,
         };
-        let start_data = PointerOrTouchStartData::Pointer(start_data);
+        let start_data = AnyStartData::Pointer(start_data);
         let icon = CursorIcon::Grabbing;
         let Some(grab) = MoveGrab::new(self, start_data, window, false, Some(icon)) else {
             return false;
@@ -395,7 +415,7 @@ impl State {
             button: button_code,
             location: pointer.current_location(),
         };
-        let start_data = PointerOrTouchStartData::Pointer(start_data);
+        let start_data = AnyStartData::Pointer(start_data);
         let Some(grab) = MoveGrab::new(self, start_data, window, false, None) else {
             return false;
         };
@@ -520,6 +540,7 @@ impl State {
             button: button_code,
             location,
         };
+        let start_data = AnyStartData::Pointer(start_data);
         let grab = ResizeGrab::new(start_data, window);
         pointer.set_grab(self, grab, serial, Focus::Clear);
         self.niri
@@ -632,7 +653,7 @@ impl State {
         self.niri.pointer_contents = self.niri.contents_under(pos);
     }
 
-    fn drive_pointer_grab_from_tablet_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
+    fn drive_pointer_grab_from_tablet_motion(&mut self, pos: Point<f64, Logical>, time: InputTime) {
         let pointer = self.niri.seat.get_pointer().unwrap();
         let under = self.niri.contents_under(pos);
         self.niri.pointer_contents.clone_from(&under);
@@ -674,7 +695,7 @@ impl State {
         action: &Action,
         press: &TabletToolPress,
         pos: Point<f64, Logical>,
-        time: u32,
+        time: InputTime,
     ) -> bool {
         self.sync_pointer_to_position(pos);
 
@@ -710,7 +731,7 @@ impl State {
         trigger: Trigger,
         press: TabletToolPress,
         pos: Option<Point<f64, Logical>>,
-        time: u32,
+        time: InputTime,
     ) -> bool {
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
         let Some(bind) = self.find_tablet_bind(trigger, mods) else {
@@ -733,7 +754,7 @@ impl State {
         true
     }
 
-    fn finish_suppressed_tablet_press(&mut self, press: &TabletToolPress, time: u32) -> bool {
+    fn finish_suppressed_tablet_press(&mut self, press: &TabletToolPress, time: InputTime) -> bool {
         if !self.niri.suppressed_tablet_presses.remove(press) {
             return false;
         }
@@ -745,7 +766,7 @@ impl State {
         true
     }
 
-    fn release_active_tablet_grab(&mut self, time: u32) -> bool {
+    fn release_active_tablet_grab(&mut self, time: InputTime) -> bool {
         let Some(press) = self.niri.active_tablet_grab.take() else {
             return false;
         };
@@ -765,7 +786,7 @@ impl State {
         true
     }
 
-    pub(crate) fn abort_active_tablet_drag_action(&mut self, time: u32) -> bool {
+    pub(crate) fn abort_active_tablet_drag_action(&mut self, time: InputTime) -> bool {
         let Some(press) = self.niri.active_tablet_grab.clone() else {
             return false;
         };
@@ -774,7 +795,11 @@ impl State {
         self.release_active_tablet_grab(time)
     }
 
-    fn clear_suppressed_tablet_presses_for_tool(&mut self, tool: &TabletToolDescriptor, time: u32) {
+    fn clear_suppressed_tablet_presses_for_tool(
+        &mut self,
+        tool: &TabletToolDescriptor,
+        time: InputTime,
+    ) {
         let suppressed: Vec<_> = self
             .niri
             .suppressed_tablet_presses
@@ -921,7 +946,7 @@ impl State {
             let tablet_seat = self.niri.seat.tablet_seat();
 
             let desc = TabletDescriptor::from(&device);
-            tablet_seat.add_tablet::<Self>(&self.niri.display_handle, &desc);
+            tablet_seat.add_wp_tablet(&self.niri.display_handle, &desc);
         }
         if device.has_capability(DeviceCapability::Touch) && self.niri.seat.get_touch().is_none() {
             self.niri.seat.add_touch();
@@ -1070,7 +1095,7 @@ impl State {
         let mut pressed_keys = keyboard.pressed_keys().into_iter().collect::<Vec<_>>();
         pressed_keys.sort_unstable();
 
-        let time = get_monotonic_time().as_millis() as u32;
+        let time = InputTime::now();
         for keycode in pressed_keys {
             let serial = SERIAL_COUNTER.next_serial();
             let (_, mods_changed) =
@@ -1110,7 +1135,7 @@ impl State {
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
         let serial = SERIAL_COUNTER.next_serial();
-        let time = Event::time_msec(&event);
+        let time = Event::time(&event);
         let pressed = event.state() == KeyState::Pressed;
 
         // Stop bind key repeat on any release. This won't work 100% correctly in cases like:
@@ -1140,7 +1165,7 @@ impl State {
         #[cfg(feature = "dbus")]
         let block = {
             let block = self.a11y_process_key(
-                Duration::from_millis(u64::from(time)),
+                Duration::from_micros(time.micros()),
                 event.key_code(),
                 event.state(),
             );
@@ -3423,6 +3448,12 @@ impl State {
                     }
                 }
             }
+            Action::TestAction => {
+                #[cfg(test)]
+                {
+                    self.niri.test_action_count += 1;
+                }
+            }
         }
     }
 
@@ -3502,7 +3533,7 @@ impl State {
                     &RelativeMotionEvent {
                         delta: event.delta(),
                         delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
+                        time: event.time(),
                     },
                 );
 
@@ -3638,7 +3669,7 @@ impl State {
                     &RelativeMotionEvent {
                         delta: event.delta(),
                         delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
+                        time: event.time(),
                     },
                 );
 
@@ -3660,7 +3691,7 @@ impl State {
             &MotionEvent {
                 location: new_pos,
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
             },
         );
 
@@ -3670,7 +3701,7 @@ impl State {
             &RelativeMotionEvent {
                 delta: event.delta(),
                 delta_unaccel: event.delta_unaccel(),
-                utime: event.time(),
+                time: event.time(),
             },
         );
 
@@ -3715,6 +3746,9 @@ impl State {
             let point = self.screenshot_ui_point_on_output(output, new_pos);
             self.niri.screenshot_ui.pointer_motion(point, None);
         }
+        // Notify a11y.
+        #[cfg(feature = "dbus")]
+        self.a11y_notify_pointer_motion();
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
@@ -3773,7 +3807,7 @@ impl State {
             &MotionEvent {
                 location: pos,
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
             },
         );
 
@@ -3820,6 +3854,9 @@ impl State {
             let point = self.screenshot_ui_point_on_output(output, pos);
             self.niri.screenshot_ui.pointer_motion(point, None);
         }
+        // Notify a11y.
+        #[cfg(feature = "dbus")]
+        self.a11y_notify_pointer_motion();
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
@@ -4038,7 +4075,7 @@ impl State {
                 button: button_code,
                 state: button_state,
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
             },
         );
 
@@ -4101,7 +4138,7 @@ impl State {
         self.niri.pointer_visibility = PointerVisibility::Visible;
         self.niri.tablet_cursor_location = None;
 
-        let timestamp = Duration::from_micros(event.time());
+        let timestamp = Duration::from_micros(event.time().micros());
 
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
@@ -4538,7 +4575,7 @@ impl State {
         let horizontal_amount_v120 = horizontal_amount_v120.map(|x| x * horizontal_factor);
         let vertical_amount_v120 = vertical_amount_v120.map(|x| x * vertical_factor);
 
-        let mut frame = AxisFrame::new(event.time_msec()).source(source);
+        let mut frame = AxisFrame::new(event.time()).source(source);
         if horizontal_amount != 0.0 {
             frame = frame
                 .relative_direction(Axis::Horizontal, event.relative_direction(Axis::Horizontal));
@@ -4556,7 +4593,7 @@ impl State {
             }
         }
 
-        if source == AxisSource::Finger {
+        if source == AxisSource::Finger || source == AxisSource::Continuous {
             if event.amount(Axis::Horizontal) == Some(0.0) {
                 frame = frame.stop(Axis::Horizontal);
             }
@@ -4573,7 +4610,17 @@ impl State {
     where
         I::Device: 'static, // Needed for downcasting.
     {
-        let Some(pos) = self.compute_tablet_position(&event) else {
+        self.update_tablet_tool::<I>(&event, true);
+    }
+
+    fn update_tablet_tool<I: InputBackend>(
+        &mut self,
+        event: &(impl Event<I> + TabletToolEvent<I>),
+        send_frame: bool,
+    ) where
+        I::Device: 'static,
+    {
+        let Some(pos) = self.compute_tablet_position(event) else {
             return;
         };
         let pos = self.clamp_position_to_zoom(pos);
@@ -4586,7 +4633,7 @@ impl State {
             .as_ref()
             .is_some_and(|press| press.tool == tool_desc)
         {
-            self.drive_pointer_grab_from_tablet_motion(pos, event.time_msec());
+            self.drive_pointer_grab_from_tablet_motion(pos, event.time());
             self.niri.pointer_visibility = PointerVisibility::Visible;
             self.niri.tablet_cursor_location = Some(pos);
         } else {
@@ -4608,43 +4655,50 @@ impl State {
             }
 
             let under = self.niri.contents_under(pos);
-            let previous_focus = previous_pos
-                .map(|prev| self.niri.contents_under(prev))
-                .unwrap_or_default();
-            let current_focus = previous_focus.clone();
-            self.niri
-                .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
 
             let tablet_seat = self.niri.seat.tablet_seat();
-            let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
             let tool = tablet_seat.get_tool(&tool_desc);
-            if let (Some(tablet), Some(tool)) = (tablet, tool) {
-                if event.pressure_has_changed() {
-                    tool.pressure(event.pressure());
-                }
-                if event.distance_has_changed() {
-                    tool.distance(event.distance());
-                }
-                if event.tilt_has_changed() {
-                    tool.tilt(event.tilt());
-                }
-                if event.slider_has_changed() {
-                    tool.slider_position(event.slider_position());
-                }
-                if event.rotation_has_changed() {
-                    tool.rotation(event.rotation());
-                }
-                if event.wheel_has_changed() {
-                    tool.wheel(event.wheel_delta(), event.wheel_delta_discrete());
+            if let Some(tool) = tool {
+                // Don't move focus around while a native tablet tool grab (e.g. interactive move)
+                // is active.
+                if !tool.is_grabbed() {
+                    let previous_focus = previous_pos
+                        .map(|prev| self.niri.contents_under(prev))
+                        .unwrap_or_default();
+                    let current_focus = previous_focus.clone();
+                    self.niri
+                        .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
                 }
 
+                let time = event.time();
+
+                let frame = tablet::tool::AxisFrame {
+                    pressure: event.pressure_has_changed().then(|| event.pressure()),
+                    distance: event.distance_has_changed().then(|| event.distance()),
+                    tilt: event.tilt_has_changed().then(|| event.tilt()),
+                    rotation: event.rotation_has_changed().then(|| event.rotation()),
+                    slider: event.slider_has_changed().then(|| event.slider_position()),
+                    wheel: event
+                        .wheel_has_changed()
+                        .then(|| (event.wheel_delta(), event.wheel_delta_discrete())),
+                };
+
                 tool.motion(
-                    pos,
-                    under.surface.clone(),
-                    &tablet,
-                    SERIAL_COUNTER.next_serial(),
-                    event.time_msec(),
+                    self,
+                    under.surface,
+                    &tablet::tool::MotionEvent {
+                        location: pos,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
                 );
+
+                // Set axis after motion to ensure it reaches the new focus surface.
+                tool.axis(self, frame);
+
+                if send_frame {
+                    tool.frame(self, time);
+                }
 
                 self.niri.pointer_visibility = PointerVisibility::Visible;
                 self.niri.tablet_cursor_location = Some(pos);
@@ -4666,42 +4720,51 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent) {
+    fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent)
+    where
+        I::Device: 'static,
+    {
         let press = TabletToolPress {
             tool: event.tool(),
             button: BTN_TOUCH,
         };
-        let tip_state = event.tip_state();
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
+
+        let Some(tool) = tool else {
+            return;
+        };
+
+        let tip_state = event.tip_state();
+        if tip_state == TabletToolTipState::Down {
+            // Tip events can come together with axis event data with no separate axis event.
+            self.update_tablet_tool::<I>(&event, false);
+        }
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = event.time();
 
         match tip_state {
             TabletToolTipState::Down => {
                 if self.maybe_handle_tablet_bind_press(
                     Trigger::TabletPress,
-                    press.clone(),
+                    press,
                     self.niri.tablet_cursor_location,
-                    event.time_msec(),
+                    time,
                 ) {
+                    tool.frame(self, time);
                     return;
                 }
-
-                let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
-                let Some(tool) = tool else {
-                    return;
-                };
-                let serial = SERIAL_COUNTER.next_serial();
-                tool.tip_down(serial, event.time_msec());
 
                 if let Some(pos) = self.niri.tablet_cursor_location {
                     let under = self.niri.contents_under(pos);
 
-                    if self.niri.screenshot_ui.is_open() {
-                        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-                        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
-                        let modifiers = modifiers_from_state(mods);
-                        let mod_down = modifiers.contains(mod_key.to_modifiers());
+                    let mod_key = self.backend.mod_key(&self.niri.config.borrow());
+                    let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+                    let modifiers = modifiers_from_state(mods);
+                    let mod_down = modifiers.contains(mod_key.to_modifiers());
 
+                    if self.niri.screenshot_ui.is_open() {
                         // If we'll be moving the existing selection, use the selection output.
                         let output = if mod_down {
                             self.niri.screenshot_ui.selection_output()
@@ -4736,68 +4799,81 @@ impl State {
                                 self.niri.cancel_mru();
                             }
                         }
-                    } else if let Some((window, _)) = under.window {
-                        if let Some(output) = is_overview_open.then_some(under.output).flatten() {
-                            let mut workspaces = self.niri.layout.workspaces();
-                            let ws_idx = workspaces.find_map(|(_, ws_idx, ws)| {
-                                ws.windows().any(|w| w.id() == window).then_some(ws_idx)
-                            });
-                            let ws_idx = ws_idx.or_else(|| {
-                                if !self.niri.layout.is_sticky_window(&window) {
-                                    return None;
-                                }
+                    } else if !tool.is_grabbed() {
+                        if self.niri.layout.is_overview_open()
+                            && !mod_down
+                            && under.layer.is_none()
+                            && under.output.is_some()
+                        {
+                            let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
+                            let output = output.clone();
 
-                                let (output, pos_within_output) = self.niri.output_under(pos)?;
-                                let ws = self.niri.layout.workspace_under(
-                                    false,
-                                    output,
-                                    pos_within_output,
-                                )?;
-                                self.niri
-                                    .layout
-                                    .find_workspace_by_id(ws.id())
-                                    .map(|(idx, _)| idx)
-                            });
-                            if let Some(ws_idx) = ws_idx {
-                                drop(workspaces);
-                                self.niri.layout.focus_output(&output);
-                                self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                            let mut matched_narrow = true;
+                            let mut ws = self.niri.workspace_under(false, pos);
+                            if ws.is_none() {
+                                matched_narrow = false;
+                                ws = self.niri.workspace_under(true, pos);
                             }
+                            let ws_id = ws.map(|(_, ws)| ws.id());
+
+                            let mapped = self.niri.window_under(pos);
+                            let window = mapped.map(|mapped| mapped.id());
+
+                            let start_data = TabletToolGrabStartData {
+                                focus: None,
+                                trigger: tablet::tool::GrabTrigger::Tip,
+                                location: pos,
+                            };
+                            let start_data = AnyStartData::TabletTool(start_data);
+                            let start_timestamp = Duration::from_micros(event.time().micros());
+                            let grab = TouchOverviewGrab::new(
+                                start_data,
+                                start_timestamp,
+                                output,
+                                pos_within_output,
+                                ws_id,
+                                matched_narrow,
+                                window,
+                            );
+                            tool.set_grab(self, grab, time, serial, Focus::Clear);
+                        } else if let Some((window, _)) = under.window {
+                            self.niri.layout.activate_window(&window);
+
+                            // Check if we need to start a tablet tool move grab.
+                            if mod_down {
+                                let start_data = TabletToolGrabStartData {
+                                    focus: None,
+                                    trigger: tablet::tool::GrabTrigger::Tip,
+                                    location: pos,
+                                };
+                                let start_data = AnyStartData::TabletTool(start_data);
+                                let icon = CursorIcon::Grabbing;
+                                if let Some(grab) =
+                                    MoveGrab::new(self, start_data, window, true, Some(icon))
+                                {
+                                    tool.set_grab(self, grab, time, serial, Focus::Clear);
+                                }
+                            }
+
+                            // FIXME: granular.
+                            self.niri.queue_redraw_all();
+                        } else if let Some(output) = under.output {
+                            self.niri.layout.focus_output(&output);
+
+                            // FIXME: granular.
+                            self.niri.queue_redraw_all();
                         }
-
-                        self.niri.layout.activate_window(&window);
-
-                        // FIXME: granular.
-                        self.niri.queue_redraw_all();
-                    } else if let Some((output, ws)) = is_overview_open
-                        .then(|| self.niri.workspace_under(false, pos))
-                        .flatten()
-                    {
-                        let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-
-                        self.niri.layout.focus_output(&output);
-                        self.niri.layout.toggle_overview_to_workspace(ws_idx);
-
-                        // FIXME: granular.
-                        self.niri.queue_redraw_all();
-                    } else if let Some(output) = under.output {
-                        self.niri.layout.focus_output(&output);
-
-                        // FIXME: granular.
-                        self.niri.queue_redraw_all();
+                        self.niri.focus_layer_surface_if_on_demand(under.layer);
                     }
-                    self.niri.focus_layer_surface_if_on_demand(under.layer);
                 }
+
+                tool.down(self, &tablet::tool::DownEvent { serial, time });
             }
             TabletToolTipState::Up => {
-                if self.finish_suppressed_tablet_press(&press, event.time_msec()) {
+                if self.finish_suppressed_tablet_press(&press, time) {
                     return;
                 }
 
-                let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
-                let Some(tool) = tool else {
-                    return;
-                };
                 if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
                     if capture {
                         self.confirm_screenshot(true);
@@ -4806,9 +4882,13 @@ impl State {
                     }
                 }
 
-                tool.tip_up(event.time_msec());
+                tool.up(self, &tablet::tool::UpEvent { serial, time });
+
+                self.update_tablet_tool::<I>(&event, false);
             }
         }
+
+        tool.frame(self, time);
     }
 
     fn on_tablet_tool_proximity<I: InputBackend>(&mut self, event: I::TabletToolProximityEvent)
@@ -4825,9 +4905,14 @@ impl State {
         let tablet_seat = self.niri.seat.tablet_seat();
         let display_handle = self.niri.display_handle.clone();
         let tool_desc = event.tool();
-        let tool = tablet_seat.add_tool::<Self>(self, &display_handle, &tool_desc);
+        let tool = tablet_seat
+            .get_tool(&tool_desc)
+            .unwrap_or_else(|| tablet_seat.add_wp_tool(self, &display_handle, &tool_desc));
         let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
         if let Some(tablet) = tablet {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time();
+
             match event.state() {
                 ProximityState::In => {
                     let previous_focus = previous_pos
@@ -4837,21 +4922,41 @@ impl State {
                     self.niri
                         .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
 
-                    if let Some(under) = under.surface.clone() {
-                        tool.proximity_in(
-                            pos,
-                            under,
-                            &tablet,
-                            SERIAL_COUNTER.next_serial(),
-                            event.time_msec(),
-                        );
-                    }
+                    let frame = tablet::tool::AxisFrame {
+                        pressure: event.pressure_has_changed().then(|| event.pressure()),
+                        distance: event.distance_has_changed().then(|| event.distance()),
+                        tilt: event.tilt_has_changed().then(|| event.tilt()),
+                        rotation: event.rotation_has_changed().then(|| event.rotation()),
+                        slider: event.slider_has_changed().then(|| event.slider_position()),
+                        wheel: event
+                            .wheel_has_changed()
+                            .then(|| (event.wheel_delta(), event.wheel_delta_discrete())),
+                    };
+
+                    tool.proximity_in(
+                        self,
+                        under.surface,
+                        tablet,
+                        &tablet::tool::ProximityInEvent {
+                            location: pos,
+                            axis: Some(frame),
+                            serial,
+                            time,
+                        },
+                    );
+
+                    // Is proximity in usually immediatelly followed by other events like button? If
+                    // so, then it might be worth delaying this frame() until the loop callback to
+                    // batch all of them in.
+                    tool.frame(self, time);
+
                     self.niri.pointer_visibility = PointerVisibility::Visible;
                     self.niri.tablet_cursor_location = Some(pos);
                 }
                 ProximityState::Out => {
-                    self.clear_suppressed_tablet_presses_for_tool(&tool_desc, event.time_msec());
-                    tool.proximity_out(event.time_msec());
+                    self.clear_suppressed_tablet_presses_for_tool(&tool_desc, time);
+                    tool.proximity_out(self, &tablet::tool::ProximityOutEvent { serial, time });
+                    tool.frame(self, time);
 
                     // Move the mouse pointer here to avoid discontinuity.
                     //
@@ -4877,9 +4982,10 @@ impl State {
             button: event.button(),
         };
         let button_state = event.button_state();
+        let time = event.time();
 
         if button_state == ButtonState::Released
-            && self.finish_suppressed_tablet_press(&press, event.time_msec())
+            && self.finish_suppressed_tablet_press(&press, time)
         {
             return;
         }
@@ -4889,7 +4995,7 @@ impl State {
                 Trigger::TabletButton(press.button),
                 press.clone(),
                 self.niri.tablet_cursor_location,
-                event.time_msec(),
+                time,
             )
         {
             return;
@@ -4898,11 +5004,16 @@ impl State {
         let tool = self.niri.seat.tablet_seat().get_tool(&press.tool);
         if let Some(tool) = tool {
             tool.button(
-                press.button,
-                button_state,
-                SERIAL_COUNTER.next_serial(),
-                event.time_msec(),
+                self,
+                &tablet::tool::ButtonEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    button: press.button,
+                    state: button_state,
+                    time,
+                },
             );
+
+            tool.frame(self, time);
         }
     }
 
@@ -4936,7 +5047,7 @@ impl State {
             self,
             &GestureSwipeBeginEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 fingers: event.fingers(),
             },
         );
@@ -5007,7 +5118,7 @@ impl State {
             }
         }
 
-        let timestamp = Duration::from_micros(event.time());
+        let timestamp = Duration::from_micros(event.time().micros());
 
         let mut handled = false;
         let res = self
@@ -5057,7 +5168,7 @@ impl State {
         pointer.gesture_swipe_update(
             self,
             &GestureSwipeUpdateEvent {
-                time: event.time_msec(),
+                time: event.time(),
                 delta: event.delta(),
             },
         );
@@ -5101,7 +5212,7 @@ impl State {
             self,
             &GestureSwipeEndEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 cancelled: event.cancelled(),
             },
         );
@@ -5143,7 +5254,7 @@ impl State {
             self,
             &GesturePinchBeginEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 fingers: event.fingers(),
             },
         );
@@ -5160,7 +5271,7 @@ impl State {
             let sensitivity = self.niri.config.borrow().zoom.pinch_sensitivity
                 * output.current_scale().fractional_scale();
 
-            let timestamp = Duration::from_millis(event.time_msec() as u64);
+            let timestamp = Duration::from_micros(event.time().micros());
             let scale = event.scale();
 
             // Returns Some if a zoom gesture was active (avoids check-then-act race).
@@ -5173,13 +5284,29 @@ impl State {
                 return;
             }
         }
+        let input_sensitivity = self
+            .niri
+            .config
+            .borrow()
+            .input
+            .touchpad
+            .pinch_sensitivity
+            .map(|x| x.0)
+            .unwrap_or(1.);
+        let window_sensitivity = pointer
+            .current_focus()
+            .map(|focused| self.niri.find_root_shell_surface(&focused))
+            .and_then(|root| self.niri.layout.find_window_and_output(&root).unzip().0)
+            .and_then(|window| window.rules().pinch_sensitivity)
+            .unwrap_or(1.);
+        let sensitivity = input_sensitivity * window_sensitivity;
 
         pointer.gesture_pinch_update(
             self,
             &GesturePinchUpdateEvent {
-                time: event.time_msec(),
+                time: event.time(),
                 delta: event.delta(),
-                scale: event.scale(),
+                scale: event.scale().powf(sensitivity),
                 rotation: event.rotation(),
             },
         );
@@ -5210,7 +5337,7 @@ impl State {
             self,
             &GesturePinchEndEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 cancelled: event.cancelled(),
             },
         );
@@ -5228,7 +5355,7 @@ impl State {
             self,
             &GestureHoldBeginEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 fingers: event.fingers(),
             },
         );
@@ -5246,7 +5373,7 @@ impl State {
             self,
             &GestureHoldEndEvent {
                 serial,
-                time: event.time_msec(),
+                time: event.time(),
                 cancelled: event.cancelled(),
             },
         );
@@ -5402,7 +5529,8 @@ impl State {
                     slot,
                     location: pos,
                 };
-                let start_timestamp = Duration::from_micros(evt.time());
+                let start_data = AnyStartData::Touch(start_data);
+                let start_timestamp = Duration::from_micros(evt.time().micros());
                 let grab = TouchOverviewGrab::new(
                     start_data,
                     start_timestamp,
@@ -5423,7 +5551,7 @@ impl State {
                         slot,
                         location: pos,
                     };
-                    let start_data = PointerOrTouchStartData::Touch(start_data);
+                    let start_data = AnyStartData::Touch(start_data);
                     if let Some(grab) = MoveGrab::new(self, start_data, window, true, None) {
                         handle.set_grab(self, grab, serial);
                     }
@@ -5447,7 +5575,7 @@ impl State {
                 slot,
                 location: pos,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
 
@@ -5474,7 +5602,7 @@ impl State {
             &UpEvent {
                 slot,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         )
     }
@@ -5505,7 +5633,7 @@ impl State {
             &TouchMotionEvent {
                 slot,
                 location: pos,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
 
@@ -5892,8 +6020,7 @@ fn overview_drag_bind_matches(
 fn allowed_when_locked(action: &Action) -> bool {
     matches!(
         action,
-        Action::Quit(_)
-            | Action::ChangeVt(_)
+        Action::ChangeVt(_)
             | Action::Suspend
             | Action::PowerOffMonitors
             | Action::PowerOnMonitors
@@ -6415,13 +6542,10 @@ fn confined_pointer_move_should_be_prevented(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use smithay::backend::input::{TabletToolCapabilities, TabletToolDescriptor, TabletToolType};
     use smithay::utils::{Point, SERIAL_COUNTER};
 
     use super::*;
-    use crate::animation::Clock;
     use crate::tests::Fixture;
 
     fn set_up_window() -> Fixture {
@@ -6441,192 +6565,6 @@ mod tests {
         f.double_roundtrip(id);
 
         f
-    }
-
-    #[test]
-    fn bindings_suppress_keys() {
-        let close_keysym = Keysym::q;
-        let bindings = Binds(vec![Bind {
-            key: Key {
-                trigger: Trigger::Keysym(close_keysym),
-                modifiers: Modifiers::COMPOSITOR | Modifiers::CTRL,
-            },
-            action: Action::CloseWindow,
-            repeat: true,
-            cooldown: None,
-            allow_when_locked: false,
-            allow_inhibiting: true,
-            hotkey_overlay_title: None,
-        }]);
-
-        let comp_mod = ModKey::Super;
-        let mut suppressed_keys = HashSet::new();
-
-        let screenshot_ui = ScreenshotUi::new(Clock::default(), Default::default());
-        let disable_power_key_handling = false;
-        let is_inhibiting_shortcuts = Cell::new(false);
-
-        // The key_code we pick is arbitrary, the only thing
-        // that matters is that they are different between cases.
-
-        let close_key_code = Keycode::from(close_keysym.raw() + 8u32);
-        let close_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
-            should_intercept_key(
-                suppr,
-                &bindings.0,
-                comp_mod,
-                close_key_code,
-                close_keysym,
-                Some(close_keysym),
-                pressed,
-                mods,
-                &screenshot_ui,
-                disable_power_key_handling,
-                is_inhibiting_shortcuts.get(),
-            )
-        };
-
-        // Key event with the code which can't trigger any action.
-        let none_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
-            should_intercept_key(
-                suppr,
-                &bindings.0,
-                comp_mod,
-                Keycode::from(Keysym::l.raw() + 8),
-                Keysym::l,
-                Some(Keysym::l),
-                pressed,
-                mods,
-                &screenshot_ui,
-                disable_power_key_handling,
-                is_inhibiting_shortcuts.get(),
-            )
-        };
-
-        let mut mods = ModifiersState {
-            logo: true,
-            ctrl: true,
-            ..Default::default()
-        };
-
-        // Action press/release.
-
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(
-            filter,
-            FilterResult::Intercept(Some(Bind {
-                action: Action::CloseWindow,
-                ..
-            }))
-        ));
-        assert!(suppressed_keys.contains(&close_key_code));
-
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Intercept(None)));
-        assert!(suppressed_keys.is_empty());
-
-        // Remove mod to make it for a binding.
-
-        mods.shift = true;
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        mods.shift = false;
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        // Just none press/release.
-
-        let filter = none_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        let filter = none_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        // Press action, press arbitrary, release action, release arbitrary.
-
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(
-            filter,
-            FilterResult::Intercept(Some(Bind {
-                action: Action::CloseWindow,
-                ..
-            }))
-        ));
-
-        let filter = none_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Intercept(None)));
-
-        let filter = none_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Forward));
-
-        // Trigger and remove all mods.
-
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(
-            filter,
-            FilterResult::Intercept(Some(Bind {
-                action: Action::CloseWindow,
-                ..
-            }))
-        ));
-
-        mods = Default::default();
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Intercept(None)));
-
-        // Ensure that no keys are being suppressed.
-        assert!(suppressed_keys.is_empty());
-
-        // Now test shortcut inhibiting.
-
-        // With inhibited shortcuts, we don't intercept our shortcut.
-        is_inhibiting_shortcuts.set(true);
-
-        mods = ModifiersState {
-            logo: true,
-            ctrl: true,
-            ..Default::default()
-        };
-
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(filter, FilterResult::Forward));
-        assert!(suppressed_keys.is_empty());
-
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Forward));
-        assert!(suppressed_keys.is_empty());
-
-        // Toggle it off after pressing the shortcut.
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(filter, FilterResult::Forward));
-        assert!(suppressed_keys.is_empty());
-
-        is_inhibiting_shortcuts.set(false);
-
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Forward));
-        assert!(suppressed_keys.is_empty());
-
-        // Toggle it on after pressing the shortcut.
-        let filter = close_key_event(&mut suppressed_keys, mods, true);
-        assert!(matches!(
-            filter,
-            FilterResult::Intercept(Some(Bind {
-                action: Action::CloseWindow,
-                ..
-            }))
-        ));
-        assert!(suppressed_keys.contains(&close_key_code));
-
-        is_inhibiting_shortcuts.set(true);
-
-        let filter = close_key_event(&mut suppressed_keys, mods, false);
-        assert!(matches!(filter, FilterResult::Intercept(None)));
-        assert!(suppressed_keys.is_empty());
     }
 
     #[test]
@@ -7070,8 +7008,12 @@ mod tests {
 
         let pointer = state.niri.seat.get_pointer().unwrap();
         assert!(pointer.is_grabbed());
-        pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), 1);
-        state.abort_active_tablet_drag_action(1);
+        pointer.unset_grab(
+            state,
+            SERIAL_COUNTER.next_serial(),
+            InputTime::from_millis(1),
+        );
+        state.abort_active_tablet_drag_action(InputTime::from_millis(1));
 
         assert!(!pointer.is_grabbed());
         assert!(state.niri.active_tablet_grab.is_none());

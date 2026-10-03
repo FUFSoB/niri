@@ -470,6 +470,10 @@ pub enum Action {
     MruSetScope(MruScope),
     #[knuffel(skip)]
     MruCycleScope,
+
+    // Doesn't look like knuffel allows gating on #[cfg(test)]...
+    #[knuffel(skip)]
+    TestAction,
 }
 
 impl From<niri_ipc::Action> for Action {
@@ -1179,11 +1183,17 @@ impl FromStr for Key {
             Trigger::TouchpadScrollRight
         } else if key.eq_ignore_ascii_case("TabletPress") || key.eq_ignore_ascii_case("TabletTip") {
             Trigger::TabletPress
-        } else if key.eq_ignore_ascii_case("TabletStylus3") {
+        } else if key.eq_ignore_ascii_case("TabletStylus3")
+            || key.eq_ignore_ascii_case("TabletStylusButton3")
+        {
             Trigger::TabletButton(BTN_STYLUS3)
-        } else if key.eq_ignore_ascii_case("TabletStylus") {
+        } else if key.eq_ignore_ascii_case("TabletStylus")
+            || key.eq_ignore_ascii_case("TabletStylusButton1")
+        {
             Trigger::TabletButton(BTN_STYLUS)
-        } else if key.eq_ignore_ascii_case("TabletStylus2") {
+        } else if key.eq_ignore_ascii_case("TabletStylus2")
+            || key.eq_ignore_ascii_case("TabletStylusButton2")
+        {
             Trigger::TabletButton(BTN_STYLUS2)
         } else if key
             .get(..12)
@@ -1329,6 +1339,27 @@ mod tests {
         );
         assert_eq!(
             "TabletStylus3".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS3),
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert_eq!(
+            "Mod+TabletStylusButton1".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS),
+                modifiers: Modifiers::COMPOSITOR,
+            },
+        );
+        assert_eq!(
+            "TabletStylusButton2".parse::<Key>().unwrap(),
+            Key {
+                trigger: Trigger::TabletButton(BTN_STYLUS2),
+                modifiers: Modifiers::empty(),
+            },
+        );
+        assert_eq!(
+            "TabletStylusButton3".parse::<Key>().unwrap(),
             Key {
                 trigger: Trigger::TabletButton(BTN_STYLUS3),
                 modifiers: Modifiers::empty(),

@@ -125,6 +125,7 @@ pub(super) fn build_headless_virtual_output(
         is_custom_mode: true,
         vrr_supported: false,
         vrr_enabled: false,
+        max_bpc: None,
         logical: Some(logical_output(&output)),
     };
 

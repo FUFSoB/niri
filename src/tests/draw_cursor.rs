@@ -14,6 +14,7 @@ use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 use smithay::wayland::compositor::with_states;
 
@@ -686,22 +687,45 @@ fn virtual_output_frame_callbacks_tick_cursor_surfaces() {
     let mapped = f.niri().layout.focus().unwrap().id();
     let server_surface = window_surface(&mut f, mapped);
 
+    let server_client = Resource::client(&server_surface).unwrap();
+
     let window = f.client(id).window(&client_surface);
     window.attach_null();
     window.commit();
     f.double_roundtrip(id);
 
+    // Use a separate buffer-backed surface as the cursor: Smithay doesn't send frame callbacks
+    // to unmapped (buffer-less) surfaces, and real cursor surfaces always have a buffer.
     let frame_done = Arc::new(SyncData::default());
-    {
+    let cursor_client_surface = {
         let client = f.client(id);
-        client_surface.frame(&client.qh, frame_done.clone());
-        client_surface.commit();
+        let surface = client.state.create_surface();
+        let [r, g, b, a] = WINDOW_COLOR;
+        let buffer =
+            client
+                .state
+                .spbm
+                .as_ref()
+                .unwrap()
+                .create_u32_rgba_buffer(r, g, b, a, &client.qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.frame(&client.qh, frame_done.clone());
+        surface.commit();
         client.connection.flush().unwrap();
-    }
+        surface
+    };
     f.dispatch();
 
-    set_cursor_image(&mut f, CursorImageStatus::Surface(server_surface.clone()));
-    with_states(&server_surface, |states| {
+    let display_handle = f.niri().display_handle.clone();
+    let cursor_surface: WlSurface = server_client
+        .object_from_protocol_id(
+            &display_handle,
+            wayland_client::Proxy::id(&cursor_client_surface).protocol_id(),
+        )
+        .unwrap();
+
+    set_cursor_image(&mut f, CursorImageStatus::Surface(cursor_surface.clone()));
+    with_states(&cursor_surface, |states| {
         states
             .data_map
             .insert_if_missing_threadsafe(CursorImageSurfaceData::default);
@@ -853,6 +877,8 @@ fn draw_cursor_always_hidden_stays_hidden_on_screencast_during_workspace_switch(
     let visible = create_window(&mut f, "visible", (40, 30));
     f.niri().layout.move_to_workspace_down(true);
     f.niri().layout.activate_window(&hidden);
+    // Let the window finish its animated move to the other workspace.
+    f.niri_complete_animations();
 
     move_cursor_to_window(&mut f, hidden);
     set_cursor_image(&mut f, CursorImageStatus::default_named());

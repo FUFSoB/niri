@@ -4,8 +4,10 @@ pub(crate) use fixture::Fixture;
 mod client;
 mod fixture;
 mod server;
+mod test_input_backend;
 
 mod animations;
+mod binds;
 mod capture_block_out;
 mod cursor_capture;
 mod draw_cursor;
@@ -17,4 +19,5 @@ mod remove_output;
 mod screencast_portal;
 mod transactions;
 mod virtual_output;
+mod virtual_pointer;
 mod window_opening;

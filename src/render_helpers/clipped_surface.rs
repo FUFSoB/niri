@@ -70,7 +70,7 @@ impl<R: NiriRenderer, E: ClippedSurfaceInner<R>> ClippedSurfaceRenderElement<R, 
             x => x,
         };
         Mat3::from_translation(Vec2::new(0.5, 0.5))
-            * Mat3::from_cols_array(transform.matrix().as_ref())
+            * transform.matrix()
             * Mat3::from_translation(-Vec2::new(0.5, 0.5))
     }
 

@@ -1,6 +1,7 @@
 use std::f64::consts::LN_2;
 use std::time::Duration;
 
+use smithay::backend::input::InputTime;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
     GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
@@ -11,7 +12,6 @@ use smithay::input::SeatHandler;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use crate::niri::State;
-use crate::utils::get_monotonic_time;
 use crate::window::mapped::MappedId;
 
 const MIRROR_ZOOM_PIXELS_PER_OCTAVE: f64 = 120.;
@@ -108,7 +108,7 @@ impl PointerGrab<State> for MirrorViewGrab {
         handle.motion(data, None, event);
 
         self.new_location = event.location;
-        self.event_timestamp = Some(Duration::from_millis(u64::from(event.time)));
+        self.event_timestamp = Some(Duration::from_micros(event.time.micros()));
     }
 
     fn relative_motion(
@@ -122,7 +122,7 @@ impl PointerGrab<State> for MirrorViewGrab {
         handle.relative_motion(data, None, event);
 
         self.new_location += event.delta;
-        self.event_timestamp = Some(Duration::from_micros(event.utime));
+        self.event_timestamp = Some(Duration::from_micros(event.time.micros()));
     }
 
     fn button(
@@ -155,7 +155,7 @@ impl PointerGrab<State> for MirrorViewGrab {
                 self,
                 data,
                 SERIAL_COUNTER.next_serial(),
-                get_monotonic_time().as_millis() as u32,
+                InputTime::now(),
                 true,
             );
         }

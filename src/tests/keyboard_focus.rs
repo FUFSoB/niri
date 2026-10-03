@@ -1,5 +1,5 @@
 use niri_config::{Action, MruDirection};
-use smithay::backend::input::KeyState;
+use smithay::backend::input::{InputTime, KeyState};
 use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::utils::SERIAL_COUNTER;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -33,7 +33,7 @@ fn press_forwarded_key(f: &mut Fixture, keycode: Keycode) {
         keycode,
         KeyState::Pressed,
         SERIAL_COUNTER.next_serial(),
-        0,
+        InputTime::from_millis(0),
         |_, _, _| -> FilterResult<()> { FilterResult::Forward },
     );
 }
@@ -45,7 +45,7 @@ fn press_suppressed_key(f: &mut Fixture, keycode: Keycode) {
         keycode,
         KeyState::Pressed,
         SERIAL_COUNTER.next_serial(),
-        0,
+        InputTime::from_millis(0),
         |state, _, _| {
             state.niri.suppressed_keys.insert(keycode);
             FilterResult::Intercept(())

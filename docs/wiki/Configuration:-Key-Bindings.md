@@ -158,13 +158,18 @@ These drag actions are config-only and are not available through `niri msg actio
 
 ### Tablet Tool Bindings
 
+<sup>Since: next release</sup>
+
 You can bind tablet tool tip contact and stylus buttons in the same `binds {}` section.
 `TabletPress` means tip contact down, while `TabletStylus`, `TabletStylus2`, `TabletStylus3`,
 or raw `TabletButton<N>` match stylus buttons reported by libinput.
+The upstream names `TabletStylusButton1`, `TabletStylusButton2` and `TabletStylusButton3` are
+accepted as aliases for `TabletStylus`, `TabletStylus2` and `TabletStylus3`.
 
 ```kdl
 binds {
     TabletStylus2 { close-window; }
+    Mod+TabletStylusButton1 { close-window; }
     Mod+TabletButton332 { spawn "fuzzel"; }
     Mod+TabletPress { move-window-interactively; }
 }
@@ -172,6 +177,9 @@ binds {
 
 Tablet drag binds reuse the same compositor drag actions as mouse drag binds.
 Stylus button drags can start while hovering in proximity, without requiring tip contact.
+
+When no tablet bind matches, the tablet tip behaves like upstream niri: <kbd>Mod</kbd>+tip moves
+the window, and tip in the overview drags workspaces and windows.
 
 ### Custom Hotkey Overlay Titles
 
