@@ -946,6 +946,7 @@ impl<W: LayoutElement> Tile<W> {
 
         let fallback = self
             .floating_window_size
+            .or_else(|| self.window.mirror_normal_size())
             .or_else(|| self.window.expected_size())
             .unwrap_or_else(|| self.window.size());
         if size.w == 0 {

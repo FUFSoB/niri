@@ -370,6 +370,11 @@ pub trait LayoutElement {
         false
     }
 
+    /// Size that a mirror uses in place of zero size components of a size request.
+    fn mirror_normal_size(&self) -> Option<Size<i32, Logical>> {
+        None
+    }
+
     fn set_mirror_linked(&mut self, value: bool) {
         let _ = value;
     }

@@ -2562,6 +2562,48 @@ fn mirror_from_maximized_source_inherits_maximized_state() {
     assert_eq!(mirror_size, Size::from((80, 80)));
 }
 
+#[test]
+fn maximized_mirror_keeps_normal_size_when_floating() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), RED);
+
+    let mirror_id = create_window_mirror(&mut f);
+    let (_, normal_size) = mirror_mapped_by_id(&mut f, mirror_id);
+
+    f.niri().layout.set_maximized(&mirror_id, true);
+    let (mirror_mode, maximized_size) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(mirror_mode.is_maximized());
+    assert_ne!(maximized_size, normal_size);
+
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+
+    let (mirror_mode, mirror_size) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(mirror_mode.is_normal());
+    assert_eq!(mirror_size, normal_size);
+}
+
+#[test]
+fn maximized_born_mirror_does_not_collapse_when_floating() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), RED);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    f.niri().layout.set_maximized(&source_id, true);
+
+    let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.toggle_window_floating(Some(&mirror_id));
+
+    let (mirror_mode, mirror_size) = mirror_mapped_by_id(&mut f, mirror_id);
+    assert!(mirror_mode.is_normal());
+    assert!(mirror_size.w > 1 && mirror_size.h > 1, "{mirror_size:?}");
+}
+
 fn focused_window_is_block_out(f: &mut Fixture) -> bool {
     let state = f.niri_state();
     state.ipc_refresh_layout();

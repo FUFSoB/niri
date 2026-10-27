@@ -74,6 +74,12 @@ pub struct Mapped {
     /// Current visual size for mirror entries.
     mirror_size: Size<i32, Logical>,
 
+    /// Last size requested in normal sizing mode for mirror entries.
+    ///
+    /// Used in place of zero size components (which ask a real client to pick its own size), e.g.
+    /// when a maximized mirror goes floating.
+    mirror_normal_size: Size<i32, Logical>,
+
     /// Current sizing mode for mirror entries.
     mirror_sizing_mode: SizingMode,
 
@@ -469,6 +475,7 @@ impl Mapped {
             is_mirror: false,
             is_mirror_linked: false,
             mirror_size: Size::from((1, 1)),
+            mirror_normal_size: Size::from((1, 1)),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
             mirror_view: MirrorViewState::default(),
@@ -529,6 +536,11 @@ impl Mapped {
             is_mirror: true,
             is_mirror_linked: false,
             mirror_size: source.size(),
+            mirror_normal_size: if source.is_mirror {
+                source.mirror_normal_size
+            } else {
+                source.size()
+            },
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
             mirror_view: source.mirror_view,
@@ -640,6 +652,22 @@ impl Mapped {
     pub fn element_namespace(&self) -> Option<usize> {
         self.is_mirror
             .then(|| self.id.get().try_into().unwrap_or(usize::MAX))
+    }
+
+    /// Resolves zero size components the way a client picking its own size would: by going back
+    /// to the last normal size.
+    fn mirror_resolve_requested_size(&self, size: Size<i32, Logical>) -> Size<i32, Logical> {
+        let resolve = |requested: i32, normal: i32| {
+            if requested > 0 {
+                requested
+            } else {
+                normal.max(1)
+            }
+        };
+        Size::from((
+            resolve(size.w, self.mirror_normal_size.w),
+            resolve(size.h, self.mirror_normal_size.h),
+        ))
     }
 
     fn mirror_transform(&self) -> MirrorContentTransform {
@@ -1923,7 +1951,10 @@ impl LayoutElement for Mapped {
         transaction: Option<Transaction>,
     ) {
         if self.is_mirror {
-            let size = Size::from((size.w.max(1), size.h.max(1)));
+            let size = self.mirror_resolve_requested_size(size);
+            if mode.is_normal() {
+                self.mirror_normal_size = size;
+            }
             self.mirror_size = size;
             self.mirror_sizing_mode = mode;
             self.mirror_pending_sizing_mode = mode;
@@ -2635,6 +2666,10 @@ impl LayoutElement for Mapped {
 
     fn is_mirror_linked(&self) -> bool {
         self.is_mirror_linked
+    }
+
+    fn mirror_normal_size(&self) -> Option<Size<i32, Logical>> {
+        self.is_mirror.then_some(self.mirror_normal_size)
     }
 
     fn set_mirror_linked(&mut self, value: bool) {
