@@ -73,6 +73,12 @@ impl MergeWith<ZoomPart> for Zoom {
             pinch_sensitivity,
             max_zoom
         );
+
+        // Zoom levels are clamped to 1..=max_zoom all over the place, and f64::clamp() panics
+        // when max < min or either is NaN.
+        if self.max_zoom.is_nan() || self.max_zoom < 1. {
+            self.max_zoom = 1.;
+        }
     }
 }
 

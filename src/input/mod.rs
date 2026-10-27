@@ -22,7 +22,7 @@ use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, ClickGrab, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
     GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
     GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab, RelativeMotionEvent,
@@ -30,7 +30,8 @@ use smithay::input::pointer::{
 use smithay::input::tablet::tool::GrabStartData as TabletToolGrabStartData;
 use smithay::input::tablet::{TabletDescriptor, TabletSeatHandler, TabletSeatTrait};
 use smithay::input::touch::{
-    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, UpEvent,
+    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, TouchDownGrab,
+    UpEvent,
 };
 use smithay::input::{tablet, SeatHandler};
 use smithay::output::Output;
@@ -43,7 +44,8 @@ use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use touch_overview_grab::TouchOverviewGrab;
 
-use self::mirror_click_grab::MirrorClickGrab;
+use self::click_grab::ClickGrab;
+use self::mirror_click_grab::{MirrorClickGrab, MirrorTouchDownGrab};
 use self::mirror_view_grab::{MirrorViewGrab, MirrorViewGrabMode};
 use self::move_grab::MoveGrab;
 use self::pick_color_grab::PickColorGrab;
@@ -357,6 +359,21 @@ impl State {
         let mirror_local = pos_within_output - win_pos + mapped.buf_loc().to_f64();
         let source_point = mapped.mirror_point_to_source(mirror_local)?;
         Some((window, mirror_local, source_point, mapped.mirror_zoom()))
+    }
+
+    fn toggle_ignore_opacity_window_rule(&mut self, mut matches: impl FnMut(&Mapped) -> bool) {
+        let mut changed = false;
+        self.niri.layout.with_windows_mut(|mapped, _| {
+            if matches(mapped) && mapped.rules().opacity.is_some_and(|o| o != 1.) {
+                mapped.toggle_ignore_opacity_window_rule();
+                changed = true;
+            }
+        });
+
+        if changed {
+            // FIXME: granular
+            self.niri.queue_redraw_all();
+        }
     }
 
     fn try_start_move_window_interactively(&mut self, button_code: u32, serial: Serial) -> bool {
@@ -3132,32 +3149,13 @@ impl State {
                 self.niri.queue_redraw_all();
             }
             Action::ToggleWindowRuleOpacity => {
-                let active_window = self
-                    .niri
-                    .layout
-                    .active_workspace_mut()
-                    .and_then(|ws| ws.active_window_mut());
-                if let Some(window) = active_window {
-                    if window.rules().opacity.is_some_and(|o| o != 1.) {
-                        window.toggle_ignore_opacity_window_rule();
-                        // FIXME: granular
-                        self.niri.queue_redraw_all();
-                    }
+                // Use the focused window, which may be a sticky one.
+                if let Some(window) = self.niri.layout.focus().map(|window| window.id()) {
+                    self.toggle_ignore_opacity_window_rule(|mapped| mapped.id() == window);
                 }
             }
             Action::ToggleWindowRuleOpacityById(id) => {
-                let window = self
-                    .niri
-                    .layout
-                    .workspaces_mut()
-                    .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
-                if let Some(window) = window {
-                    if window.rules().opacity.is_some_and(|o| o != 1.) {
-                        window.toggle_ignore_opacity_window_rule();
-                        // FIXME: granular
-                        self.niri.queue_redraw_all();
-                    }
-                }
+                self.toggle_ignore_opacity_window_rule(|mapped| mapped.id().get() == id);
             }
             Action::ToggleWindowCursorCapture => {
                 let focus = self.niri.layout.focus().map(|window| window.id());
@@ -3187,11 +3185,7 @@ impl State {
             Action::ToggleBlockOutWindow => {
                 let focus = self.niri.layout.focus().map(|window| window.id());
                 if let Some(window) = focus {
-                    self.niri.layout.with_windows_mut(|mapped, _| {
-                        if mapped.id() == window {
-                            mapped.toggle_block_out_window_rule();
-                        }
-                    });
+                    toggle_block_out_window(&mut self.niri.layout, window);
                     self.niri.queue_redraw_all();
                 }
             }
@@ -3203,11 +3197,7 @@ impl State {
                     .find(|(_, mapped)| mapped.id().get() == id)
                     .map(|(_, mapped)| mapped.id());
                 if let Some(window) = window {
-                    self.niri.layout.with_windows_mut(|mapped, _| {
-                        if mapped.id() == window {
-                            mapped.toggle_block_out_window_rule();
-                        }
-                    });
+                    toggle_block_out_window(&mut self.niri.layout, window);
                     self.niri.queue_redraw_all();
                 }
             }
@@ -3243,11 +3233,17 @@ impl State {
             }
             Action::SetDynamicCastWorkspace(reference) => {
                 let target = if let Some(reference) = reference {
-                    self.niri.layout.find_workspace_by_ref(reference)
+                    self.niri
+                        .layout
+                        .find_workspace_by_ref(reference)
+                        .map(|ws| CastTarget::workspace(ws.id(), ws.current_output()))
                 } else {
-                    self.niri.layout.active_workspace_mut()
-                }
-                .map(|workspace| CastTarget::workspace(workspace.id(), workspace.current_output()));
+                    // Don't use active_workspace_mut() as it moves focus away from sticky windows.
+                    self.niri
+                        .layout
+                        .active_workspace()
+                        .map(|ws| CastTarget::workspace(ws.id(), ws.current_output()))
+                };
 
                 if let Some(target) = target {
                     self.set_dynamic_cast_target(target);
@@ -3364,9 +3360,24 @@ impl State {
             Action::MruCloseCurrentWindow => {
                 if self.niri.window_mru_ui.is_open() {
                     if let Some(id) = self.niri.window_mru_ui.current_window_id() {
-                        if let Some(w) = self.niri.find_window_by_id(id) {
-                            if let Some(tl) = w.toplevel() {
-                                tl.send_close();
+                        let is_mirror = self
+                            .niri
+                            .layout
+                            .windows()
+                            .find(|(_, m)| m.id() == id)
+                            .map(|(_, m)| m.is_mirror());
+                        if is_mirror == Some(true) {
+                            // Closing a mirror must not close the source application.
+                            self.niri
+                                .stop_casts_for_target(CastTarget::Window { id: id.get() });
+                            self.niri.window_mru_ui.remove_window(id);
+                            self.niri.layout.remove_window(&id, Transaction::new());
+                            self.niri.queue_redraw_all();
+                        } else if is_mirror == Some(false) {
+                            if let Some(w) = self.niri.find_window_by_id(id) {
+                                if let Some(tl) = w.toplevel() {
+                                    tl.send_close();
+                                }
                             }
                         }
                     }
@@ -3445,6 +3456,7 @@ impl State {
                         self.niri
                             .layout
                             .animate_zoom_unlock(&output, cursor_local, &movement_mode);
+                        self.niri.queue_redraw(&output);
                     }
                 }
             }
@@ -3616,6 +3628,16 @@ impl State {
             }
         }
 
+        // Handle cursor and focal center movement across outputs with different zoom levels or
+        // locked zoom. Do this before hit-testing so that the contents under the cursor and the
+        // location sent to clients match where the cursor is displayed.
+        if let Some((new_out, _)) = self.niri.output_under(new_pos) {
+            let new_out = new_out.clone();
+            self.niri
+                .update_zoom_base_focal(&new_out, new_pos, Some(pos));
+            new_pos = self.niri.effective_cursor_pos(new_pos);
+        }
+
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
             let point = (new_pos - geom.loc.to_f64())
@@ -3626,9 +3648,11 @@ impl State {
         }
 
         if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+            if let Some((output, _)) = self.niri.output_under(new_pos) {
                 if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                    // The MRU UI is not zoomed, so it needs the on-screen cursor position.
+                    let pos_on_screen = self.niri.cursor_screen_pos_within_output(output, new_pos);
+                    self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                 }
             }
         }
@@ -3638,15 +3662,11 @@ impl State {
             .pointer_contents
             .window
             .as_ref()
-            .map(|(window, _)| self.niri.layout.window_captures_cursor(window));
+            .and_then(|(window, _)| self.niri.layout.window_captures_cursor(window));
         let under = self.niri.contents_under(new_pos);
 
         // Handle confined pointer.
         if let Some((focus_surface, region)) = pointer_confined {
-            let destination_window_captures_cursor = under
-                .window
-                .as_ref()
-                .map(|(window, _)| self.niri.layout.window_captures_cursor(window));
             let stays_on_focused_surface =
                 Some(&focus_surface.0) == under.surface.as_ref().map(|(s, _)| s);
             let stays_within_region = match region {
@@ -3659,10 +3679,16 @@ impl State {
 
             if confined_pointer_move_should_be_prevented(
                 source_window_captures_cursor,
-                destination_window_captures_cursor,
                 stays_on_focused_surface,
                 stays_within_region,
             ) {
+                // The cursor stays in place, so keep it in the zoomed view.
+                if let Some((output, _)) = self.niri.output_under(pos) {
+                    let output = output.clone();
+                    self.niri
+                        .update_zoom_base_focal(&output, pos, Some(new_pos));
+                }
+
                 pointer.relative_motion(
                     self,
                     Some(focus_surface),
@@ -3679,9 +3705,7 @@ impl State {
             }
         }
 
-        let previous_focus = self.niri.pointer_contents.clone();
-        self.niri
-            .handle_focus_follows_mouse(&previous_focus, &under);
+        self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
 
@@ -3734,14 +3758,6 @@ impl State {
             }
         }
 
-        // Handle cursor and focal center movement across outputs with different zoom levels or
-        // locked zoom.
-        if let Some((new_out, _)) = self.niri.output_under(new_pos) {
-            let new_out = new_out.clone();
-            self.niri
-                .update_zoom_base_focal(&new_out, new_pos, Some(pos));
-        }
-
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let point = self.screenshot_ui_point_on_output(output, new_pos);
             self.niri.screenshot_ui.pointer_motion(point, None);
@@ -3770,7 +3786,14 @@ impl State {
         }) else {
             return;
         };
-        let pos = self.clamp_position_to_zoom(pos);
+        let pos = self.map_absolute_position_to_zoom(pos);
+
+        // Move the zoom focal point before hit-testing so that the contents under the cursor
+        // match where the cursor is displayed.
+        if let Some((output, _)) = self.niri.output_under(pos) {
+            let output = output.clone();
+            self.niri.update_zoom_base_focal(&output, pos, None);
+        }
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -3786,18 +3809,17 @@ impl State {
         }
 
         if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, _)) = self.niri.output_under(pos) {
                 if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                    let pos_on_screen = self.niri.cursor_screen_pos_within_output(output, pos);
+                    self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                 }
             }
         }
 
         let under = self.niri.contents_under(pos);
 
-        let previous_focus = self.niri.pointer_contents.clone();
-        self.niri
-            .handle_focus_follows_mouse(&previous_focus, &under);
+        self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
 
@@ -3845,11 +3867,6 @@ impl State {
             }
         }
 
-        if let Some((output, _)) = self.niri.output_under(pos) {
-            let output = output.clone();
-            self.niri.update_zoom_base_focal(&output, pos, None);
-        }
-
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let point = self.screenshot_ui_point_on_output(output, pos);
             self.niri.screenshot_ui.pointer_motion(point, None);
@@ -3893,9 +3910,11 @@ impl State {
                 is_mru_open = true;
                 if let Some(MouseButton::Left) = button {
                     let location = pointer.current_location();
-                    let (output, pos_within_output) = self.niri.output_under(location).unwrap();
+                    let (output, _) = self.niri.output_under(location).unwrap();
                     if mru_output == output {
-                        let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                        let pos_on_screen =
+                            self.niri.cursor_screen_pos_within_output(output, location);
+                        let id = self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                         if id.is_some() {
                             self.confirm_mru();
                         } else {
@@ -3927,6 +3946,7 @@ impl State {
                 };
             }
 
+            let mut found_mouse_bind = false;
             if is_mru_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = mouse_trigger(button)
                     .and_then(|trigger| {
@@ -3940,6 +3960,7 @@ impl State {
                             || allowed_during_screenshot(&bind.action)
                     })
                 {
+                    found_mouse_bind = true;
                     if is_mouse_drag_action(&bind.action) {
                         started_drag_bind = if is_overview_open
                             && matches!(bind.action, Action::MoveWindowInteractively)
@@ -3992,6 +4013,33 @@ impl State {
                             );
                     }
                 }
+            }
+
+            // Built-in Mod+mouse gestures for configs that don't bind these buttons, matching the
+            // historical hardcoded behavior.
+            if !found_mouse_bind
+                && !started_drag_bind
+                && mod_down
+                && !self.niri.screenshot_ui.is_open()
+            {
+                started_drag_bind = match button {
+                    Some(MouseButton::Left) => {
+                        self.try_start_move_window_interactively(button_code, serial)
+                    }
+                    Some(MouseButton::Right) => {
+                        self.try_start_resize_window_interactively(button_code, serial)
+                    }
+                    Some(MouseButton::Middle) => self
+                        .try_start_move_view_or_switch_workspace_interactively(button_code, serial),
+                    _ => false,
+                };
+            }
+
+            // If the drag action completed right away without starting a grab (e.g. a resize
+            // double-click), don't send the click to the client.
+            if started_drag_bind && !pointer.is_grabbed() {
+                self.niri.suppressed_buttons.insert(button_code);
+                return;
             }
 
             if !started_drag_bind {
@@ -4623,8 +4671,16 @@ impl State {
         let Some(pos) = self.compute_tablet_position(event) else {
             return;
         };
-        let pos = self.clamp_position_to_zoom(pos);
+        let pos = self.map_absolute_position_to_zoom(pos);
         let previous_pos = self.niri.tablet_cursor_location;
+
+        // Move the zoom focal point before hit-testing so that the contents under the cursor
+        // match where the cursor is displayed.
+        if let Some((output, _)) = self.niri.output_under(pos) {
+            let output = output.clone();
+            self.niri.update_zoom_base_focal(&output, pos, None);
+        }
+
         let tool_desc = event.tool();
 
         if self
@@ -4647,9 +4703,10 @@ impl State {
             }
 
             if let Some(mru_output) = self.niri.window_mru_ui.output() {
-                if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                if let Some((output, _)) = self.niri.output_under(pos) {
                     if mru_output == output {
-                        self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                        let pos_on_screen = self.niri.cursor_screen_pos_within_output(output, pos);
+                        self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                     }
                 }
             }
@@ -4662,12 +4719,11 @@ impl State {
                 // Don't move focus around while a native tablet tool grab (e.g. interactive move)
                 // is active.
                 if !tool.is_grabbed() {
-                    let previous_focus = previous_pos
+                    let current_focus = previous_pos
                         .map(|prev| self.niri.contents_under(prev))
                         .unwrap_or_default();
-                    let current_focus = previous_focus.clone();
                     self.niri
-                        .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
+                        .handle_focus_follows_motion(&current_focus, &under);
                 }
 
                 let time = event.time();
@@ -4703,11 +4759,6 @@ impl State {
                 self.niri.pointer_visibility = PointerVisibility::Visible;
                 self.niri.tablet_cursor_location = Some(pos);
             }
-        }
-
-        if let Some((output, _)) = self.niri.output_under(pos) {
-            let output = output.clone();
-            self.niri.update_zoom_base_focal(&output, pos, None);
         }
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
@@ -4787,9 +4838,11 @@ impl State {
                             }
                         }
                     } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
-                        if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                        if let Some((output, _)) = self.niri.output_under(pos) {
                             if mru_output == output {
-                                let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                                let pos_on_screen =
+                                    self.niri.cursor_screen_pos_within_output(output, pos);
+                                let id = self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                                 if id.is_some() {
                                     self.confirm_mru();
                                 } else {
@@ -4915,12 +4968,11 @@ impl State {
 
             match event.state() {
                 ProximityState::In => {
-                    let previous_focus = previous_pos
+                    let current_focus = previous_pos
                         .map(|prev| self.niri.contents_under(prev))
                         .unwrap_or_default();
-                    let current_focus = previous_focus.clone();
                     self.niri
-                        .handle_focus_follows_motion(&current_focus, &previous_focus, &under);
+                        .handle_focus_follows_motion(&current_focus, &under);
 
                     let frame = tablet::tool::AxisFrame {
                         pressure: event.pressure_has_changed().then(|| event.pressure()),
@@ -5226,29 +5278,11 @@ impl State {
             pointer.frame(self);
         }
 
-        if event.fingers() == 3 {
-            if let Some(output) = self.niri.output_under_cursor() {
-                // Always intercept 2-finger pinch for zoom control when zoom state exists.
-                // This allows pinch-to-zoom from unzoomed state (level == 1.0).
-                if self.niri.layout.has_zoom_for_output(&output) {
-                    let cursor_global = self.niri.seat.get_pointer().unwrap().current_location();
-                    let output_geo = self
-                        .niri
-                        .global_space
-                        .output_geometry(&output)
-                        .map(|g| g.to_f64());
-                    let cursor_local = output_geo.map(|g| cursor_global - g.loc);
-                    let output_size = output_geo.map(|g| g.size);
-                    let movement_mode = Some(self.niri.config.borrow().zoom.movement_mode);
-                    self.niri.layout.zoom_gesture_begin(
-                        &output,
-                        cursor_local,
-                        output_size,
-                        movement_mode,
-                    );
-                    return;
-                }
-            }
+        // Finish any zoom pinch whose end we somehow missed so that it doesn't get stuck.
+        self.zoom_pinch_end(true);
+
+        if event.fingers() == 3 && self.zoom_pinch_begin() {
+            return;
         }
         pointer.gesture_pinch_begin(
             self,
@@ -5267,22 +5301,9 @@ impl State {
             pointer.frame(self);
         }
 
-        if let Some(output) = self.niri.output_under_cursor() {
-            let sensitivity = self.niri.config.borrow().zoom.pinch_sensitivity
-                * output.current_scale().fractional_scale();
-
-            let timestamp = Duration::from_micros(event.time().micros());
-            let scale = event.scale();
-
-            // Returns Some if a zoom gesture was active (avoids check-then-act race).
-            if let Some(_changed) =
-                self.niri
-                    .layout
-                    .zoom_gesture_update(&output, scale, sensitivity, timestamp)
-            {
-                self.niri.queue_redraw(&output);
-                return;
-            }
+        let timestamp = Duration::from_micros(event.time().micros());
+        if self.zoom_pinch_update(event.scale(), timestamp) {
+            return;
         }
         let input_sensitivity = self
             .niri
@@ -5320,17 +5341,8 @@ impl State {
             pointer.frame(self);
         }
 
-        if let Some(output) = self.niri.output_under_cursor() {
-            let cancelled = event.cancelled();
-            if self
-                .niri
-                .layout
-                .zoom_gesture_end(&output, cancelled)
-                .unwrap_or(false)
-            {
-                self.niri.queue_redraw(&output);
-                return;
-            }
+        if self.zoom_pinch_end(event.cancelled()) {
+            return;
         }
 
         pointer.gesture_pinch_end(
@@ -5341,6 +5353,83 @@ impl State {
                 cancelled: event.cancelled(),
             },
         );
+    }
+
+    /// Starts a zoom pinch gesture on the output under the cursor.
+    ///
+    /// Returns `false` if the pinch should go to the client instead.
+    pub(crate) fn zoom_pinch_begin(&mut self) -> bool {
+        let Some(output) = self.niri.output_under_cursor() else {
+            return false;
+        };
+        // Always intercept the pinch for zoom control when zoom state exists. This allows
+        // pinch-to-zoom from unzoomed state (level == 1.0).
+        if !self.niri.layout.has_zoom_for_output(&output) {
+            return false;
+        }
+
+        let cursor_global = self.niri.seat.get_pointer().unwrap().current_location();
+        let output_geo = self
+            .niri
+            .global_space
+            .output_geometry(&output)
+            .map(|g| g.to_f64());
+        let cursor_local = output_geo.map(|g| cursor_global - g.loc);
+        let output_size = output_geo.map(|g| g.size);
+        let movement_mode = Some(self.niri.config.borrow().zoom.movement_mode);
+        self.niri
+            .layout
+            .zoom_gesture_begin(&output, cursor_local, output_size, movement_mode);
+        self.niri.zoom_pinch_output = Some(output.downgrade());
+        true
+    }
+
+    /// Updates the ongoing zoom pinch gesture.
+    ///
+    /// Returns `false` if there's no zoom pinch gesture and the event should go to the client.
+    pub(crate) fn zoom_pinch_update(&mut self, scale: f64, timestamp: Duration) -> bool {
+        let Some(output) = &self.niri.zoom_pinch_output else {
+            return false;
+        };
+
+        // The gesture belongs to the output where it began, regardless of where the cursor is
+        // now. If that output was removed, its gesture is gone too; keep consuming the events.
+        if let Some(output) = output.upgrade() {
+            let sensitivity = self.niri.config.borrow().zoom.pinch_sensitivity
+                * output.current_scale().fractional_scale();
+            if self
+                .niri
+                .layout
+                .zoom_gesture_update(&output, scale, sensitivity, timestamp)
+                .is_some()
+            {
+                self.niri.queue_redraw(&output);
+            }
+        }
+
+        true
+    }
+
+    /// Ends the ongoing zoom pinch gesture.
+    ///
+    /// Returns `false` if there's no zoom pinch gesture and the event should go to the client.
+    pub(crate) fn zoom_pinch_end(&mut self, cancelled: bool) -> bool {
+        let Some(output) = self.niri.zoom_pinch_output.take() else {
+            return false;
+        };
+
+        if let Some(output) = output.upgrade() {
+            if self
+                .niri
+                .layout
+                .zoom_gesture_end(&output, cancelled)
+                .is_some()
+            {
+                self.niri.queue_redraw(&output);
+            }
+        }
+
+        true
     }
 
     fn on_gesture_hold_begin<I: InputBackend>(&mut self, event: I::GestureHoldBeginEvent) {
@@ -5406,27 +5495,15 @@ impl State {
         self.compute_absolute_location(evt, self.niri.output_for_touch())
     }
 
-    /// Clamp a position to the zoomed viewport when zoom is locked.
+    /// Maps an absolute pointer or tablet position through the zoom when zoom is locked.
     ///
-    /// This ensures that touch events do not go outside the zoomed area.
-    fn clamp_position_to_zoom(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+    /// With locked zoom the view doesn't follow the device, so the whole output area maps onto
+    /// the zoomed viewport, i.e. the device points at what is displayed under it. With unlocked
+    /// zoom the device covers the whole output and the view follows it.
+    fn map_absolute_position_to_zoom(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
         if let Some((output, _)) = self.niri.output_under(pos) {
-            if self.niri.layout.zoom_locked_for_output(output)
-                && self.niri.layout.zoom_is_active_for_output(output)
-            {
-                let output_geometry = self
-                    .niri
-                    .global_space
-                    .output_geometry(output)
-                    .unwrap()
-                    .to_f64();
-                if let Some(clamped) =
-                    self.niri
-                        .layout
-                        .zoom_clamp_to_viewport_for_output(output, pos, output_geometry)
-                {
-                    return clamped;
-                }
+            if self.niri.layout.zoom_locked_for_output(output) {
+                return self.niri.unzoom_screen_pos(pos);
             }
         }
         pos
@@ -5457,7 +5534,8 @@ impl State {
         let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
-        let pos = self.clamp_position_to_zoom(pos);
+        // Touchscreens point at what is displayed under the finger.
+        let pos = self.niri.unzoom_screen_pos(pos);
         let slot = evt.slot();
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -5492,9 +5570,10 @@ impl State {
                 }
             }
         } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, _)) = self.niri.output_under(pos) {
                 if mru_output == output {
-                    let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                    let pos_on_screen = self.niri.cursor_screen_pos_within_output(output, pos);
+                    let id = self.niri.window_mru_ui.pointer_motion(pos_on_screen);
                     if id.is_some() {
                         self.confirm_mru();
                     } else {
@@ -5568,6 +5647,7 @@ impl State {
             self.niri.focus_layer_surface_if_on_demand(under.layer);
         };
 
+        let mirror_focus = under.window.as_ref().zip(under.surface.clone());
         handle.down(
             self,
             under.surface,
@@ -5578,6 +5658,42 @@ impl State {
                 time: evt.time(),
             },
         );
+
+        // Like MirrorClickGrab for the pointer: keep remapping the focus origin through the
+        // mirror's scale and transform while the touch point is down.
+        let is_touch_down_grab = handle
+            .with_grab(|grab_serial, grab| {
+                grab_serial == serial && grab.as_any().is::<TouchDownGrab<State>>()
+            })
+            .unwrap_or(false);
+        if let Some(((window, _), surface)) = mirror_focus.filter(|_| is_touch_down_grab) {
+            let mirror = self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.id() == *window && mapped.is_mirror())
+                .map(|(_, mapped)| {
+                    (
+                        mapped.mirror_content_transform().1,
+                        mapped.mirror_view_transform().invert(),
+                    )
+                });
+            if let Some((mirror_scale, inverse_transform)) = mirror {
+                let start_surface_local = pos - surface.1;
+                let start_data = TouchGrabStartData {
+                    focus: Some(surface),
+                    slot,
+                    location: pos,
+                };
+                let grab = MirrorTouchDownGrab::new(
+                    start_data,
+                    start_surface_local,
+                    mirror_scale,
+                    inverse_transform,
+                );
+                handle.set_grab(self, grab, serial);
+            }
+        }
 
         // We're using touch, hide the pointer.
         self.niri.pointer_visibility = PointerVisibility::Disabled;
@@ -5613,7 +5729,7 @@ impl State {
         let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
-        let pos = self.clamp_position_to_zoom(pos);
+        let pos = self.niri.unzoom_screen_pos(pos);
         let slot = evt.slot();
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
@@ -6525,15 +6641,37 @@ fn make_binds_iter<'a>(
     general_binds.chain(mru_binds).chain(mru_open_binds)
 }
 
+fn toggle_block_out_window(
+    layout: &mut crate::layout::Layout<Mapped>,
+    window: crate::window::mapped::MappedId,
+) {
+    let Some((source_id, block_out)) = layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == window)
+        .map(|(_, mapped)| (mapped.source_id(), !mapped.is_block_out()))
+    else {
+        return;
+    };
+
+    // Mirrors show the same surface, so the source window and all of its mirrors must be
+    // toggled together, otherwise the content stays visible through one of them.
+    layout.with_windows_mut(|mapped, _| {
+        if mapped.source_id() == source_id {
+            mapped.set_block_out_window_override(block_out);
+        }
+    });
+}
+
+/// Whether a pointer move must be stopped to keep a confined pointer inside its surface/region.
+///
+/// Only the confining window's explicit `cursor-capture false` lets the pointer escape; without a
+/// rule (`None`) the standard pointer confinement applies.
 fn confined_pointer_move_should_be_prevented(
     source_window_captures_cursor: Option<bool>,
-    destination_window_captures_cursor: Option<bool>,
     stays_on_focused_surface: bool,
     stays_within_region: bool,
 ) -> bool {
-    if source_window_captures_cursor == Some(false)
-        || destination_window_captures_cursor == Some(false)
-    {
+    if source_window_captures_cursor == Some(false) {
         return false;
     }
 
@@ -6753,28 +6891,21 @@ mod tests {
     }
 
     #[test]
-    fn confined_pointer_move_stays_strict_when_both_windows_capture() {
+    fn confined_pointer_move_stays_strict_when_window_captures() {
         assert!(confined_pointer_move_should_be_prevented(
-            Some(true),
             Some(true),
             false,
             true,
         ));
         assert!(confined_pointer_move_should_be_prevented(
             Some(true),
-            Some(true),
             true,
             false,
         ));
-    }
-
-    #[test]
-    fn confined_pointer_move_allows_entering_window_without_capture() {
         assert!(!confined_pointer_move_should_be_prevented(
             Some(true),
-            Some(false),
-            false,
-            false,
+            true,
+            true,
         ));
     }
 
@@ -6782,30 +6913,16 @@ mod tests {
     fn confined_pointer_move_allows_leaving_window_without_capture() {
         assert!(!confined_pointer_move_should_be_prevented(
             Some(false),
-            None,
             false,
             false,
         ));
     }
 
     #[test]
-    fn confined_pointer_move_allows_ruleless_windows_by_default() {
-        assert!(!confined_pointer_move_should_be_prevented(
-            Some(false),
-            Some(false),
-            false,
-            false,
-        ));
-    }
-
-    #[test]
-    fn confined_pointer_move_prevents_escape_without_window_override() {
-        assert!(confined_pointer_move_should_be_prevented(
-            Some(true),
-            None,
-            false,
-            false,
-        ));
+    fn confined_pointer_move_keeps_stock_confinement_without_rule() {
+        assert!(confined_pointer_move_should_be_prevented(None, false, true));
+        assert!(confined_pointer_move_should_be_prevented(None, true, false));
+        assert!(!confined_pointer_move_should_be_prevented(None, true, true));
     }
 
     #[test]

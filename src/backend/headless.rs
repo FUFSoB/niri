@@ -66,7 +66,10 @@ pub struct Headless {
 impl Headless {
     pub fn new(event_loop: LoopHandle<'static, State>) -> Self {
         let udev_seat = std::env::var("XDG_SEAT").unwrap_or_else(|_| "seat0".to_owned());
-        init_headless_libinput(event_loop, &udev_seat);
+        // Tests run the headless backend too; they must not pick up the host's real devices.
+        if !cfg!(test) {
+            init_headless_libinput(event_loop, &udev_seat);
+        }
 
         Self {
             renderer: None,
@@ -165,7 +168,17 @@ impl Headless {
         // In real headless sessions we want a default output so clients have something to render
         // on. In tests, the harness explicitly creates predictable `headless-N` outputs; creating
         // an extra default `HEADLESS-1` here causes name collisions and snapshot churn.
-        if self.outputs.is_empty() && !cfg!(test) {
+        //
+        // Virtual outputs declared in the config are created right after init, so skip the default
+        // output if there are any.
+        let has_declared_outputs = niri
+            .config
+            .borrow()
+            .outputs
+            .0
+            .iter()
+            .any(|o| o.create_virtual);
+        if self.outputs.is_empty() && !has_declared_outputs && !cfg!(test) {
             let _ = self.create_virtual_output(niri, 1920, 1080, 60, None);
         }
     }
@@ -326,14 +339,12 @@ impl Headless {
         }
 
         if let Some(name) = name.as_deref() {
-            if name.trim().is_empty() {
-                return Err("virtual output name cannot be empty".to_string());
-            }
-            if self.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
-            {
-                return Err(format!("output '{name}' already exists"));
-            }
+            virtual_output::check_virtual_output_name(
+                niri,
+                &self.outputs,
+                std::iter::empty(),
+                name,
+            )?;
         }
 
         let built = virtual_output::build_headless_virtual_output(
@@ -344,11 +355,12 @@ impl Headless {
             name,
         );
 
-        if self.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
-        {
-            return Err(format!("output '{}' already exists", built.name));
-        }
+        virtual_output::check_virtual_output_name(
+            niri,
+            &self.outputs,
+            std::iter::empty(),
+            &built.name,
+        )?;
 
         self.ipc_outputs
             .lock()
@@ -381,6 +393,10 @@ impl Headless {
         )
     }
 
+    pub fn virtual_output(&self, name: &str) -> Option<Output> {
+        virtual_output::find_virtual_output(&self.outputs, name)
+    }
+
     pub fn seat_name(&self) -> String {
         self.udev_seat.clone()
     }
@@ -393,10 +409,16 @@ impl Headless {
     }
 
     pub fn primary_render_node(&mut self) -> Option<DrmNode> {
-        None
+        // Only meaningful while the renderer exists.
+        self.renderer.as_ref().and(self.render_node)
     }
 
-    pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
+    pub fn render(
+        &mut self,
+        niri: &mut Niri,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) -> RenderResult {
         let now = get_monotonic_time();
 
         let states = RenderElementStates::default();
@@ -409,30 +431,40 @@ impl Headless {
         );
 
         let output_state = niri.output_state.get_mut(output).unwrap();
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        output_state.frame_clock.presented(now);
+
+        // Pace redraws with an estimated vblank timer, like virtual outputs on the TTY backend.
+        // The frame callback sequence only advances when the timer fires, so clients get at most
+        // one frame callback per refresh cycle. If the timer is already running, keep it rather
+        // than restarting it on every redraw.
+        match mem::take(&mut output_state.redraw_state) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                niri.event_loop.remove(token);
+                output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+                return RenderResult::Submitted;
             }
         }
 
-        output_state.frame_clock.presented(now);
-        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
-
-        let refresh_interval = output_state
-            .frame_clock
-            .refresh_interval()
-            .unwrap_or(Duration::from_micros(16_667));
+        let mut duration = target_presentation_time.saturating_sub(now);
+        if duration.is_zero() {
+            duration += output_state
+                .frame_clock
+                .refresh_interval()
+                .unwrap_or(Duration::from_micros(16_667));
+        }
 
         let output_clone = output.clone();
-        let timer = Timer::from_duration(refresh_interval);
+        let timer = Timer::from_duration(duration);
         let token = niri
             .event_loop
             .insert_source(timer, move |_, _, data| {
-                let output_state = data.niri.output_state.get_mut(&output_clone).unwrap();
+                let Some(output_state) = data.niri.output_state.get_mut(&output_clone) else {
+                    return TimeoutAction::Drop;
+                };
+                // We waited for the timer, now we can send frame callbacks again.
                 output_state.frame_callback_sequence =
                     output_state.frame_callback_sequence.wrapping_add(1);
 

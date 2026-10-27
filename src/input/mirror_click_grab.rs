@@ -4,6 +4,10 @@ use smithay::input::pointer::{
     GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
     PointerInnerHandle, RelativeMotionEvent,
 };
+use smithay::input::touch::{
+    DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent,
+    OrientationEvent, ShapeEvent, TouchGrab, TouchInnerHandle, UpEvent,
+};
 use smithay::input::SeatHandler;
 use smithay::utils::{Logical, Point, Size, Transform};
 
@@ -15,6 +19,20 @@ fn transform_relative_delta(
     inverse_transform: Transform,
 ) -> Point<f64, Logical> {
     inverse_transform.transform_point_in(delta.downscale(mirror_scale), &Size::from((0., 0.)))
+}
+
+/// Returns the focus origin that maps `location` to the right surface-local point inside a
+/// mirror, given the surface-local point at `start_location`.
+fn focus_origin_for_location(
+    start_location: Point<f64, Logical>,
+    start_surface_local: Point<f64, Logical>,
+    mirror_scale: f64,
+    inverse_transform: Transform,
+    location: Point<f64, Logical>,
+) -> Point<f64, Logical> {
+    let surface_local = start_surface_local
+        + transform_relative_delta(location - start_location, mirror_scale, inverse_transform);
+    location - surface_local
 }
 
 pub struct MirrorClickGrab {
@@ -39,21 +57,19 @@ impl MirrorClickGrab {
         }
     }
 
-    fn source_delta_for_location(&self, location: Point<f64, Logical>) -> Point<f64, Logical> {
-        transform_relative_delta(
-            location - self.start_data.location,
-            self.mirror_scale,
-            self.inverse_transform,
-        )
-    }
-
     fn focus_for_location(
         &self,
         location: Point<f64, Logical>,
     ) -> Option<(<State as SeatHandler>::PointerFocus, Point<f64, Logical>)> {
         let (focus, _) = self.start_data.focus.as_ref()?;
-        let surface_local = self.start_surface_local + self.source_delta_for_location(location);
-        Some((focus.clone(), location - surface_local))
+        let origin = focus_origin_for_location(
+            self.start_data.location,
+            self.start_surface_local,
+            self.mirror_scale,
+            self.inverse_transform,
+            location,
+        );
+        Some((focus.clone(), origin))
     }
 }
 
@@ -192,26 +208,118 @@ impl PointerGrab<State> for MirrorClickGrab {
     fn unset(&mut self, _data: &mut State) {}
 }
 
-#[cfg(test)]
-mod tests {
-    use smithay::utils::{Logical, Point, Size, Transform};
+/// Touch counterpart of [`MirrorClickGrab`]: Smithay's `TouchDownGrab`, but with the focus origin
+/// mapped through the mirror's scale and transform, so drags inside the mirror land on the right
+/// surface-local points.
+pub struct MirrorTouchDownGrab {
+    start_data: TouchGrabStartData<State>,
+    start_surface_local: Point<f64, Logical>,
+    mirror_scale: f64,
+    inverse_transform: Transform,
+    touch_points: usize,
+}
 
-    use super::transform_relative_delta;
-
-    fn focus_origin_for_location(
-        start_location: Point<f64, Logical>,
+impl MirrorTouchDownGrab {
+    pub fn new(
+        start_data: TouchGrabStartData<State>,
         start_surface_local: Point<f64, Logical>,
         mirror_scale: f64,
         inverse_transform: Transform,
-        location: Point<f64, Logical>,
-    ) -> Point<f64, Logical> {
-        let surface_local = start_surface_local
-            + inverse_transform.transform_point_in(
-                (location - start_location).downscale(mirror_scale),
-                &Size::from((0., 0.)),
-            );
-        location - surface_local
+    ) -> Self {
+        Self {
+            start_data,
+            start_surface_local,
+            mirror_scale,
+            inverse_transform,
+            touch_points: 1,
+        }
     }
+
+    fn focus_for_location(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<(<State as SeatHandler>::TouchFocus, Point<f64, Logical>)> {
+        let (focus, _) = self.start_data.focus.as_ref()?;
+        let origin = focus_origin_for_location(
+            self.start_data.location,
+            self.start_surface_local,
+            self.mirror_scale,
+            self.inverse_transform,
+            location,
+        );
+        Some((focus.clone(), origin))
+    }
+}
+
+impl TouchGrab<State> for MirrorTouchDownGrab {
+    fn down(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        _focus: Option<(<State as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
+        event: &DownEvent,
+    ) {
+        handle.down(data, self.focus_for_location(event.location), event);
+        self.touch_points += 1;
+    }
+
+    fn up(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>, event: &UpEvent) {
+        handle.up(data, event);
+        self.touch_points = self.touch_points.saturating_sub(1);
+        if self.touch_points == 0 {
+            handle.unset_grab(self, data);
+        }
+    }
+
+    fn motion(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        _focus: Option<(<State as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
+        event: &TouchMotionEvent,
+    ) {
+        handle.motion(data, self.focus_for_location(event.location), event);
+    }
+
+    fn frame(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
+        handle.frame(data);
+    }
+
+    fn cancel(&mut self, data: &mut State, handle: &mut TouchInnerHandle<'_, State>) {
+        handle.cancel(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        event: &ShapeEvent,
+    ) {
+        handle.shape(data, event);
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut State,
+        handle: &mut TouchInnerHandle<'_, State>,
+        event: &OrientationEvent,
+    ) {
+        handle.orientation(data, event);
+    }
+
+    fn start_data(&self) -> &TouchGrabStartData<State> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, _data: &mut State) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Point, Transform};
+
+    use super::{focus_origin_for_location, transform_relative_delta};
 
     #[test]
     fn mirror_relative_delta_rotates_with_transform() {

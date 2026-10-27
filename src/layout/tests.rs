@@ -42,6 +42,8 @@ struct TestWindowInner {
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
+    /// Names of the outputs that the window has entered.
+    outputs: RefCell<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,7 @@ impl TestWindow {
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
+            outputs: RefCell::new(Vec::new()),
         }))
     }
 
@@ -206,9 +209,19 @@ impl LayoutElement for TestWindow {
         false
     }
 
-    fn output_enter(&self, _output: &Output) {}
+    fn output_enter(&self, output: &Output) {
+        let mut outputs = self.0.outputs.borrow_mut();
+        if !outputs.contains(&output.name()) {
+            outputs.push(output.name());
+        }
+    }
 
-    fn output_leave(&self, _output: &Output) {}
+    fn output_leave(&self, output: &Output) {
+        self.0
+            .outputs
+            .borrow_mut()
+            .retain(|name| *name != output.name());
+    }
 
     fn set_offscreen_data(&self, _data: Option<OffscreenData>) {}
 
@@ -622,6 +635,10 @@ enum Op {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
     },
+    ToggleWindowSticky {
+        #[proptest(strategy = "proptest::option::of(1..=5usize)")]
+        id: Option<usize>,
+    },
     SetWindowFloating {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
@@ -940,7 +957,11 @@ impl Op {
                 mut params,
                 next_to_id,
             } => {
-                let mut found_next_to = false;
+                if layout.has_window(&params.id) {
+                    return;
+                }
+
+                let mut found_next_to = layout.is_sticky_window(&next_to_id);
 
                 if let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move {
                     let win_id = move_.tile.window().0.id;
@@ -1010,6 +1031,10 @@ impl Op {
                 mut params,
                 ws_name,
             } => {
+                if layout.has_window(&params.id) {
+                    return;
+                }
+
                 let ws_name = format!("ws{ws_name}");
                 let mut ws_id = None;
 
@@ -1375,6 +1400,10 @@ impl Op {
             Op::ToggleWindowFloating { id } => {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.toggle_window_floating(id.as_ref());
+            }
+            Op::ToggleWindowSticky { id } => {
+                let id = id.filter(|id| layout.has_window(id));
+                layout.toggle_window_sticky(id.as_ref());
             }
             Op::SetWindowFloating { id, floating } => {
                 let id = id.filter(|id| layout.has_window(id));
@@ -2110,6 +2139,308 @@ fn switch_focus_floating_tiling_switches_from_sticky_to_workspace_floating() {
         *monitors[*active_monitor_idx].active_window().unwrap().id(),
         3
     );
+}
+
+fn window_scrolling_position(layout: &Layout<TestWindow>, id: usize) -> Option<(usize, usize)> {
+    layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&id))
+        .and_then(|(_, _, ws)| scrolling_position_for_window(ws, id))
+}
+
+fn active_monitor(layout: &Layout<TestWindow>) -> &Monitor<TestWindow> {
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+    &monitors[*active_monitor_idx]
+}
+
+fn test_window(layout: &Layout<TestWindow>, id: usize) -> TestWindow {
+    layout
+        .windows()
+        .find(|(_, win)| win.0.id == id)
+        .map(|(_, win)| win.clone())
+        .unwrap()
+}
+
+#[test]
+fn readding_only_output_without_windows() {
+    check_ops([Op::AddOutput(1), Op::RemoveOutput(1), Op::AddOutput(1)]);
+}
+
+#[test]
+fn sticking_last_window_cleans_up_its_workspace() {
+    check_ops([
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddNamedWorkspace {
+            ws_name: 1,
+            output_names: vec![],
+            layout_config: None,
+        },
+        Op::AddOutput(1),
+        Op::ToggleWindowSticky { id: Some(2) },
+    ]);
+}
+
+#[test]
+fn unstick_lone_column_window_creates_new_column() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ToggleWindowSticky { id: Some(2) },
+        Op::ToggleWindowSticky { id: Some(2) },
+    ];
+
+    let layout = check_ops(ops);
+    // Window 2 must not have been stacked into window 3's column.
+    assert_eq!(window_scrolling_position(&layout, 1), Some((0, 0)));
+    assert_eq!(window_scrolling_position(&layout, 2), Some((1, 0)));
+    assert_eq!(window_scrolling_position(&layout, 3), Some((2, 0)));
+}
+
+#[test]
+fn unstick_with_column_index_past_end() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ToggleWindowSticky { id: Some(3) },
+        Op::CloseWindow(1),
+        Op::CloseWindow(2),
+        Op::ToggleWindowSticky { id: Some(3) },
+    ];
+
+    let layout = check_ops(ops);
+    assert!(!layout.is_sticky_window(&3));
+    assert_eq!(window_scrolling_position(&layout, 3), Some((0, 0)));
+}
+
+#[test]
+fn unstick_goes_back_to_column_mate() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        // Columns: [1, 2], [3].
+        Op::ToggleWindowSticky { id: Some(1) },
+        // Columns: [2], [3]. Move 2's column to the end.
+        Op::FocusWindow(2),
+        Op::MoveColumnRight,
+        // Columns: [3], [2].
+        Op::ToggleWindowSticky { id: Some(1) },
+    ];
+
+    let layout = check_ops(ops);
+    assert_eq!(window_scrolling_position(&layout, 3), Some((0, 0)));
+    assert_eq!(window_scrolling_position(&layout, 1), Some((1, 0)));
+    assert_eq!(window_scrolling_position(&layout, 2), Some((1, 1)));
+}
+
+#[test]
+fn new_window_takes_focus_from_sticky() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowSticky { id: Some(2) },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+    ];
+
+    let layout = check_ops(ops);
+    let mon = active_monitor(&layout);
+    assert!(!mon.sticky_is_active());
+    assert_eq!(*mon.active_window().unwrap().id(), 3);
+}
+
+#[test]
+fn focused_sticky_deactivates_workspace_windows() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowSticky { id: Some(2) },
+        Op::Refresh { is_active: true },
+    ];
+
+    let layout = check_ops(ops);
+    assert!(active_monitor(&layout).sticky_is_active());
+    assert!(test_window(&layout, 2).0.pending_activated.get());
+    assert!(!test_window(&layout, 1).0.pending_activated.get());
+}
+
+#[test]
+fn sticky_window_keeps_output() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::FocusOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleWindowSticky { id: Some(1) },
+    ];
+
+    let mut layout = check_ops(ops);
+    let win = test_window(&layout, 1);
+    assert_eq!(*win.0.outputs.borrow(), ["output1"]);
+
+    check_ops_on_layout(&mut layout, [Op::RemoveOutput(1)]);
+    assert!(layout.is_sticky_window(&1));
+    assert_eq!(*win.0.outputs.borrow(), ["output2"]);
+
+    check_ops_on_layout(&mut layout, [Op::ToggleWindowSticky { id: Some(1) }]);
+    assert_eq!(*win.0.outputs.borrow(), ["output2"]);
+}
+
+#[test]
+fn sticky_survives_losing_all_outputs() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowSticky { id: Some(1) },
+        Op::RemoveOutput(1),
+        Op::AddOutput(2),
+    ];
+
+    let layout = check_ops(ops);
+    assert!(layout.is_sticky_window(&1));
+    assert!(!layout.is_sticky_window(&2));
+    assert_eq!(*test_window(&layout, 1).0.outputs.borrow(), ["output2"]);
+}
+
+#[test]
+fn column_actions_dont_touch_hidden_column_when_sticky_focused() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleWindowSticky { id: Some(2) },
+    ];
+
+    let mut layout = check_ops(ops);
+    let width = |layout: &Layout<TestWindow>| {
+        let ws = layout.active_workspace().unwrap();
+        let col = ws.scrolling().columns().next().unwrap();
+        (col.stored_width(), col.is_full_width())
+    };
+    let before = width(&layout);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::SetColumnWidth(SizeChange::SetFixed(500)),
+            Op::SwitchPresetColumnWidth,
+            Op::MaximizeColumn,
+            Op::ExpandColumnToAvailableWidth,
+            Op::MoveColumnToWorkspaceDown(true),
+            Op::Communicate(1),
+        ],
+    );
+
+    let mon = active_monitor(&layout);
+    assert!(mon.sticky_is_active());
+    assert_eq!(*mon.active_window().unwrap().id(), 2);
+    assert_eq!(mon.active_workspace_idx(), 0);
+    assert_eq!(width(&layout), before);
+}
+
+#[test]
+fn interactive_resize_end_keeps_manual_view() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::Communicate(1),
+        Op::Communicate(2),
+        Op::Communicate(3),
+        Op::ToggleWorkspaceViewFocusMode,
+        Op::MoveView(PositionChange::AdjustFixed(-150.)),
+        Op::CompleteAnimations,
+    ];
+
+    let mut layout = check_ops(ops);
+    let view_pos = |layout: &Layout<TestWindow>| {
+        layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .target_view_pos()
+    };
+    let before = view_pos(&layout);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::InteractiveResizeBegin {
+                window: 3,
+                edges: ResizeEdge::RIGHT,
+            },
+            Op::InteractiveResizeUpdate {
+                window: 3,
+                dx: 10.,
+                dy: 0.,
+            },
+            Op::InteractiveResizeEnd { window: 3 },
+        ],
+    );
+
+    assert_eq!(view_pos(&layout), before);
 }
 
 #[test]
@@ -4328,6 +4659,50 @@ fn expel_pending_left_from_fullscreen_tabbed_column() {
     ];
 
     check_ops(ops);
+}
+
+#[test]
+fn floating_inactive_tab_starts_near_its_tile_position() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: Some(2) },
+        Op::ToggleColumnTabbedDisplay,
+        Op::FocusWindow(2),
+        Op::CompleteAnimations,
+    ];
+    let mut layout = check_ops(ops);
+
+    let ws = layout.active_workspace().unwrap();
+    let (_, tile_pos, visible) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == &1)
+        .unwrap();
+    // Inactive tab.
+    assert!(!visible);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::ToggleWindowFloating { id: Some(1) },
+            Op::CompleteAnimations,
+        ],
+    );
+
+    // Like for any other tiled window, the floating position is derived from the tile position
+    // rather than the default (centered) floating placement. The Y coordinate is clamped to the
+    // working area since the window is tall.
+    let ws = layout.active_workspace().unwrap();
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == &1)
+        .unwrap();
+    assert_eq!(pos.x, tile_pos.x + 50.);
 }
 
 #[test]

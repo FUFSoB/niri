@@ -485,40 +485,41 @@ impl<W: LayoutElement> Workspace<W> {
             return Some(StickyRestoreInfo {
                 workspace_id: self.id(),
                 position: StickyRestorePosition::Floating,
-                next_to: None,
+                column_mate: None,
             });
         }
 
-        let mut position = None;
-        let mut next_to = None;
+        self.scrolling
+            .columns()
+            .enumerate()
+            .find_map(|(column_idx, column)| {
+                let tile_idx = column
+                    .tiles()
+                    .position(|(tile, _)| tile.window().id() == id)?;
 
-        for (column_idx, column) in self.scrolling.columns().enumerate() {
-            let mut prev_id = None;
-            for (tile_idx, (tile, _)) in column.tiles().enumerate() {
-                if tile.window().id() == id {
-                    position = Some((column_idx, tile_idx));
-                    next_to = prev_id;
-                    break;
-                }
-                prev_id = Some(tile.window().id().clone());
-            }
-            if position.is_some() {
-                break;
-            }
-        }
+                // Prefer the window above, otherwise the one below.
+                let column_mate = tile_idx
+                    .checked_sub(1)
+                    .into_iter()
+                    .chain([tile_idx + 1])
+                    .find_map(|idx| column.tiles().nth(idx))
+                    .map(|(tile, _)| tile.window().id().clone());
 
-        if let Some((column_idx, tile_idx)) = position {
-            Some(StickyRestoreInfo {
-                workspace_id: self.id(),
-                position: StickyRestorePosition::Tiling {
-                    column_idx,
-                    tile_idx,
-                },
-                next_to,
+                Some(StickyRestoreInfo {
+                    workspace_id: self.id(),
+                    position: StickyRestorePosition::Tiling {
+                        column_idx,
+                        tile_idx,
+                    },
+                    column_mate,
+                })
             })
-        } else {
-            None
-        }
+    }
+
+    pub(super) fn tiling_column_idx_of(&self, id: &W::Id) -> Option<usize> {
+        self.scrolling
+            .columns()
+            .position(|column| column.contains(id))
     }
 
     pub(super) fn mirror_source_snapshot(&self, id: &W::Id) -> Option<MirrorSourceSnapshot<W::Id>> {
@@ -1366,6 +1367,20 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.toggle_full_width_for_window(window);
     }
 
+    pub fn set_window_column_width_state(
+        &mut self,
+        window: &W::Id,
+        width: ColumnWidth,
+        is_full_width: bool,
+    ) {
+        if self.floating.has_window(window) {
+            return;
+        }
+
+        self.scrolling
+            .set_window_column_width_state(window, width, is_full_width);
+    }
+
     pub fn set_column_width(&mut self, change: SizeChange) {
         if self.floating_is_active.get() {
             self.floating.set_window_width(None, change, true);
@@ -1575,10 +1590,13 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         };
 
-        let (_, render_pos, was_visible) = self
+        let (tile, render_pos, is_visible_tab) = self
             .tiles_with_render_positions()
             .find(|(tile, _, _)| *tile.window().id() == id)
             .unwrap();
+        let tile_rect = Rectangle::new(render_pos, tile.tile_size());
+        let was_on_screen =
+            is_visible_tab && tile_rect.overlaps(Rectangle::from_size(self.view_size));
 
         if self.floating.has_window(&id) {
             let removed = self.floating.remove_tile(&id);
@@ -1598,11 +1616,14 @@ impl<W: LayoutElement> Workspace<W> {
             let mut removed = self.scrolling.remove_tile(&id, Transaction::new());
             removed.tile.stop_move_animations();
 
-            // Use the current tile position only if the tile is actually visible. Hidden tiles,
-            // such as mirrors in off-screen fullscreen columns, should fall back to the default
-            // floating placement computed after the floating size is restored.
+            // Come up with a default floating position close to the tile position.
+            //
+            // Mirrors that are off-screen, such as ones born next to a fullscreen source, fall
+            // back to the default floating placement computed after the floating size is restored
+            // instead, since the user has never seen them in their tiled position.
             let stored_or_default = self.floating.stored_or_default_tile_pos(&removed.tile);
-            if stored_or_default.is_none() && was_visible {
+            let use_tile_pos = was_on_screen || !removed.tile.window().is_mirror();
+            if stored_or_default.is_none() && use_tile_pos {
                 let offset =
                     if self.options.layout.center_focused_column == CenterFocusedColumn::Always {
                         Point::from((0., 0.))

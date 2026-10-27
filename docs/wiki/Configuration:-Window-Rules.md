@@ -623,6 +623,7 @@ You can temporarily override the per-window block-out state at runtime with the
 [`toggle-block-out-window`](./Configuration:-Key-Bindings.md#toggle-block-out-window) action.
 If a window is already blocked out by configuration, the action turns block-out off for it.
 Otherwise, it turns on `screencast` block-out for that window.
+The override applies to the window together with its mirrors, and stays in place when the window's rules change, until you toggle it back.
 
 You can also disable or re-enable block-out rendering globally with the
 [`toggle-block-out`](./Configuration:-Key-Bindings.md#toggle-block-out) action.
@@ -651,9 +652,11 @@ This global toggle does not change the window's own `is_block_out` state reporte
 
 Control whether this window captures the cursor when it requests a confined pointer constraint.
 
-By default, windows do not capture the cursor.
-Set this to `true` for windows where you want niri to keep the pointer confined to the focused
-surface and region while the constraint is active.
+Without this rule, niri uses the standard pointer confinement behavior.
+Set this to `false` for windows where you want the pointer to be able to leave a confined
+surface or region, or to `true` to explicitly keep the pointer confined to the focused surface and
+region while the constraint is active.
+The rule of the window that confines the pointer decides.
 
 You can temporarily override the per-window cursor capture state at runtime with the
 [`toggle-window-cursor-capture`](./Configuration:-Key-Bindings.md#toggle-window-cursor-capture)

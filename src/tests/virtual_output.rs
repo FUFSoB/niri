@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use niri_config::Config;
+use smithay::output::Output;
 use smithay::wayland::compositor::{with_states, SurfaceAttributes};
 use wayland_client::protocol::wl_surface::WlSurface as ClientSurface;
 use wayland_server::protocol::wl_surface::WlSurface as ServerSurface;
@@ -7,6 +9,7 @@ use wayland_server::protocol::wl_surface::WlSurface as ServerSurface;
 use super::client::ClientId;
 use super::*;
 use crate::layout::{ActivateWindow, AddWindowTarget};
+use crate::niri::RedrawState;
 use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
@@ -285,6 +288,12 @@ fn mirrored_surface_frame_callbacks_stay_single_virtual_output() {
         })
     };
 
+    // Frame callbacks on virtual outputs are paced by the estimated vblank timer. Stop the pending
+    // timers so they can't fire (and send frame callbacks) during the dispatch below if the test
+    // runs slowly, and advance the frame callback sequence by hand like the timer would.
+    stop_estimated_vblank_timer(&mut f, &source_output);
+    stop_estimated_vblank_timer(&mut f, &mirror_output);
+
     {
         let client = f.client(client_id);
         client_surface.frame(&client.qh, Arc::new(SyncData::default()));
@@ -294,11 +303,199 @@ fn mirrored_surface_frame_callbacks_stay_single_virtual_output() {
     f.state.server.dispatch_without_refresh();
     assert_eq!(queued_frame_callbacks(&server_surface), 1);
 
+    advance_frame_callback_sequence(&mut f, &non_owner_output);
     f.niri()
         .send_frame_callbacks_for_virtual_output(&non_owner_output);
     assert_eq!(queued_frame_callbacks(&server_surface), 1);
 
+    advance_frame_callback_sequence(&mut f, &owner_output);
     f.niri()
         .send_frame_callbacks_for_virtual_output(&owner_output);
     assert_eq!(queued_frame_callbacks(&server_surface), 0);
+}
+
+fn stop_estimated_vblank_timer(f: &mut Fixture, output: &Output) {
+    let niri = f.niri();
+    let state = niri.output_state.get_mut(output).unwrap();
+    if let RedrawState::WaitingForEstimatedVBlank(token)
+    | RedrawState::WaitingForEstimatedVBlankAndQueued(token) = state.redraw_state
+    {
+        niri.event_loop.remove(token);
+        state.redraw_state = RedrawState::Idle;
+    }
+}
+
+fn advance_frame_callback_sequence(f: &mut Fixture, output: &Output) {
+    let state = f.niri().output_state.get_mut(output).unwrap();
+    state.frame_callback_sequence = state.frame_callback_sequence.wrapping_add(1);
+}
+
+fn create_virtual(f: &mut Fixture, name: &str) -> Result<String, String> {
+    let state = f.niri_state();
+    state
+        .backend
+        .create_virtual_output(&mut state.niri, 1920, 1080, 60, Some(name.to_owned()))
+}
+
+fn remove_virtual(f: &mut Fixture, name: &str) -> Result<(), String> {
+    let state = f.niri_state();
+    state.backend.remove_virtual_output(&mut state.niri, name)
+}
+
+fn output_named(f: &mut Fixture, name: &str) -> Option<Output> {
+    f.niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .cloned()
+}
+
+fn has_ipc_output(f: &mut Fixture, name: &str) -> bool {
+    f.niri_state()
+        .backend
+        .ipc_outputs()
+        .lock()
+        .unwrap()
+        .values()
+        .any(|o| o.name == name)
+}
+
+fn config_with_virtual_outputs(names: &[&str], extra: &str) -> Config {
+    let mut kdl = String::from(extra);
+    for name in names {
+        kdl += &format!("output \"{name}\" {{\n    create-virtual\n}}\n");
+    }
+    Config::parse_mem(&kdl).unwrap()
+}
+
+#[test]
+fn headless_redraw_keeps_frame_callback_pacing() {
+    let mut f = Fixture::new();
+    create_virtual(&mut f, "virt").unwrap();
+    let output = output_named(&mut f, "virt").unwrap();
+
+    f.niri().queue_redraw(&output);
+    f.niri_state().refresh_and_flush_clients();
+
+    let state = &f.niri().output_state[&output];
+    let sequence = state.frame_callback_sequence;
+    let RedrawState::WaitingForEstimatedVBlank(token) = state.redraw_state else {
+        panic!("unexpected redraw state: {:?}", state.redraw_state);
+    };
+
+    // Redraws before the estimated vblank must neither restart the timer nor allow new frame
+    // callbacks, otherwise clients committing in a loop render unthrottled.
+    for _ in 0..3 {
+        f.niri().queue_redraw(&output);
+        f.niri_state().refresh_and_flush_clients();
+
+        let state = &f.niri().output_state[&output];
+        assert_eq!(state.frame_callback_sequence, sequence);
+        assert!(matches!(
+            state.redraw_state,
+            RedrawState::WaitingForEstimatedVBlank(t) if t == token
+        ));
+    }
+}
+
+#[test]
+fn virtual_outputs_keep_redrawing_with_monitors_off() {
+    let mut f = Fixture::new();
+    create_virtual(&mut f, "virt").unwrap();
+    let output = output_named(&mut f, "virt").unwrap();
+
+    {
+        let state = f.niri_state();
+        state.niri.deactivate_monitors(&mut state.backend);
+    }
+
+    f.niri().queue_redraw(&output);
+    f.niri_state().refresh_and_flush_clients();
+
+    assert!(matches!(
+        f.niri().output_state[&output].redraw_state,
+        RedrawState::WaitingForEstimatedVBlank(_)
+    ));
+}
+
+#[test]
+fn removing_virtual_output_notifies_ipc() {
+    let mut f = Fixture::new();
+    create_virtual(&mut f, "virt").unwrap();
+    f.niri().ipc_outputs_changed = false;
+
+    remove_virtual(&mut f, "virt").unwrap();
+    assert!(f.niri().ipc_outputs_changed);
+}
+
+#[test]
+fn virtual_output_names_are_case_insensitive() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert!(create_virtual(&mut f, "HEADLESS-1").is_err());
+
+    create_virtual(&mut f, "virt").unwrap();
+    assert!(create_virtual(&mut f, "VIRT").is_err());
+
+    remove_virtual(&mut f, "VIRT").unwrap();
+    assert!(output_named(&mut f, "virt").is_none());
+    assert!(!has_ipc_output(&mut f, "virt"));
+}
+
+#[test]
+fn off_virtual_output_is_not_confused_with_same_named_output() {
+    let config = Config::parse_mem("output \"headless-1\" { off; }").unwrap();
+    let mut f = Fixture::with_config(config);
+
+    create_virtual(&mut f, "headless-1").unwrap();
+    assert!(output_named(&mut f, "headless-1").is_none());
+
+    // An output with the same name appears through some other path (like a monitor hotplug).
+    f.add_output(1, (1920, 1080));
+    let output = output_named(&mut f, "headless-1").unwrap();
+
+    // This must not try to remove the other output in place of the disconnected virtual one.
+    f.niri_state().reload_output_config();
+    assert!(f.niri().output_exists(&output));
+}
+
+#[test]
+fn declared_virtual_outputs_follow_config() {
+    let mut f = Fixture::with_config(config_with_virtual_outputs(&["virt-a"], ""));
+    f.add_output(1, (1920, 1080));
+    assert!(output_named(&mut f, "virt-a").is_some());
+
+    // Renaming the declaration replaces the output.
+    f.niri_state()
+        .reload_config(Ok(config_with_virtual_outputs(&["virt-b"], "")));
+    assert!(output_named(&mut f, "virt-a").is_none());
+    assert!(!has_ipc_output(&mut f, "virt-a"));
+    assert!(output_named(&mut f, "virt-b").is_some());
+
+    // An output removed through IPC is not recreated by unrelated output config changes.
+    remove_virtual(&mut f, "virt-b").unwrap();
+    let extra = "output \"headless-1\" { scale 2; }\n";
+    f.niri_state()
+        .reload_config(Ok(config_with_virtual_outputs(&["virt-b"], extra)));
+    assert!(output_named(&mut f, "virt-b").is_none());
+    assert!(!has_ipc_output(&mut f, "virt-b"));
+
+    // Removing the declaration doesn't touch an output created through IPC with the same name.
+    create_virtual(&mut f, "virt-b").unwrap();
+    f.niri_state()
+        .reload_config(Ok(config_with_virtual_outputs(&[], extra)));
+    assert!(output_named(&mut f, "virt-b").is_some());
+    remove_virtual(&mut f, "virt-b").unwrap();
+
+    // Adding the declaration back creates the output again.
+    f.niri_state()
+        .reload_config(Ok(config_with_virtual_outputs(&["virt-b"], extra)));
+    assert!(output_named(&mut f, "virt-b").is_some());
+
+    // Removing the declaration removes the output.
+    f.niri_state()
+        .reload_config(Ok(config_with_virtual_outputs(&[], extra)));
+    assert!(output_named(&mut f, "virt-b").is_none());
+    assert!(!has_ipc_output(&mut f, "virt-b"));
 }

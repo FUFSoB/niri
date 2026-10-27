@@ -2,6 +2,9 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Write as _;
+use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,6 +29,7 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 };
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
+use smithay::reexports::rustix::fs::{memfd_create, MemfdFlags};
 use wayland_backend::client::Backend;
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
@@ -36,6 +40,8 @@ use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -63,6 +69,7 @@ pub struct State {
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
+    pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
 
@@ -73,6 +80,7 @@ pub struct State {
 pub struct Window {
     pub qh: QueueHandle<State>,
     pub spbm: WpSinglePixelBufferManagerV1,
+    pub shm: WlShm,
 
     pub surface: WlSurface,
     pub xdg_surface: XdgSurface,
@@ -264,6 +272,7 @@ impl Client {
             layer_shell: None,
             virtual_pointer_manager: None,
             spbm: None,
+            shm: None,
             viewporter: None,
             ksim: None,
             windows: Vec::new(),
@@ -356,6 +365,7 @@ impl State {
         let window = Window {
             qh: self.qh.clone(),
             spbm: self.spbm.clone().unwrap(),
+            shm: self.shm.clone().unwrap(),
 
             surface,
             xdg_surface,
@@ -437,6 +447,38 @@ impl Window {
     pub fn attach_rgba_buffer(&self, rgba: [u32; 4]) {
         let [r, g, b, a] = rgba;
         let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+    }
+
+    /// Attaches a 1×1 wl_shm buffer of the given color.
+    ///
+    /// Unlike single-pixel buffers, these are rendered as textures, so they go through texture
+    /// shaders (e.g. clipping) and show up in render snapshots.
+    pub fn attach_shm_rgba_buffer(&self, rgba: [u32; 4]) {
+        self.attach_shm_buffer(1, 1, &[rgba]);
+    }
+
+    /// Attaches a `w`×`h` wl_shm buffer with the given row-major pixels.
+    pub fn attach_shm_buffer(&self, w: i32, h: i32, pixels: &[[u32; 4]]) {
+        assert_eq!(pixels.len(), (w * h) as usize);
+
+        // ARGB8888 is little-endian, so the bytes go B, G, R, A.
+        let bytes: Vec<u8> = pixels
+            .iter()
+            .flat_map(|rgba| {
+                let [r, g, b, a] = rgba.map(|c| (c >> 24) as u8);
+                [b, g, r, a]
+            })
+            .collect();
+        let fd = memfd_create("niri-test-shm", MemfdFlags::CLOEXEC).unwrap();
+        let mut file = File::from(fd);
+        file.write_all(&bytes).unwrap();
+
+        let pool = self
+            .shm
+            .create_pool(file.as_fd(), bytes.len() as i32, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, &self.qh, ());
+        pool.destroy();
         self.surface.attach(Some(&buffer), 0, 0);
     }
 
@@ -655,6 +697,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlShm::interface().name {
+                    let version = min(version, WlShm::interface().version);
+                    state.shm = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
@@ -857,6 +902,8 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
 }
 
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerManagerV1);
+wayland_client::delegate_noop!(State: ignore WlShm);
+wayland_client::delegate_noop!(State: WlShmPool);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
 
 impl Dispatch<WlSurface, ()> for State {

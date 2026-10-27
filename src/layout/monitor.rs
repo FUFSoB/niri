@@ -309,6 +309,11 @@ impl From<&super::OverviewProgress> for OverviewProgress {
     }
 }
 
+/// Options for the sticky space: like workspaces, adjusted for the output scale.
+fn sticky_options(options: &Options, scale: f64) -> Rc<Options> {
+    Rc::new(options.clone().adjusted_for_scale(scale))
+}
+
 impl<W: LayoutElement> Monitor<W> {
     pub fn new(
         output: Output,
@@ -329,7 +334,7 @@ impl<W: LayoutElement> Monitor<W> {
             working_area,
             scale.fractional_scale(),
             clock.clone(),
-            options.clone(),
+            sticky_options(&options, scale.fractional_scale()),
         );
 
         // Prepare the workspaces: set output, empty first, empty last.
@@ -400,7 +405,12 @@ impl<W: LayoutElement> Monitor<W> {
             ws.set_output(None);
         }
 
-        (self.workspaces, self.sticky.into_tiles())
+        let sticky_tiles = self.sticky.into_tiles();
+        for tile in &sticky_tiles {
+            tile.window().output_leave(&self.output);
+        }
+
+        (self.workspaces, sticky_tiles)
     }
 
     pub fn output(&self) -> &Output {
@@ -454,13 +464,19 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     fn make_tile(&self, window: W) -> Tile<W> {
+        let scale = self.scale.fractional_scale();
         Tile::new(
             window,
             self.view_size,
-            self.scale.fractional_scale(),
+            scale,
             self.clock.clone(),
-            self.options.clone(),
+            sticky_options(&self.options, scale),
         )
+    }
+
+    fn enter_output_for_sticky_window(&self, window: &W) {
+        window.set_preferred_scale_transform(self.scale, self.output.current_transform());
+        window.output_enter(&self.output);
     }
 
     pub fn sticky_has_window(&self, window: &W::Id) -> bool {
@@ -672,6 +688,7 @@ impl<W: LayoutElement> Monitor<W> {
         if is_sticky {
             let mut tile = self.make_tile(window);
             tile.restore_to_floating = true;
+            self.enter_output_for_sticky_window(tile.window());
 
             let activate =
                 activate.map_smart(|| !self.active_workspace_ref().is_active_pending_fullscreen());
@@ -700,6 +717,7 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn add_sticky_tile(&mut self, mut tile: Tile<W>, activate: bool) {
         tile.restore_to_floating = true;
+        self.enter_output_for_sticky_window(tile.window());
         self.sticky.add_tile(tile, activate);
         if activate {
             self.active_space = ActiveSpace::Sticky;
@@ -713,6 +731,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         let mut removed = self.sticky.remove_tile(window);
         removed.is_sticky = true;
+        removed.tile.window().output_leave(&self.output);
         if self.active_space == ActiveSpace::Sticky && self.sticky.active_window().is_none() {
             self.active_space = ActiveSpace::Workspace;
         }
@@ -746,6 +765,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         if activate {
             self.activate_workspace(workspace_idx);
+            self.focus_workspace();
         }
     }
 
@@ -764,6 +784,7 @@ impl<W: LayoutElement> Monitor<W> {
     ) {
         let (mut workspace_idx, target) = self.resolve_add_window_target(target);
 
+        let id = tile.window().id().clone();
         let workspace = &mut self.workspaces[workspace_idx];
 
         workspace.add_tile(
@@ -794,6 +815,16 @@ impl<W: LayoutElement> Monitor<W> {
         if allow_to_activate_workspace && activate.map_smart(|| false) {
             self.activate_workspace(workspace_idx);
         }
+
+        // If the new window got focus on the active workspace, it takes focus away from sticky.
+        if activate != ActivateWindow::No
+            && workspace_idx == self.active_workspace_idx
+            && self.workspaces[workspace_idx]
+                .active_window()
+                .is_some_and(|win| win.id() == &id)
+        {
+            self.focus_workspace();
+        }
     }
 
     pub fn add_tile_to_column(
@@ -820,6 +851,10 @@ impl<W: LayoutElement> Monitor<W> {
 
         if allow_to_activate_workspace && activate {
             self.activate_workspace(workspace_idx);
+        }
+
+        if activate && workspace_idx == self.active_workspace_idx {
+            self.focus_workspace();
         }
     }
 
@@ -1278,17 +1313,20 @@ impl<W: LayoutElement> Monitor<W> {
             .as_ref()
             .and_then(|hint| hint.workspace.existing_id());
 
+        let sticky_active = is_active && self.active_space == ActiveSpace::Sticky;
+        // When a sticky window is focused, workspace windows are not active.
+        let ws_active = is_active && !sticky_active;
+
         for ws in &mut self.workspaces {
-            ws.update_render_elements(is_active, RenderLayer::MovingBetweenWorkspaces);
+            ws.update_render_elements(ws_active, RenderLayer::MovingBetweenWorkspaces);
         }
 
-        let sticky_active = is_active && self.active_space == ActiveSpace::Sticky;
         let view_rect = Rectangle::from_size(self.view_size);
         self.sticky
             .update_render_elements(sticky_active, view_rect, RenderLayer::Normal);
 
         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
-            ws.update_render_elements(is_active, RenderLayer::Normal);
+            ws.update_render_elements(ws_active, RenderLayer::Normal);
 
             if Some(ws.id()) == insert_hint_ws_id {
                 insert_hint_ws_geo = Some(geo);
@@ -1399,7 +1437,7 @@ impl<W: LayoutElement> Monitor<W> {
             self.view_size,
             self.working_area,
             self.scale.fractional_scale(),
-            options.clone(),
+            sticky_options(&options, self.scale.fractional_scale()),
         );
 
         self.insert_hint_element
@@ -1439,8 +1477,14 @@ impl<W: LayoutElement> Monitor<W> {
             self.view_size,
             self.working_area,
             self.scale.fractional_scale(),
-            self.options.clone(),
+            sticky_options(&self.options, self.scale.fractional_scale()),
         );
+
+        // Workspaces resend these to their windows; do the same for sticky windows.
+        for tile in self.sticky.tiles() {
+            tile.window()
+                .set_preferred_scale_transform(self.scale, self.output.current_transform());
+        }
 
         for ws in &mut self.workspaces {
             ws.update_output_size();
@@ -1780,27 +1824,42 @@ impl<W: LayoutElement> Monitor<W> {
             .find_map(|(ws, geo)| geo.contains(pos_within_output).then_some(ws))
     }
 
-    pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
-        let (ws, geo) = self.workspace_under(pos_within_output)?;
-
-        let in_overview = self.overview_progress.is_some();
-        let zoom = self.overview_zoom();
-        let pos_within_workspace = if in_overview {
-            (pos_within_output - geo.loc).downscale(zoom)
-        } else {
-            pos_within_output - geo.loc
-        };
-
-        if let Some((win, hit)) = self.sticky.window_under(pos_within_workspace) {
-            let hit = if in_overview {
-                hit.to_activate()
-            } else {
-                hit.offset_win_pos(geo.loc)
-            };
-            return Some((win, hit));
+    /// Returns the geometry that sticky windows are rendered in at the given position.
+    ///
+    /// Outside the overview, sticky windows are rendered once at the monitor origin, independent
+    /// of workspace switches. In the overview, they are rendered on every workspace.
+    pub fn sticky_render_geo(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Rectangle<f64, Logical> {
+        let origin = Rectangle::from_size(self.view_size);
+        if self.overview_progress.is_none() {
+            return origin;
         }
 
+        self.workspace_under(pos_within_output)
+            .map_or(origin, |(_, geo)| geo)
+    }
+
+    pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        let in_overview = self.overview_progress.is_some();
+
+        if !in_overview {
+            if let Some(hit) = self.sticky.window_under(pos_within_output) {
+                return Some(hit);
+            }
+        }
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+
+        let zoom = self.overview_zoom();
+
         if in_overview {
+            let pos_within_workspace = (pos_within_output - geo.loc).downscale(zoom);
+            if let Some((win, hit)) = self.sticky.window_under(pos_within_workspace) {
+                return Some((win, hit.to_activate()));
+            }
+
             let (win, hit) = ws.window_under(pos_within_workspace)?;
             // During the overview animation, we cannot do input hits because we cannot really
             // represent scaled windows properly.
@@ -1816,12 +1875,13 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
-        let (ws, geo) = self.workspace_under(pos_within_output)?;
-        let pos_within_workspace = pos_within_output - geo.loc;
-        if let Some(edges) = self.sticky.resize_edges_under(pos_within_workspace) {
+        // Outside the overview, sticky windows are at the monitor origin.
+        if let Some(edges) = self.sticky.resize_edges_under(pos_within_output) {
             return Some(edges);
         }
-        ws.resize_edges_under(pos_within_workspace)
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+        ws.resize_edges_under(pos_within_output - geo.loc)
     }
 
     pub(super) fn insert_position(
@@ -1977,6 +2037,30 @@ impl<W: LayoutElement> Monitor<W> {
                         Size::from((i32::MAX, i32::MAX)),
                     )
                 };
+
+            // Outside the overview, sticky windows don't move with workspace switches, so render
+            // them once at the monitor origin rather than on every visible workspace.
+            if pass == 0 && self.overview_progress.is_none() {
+                if !self.sticky.is_empty() {
+                    let geo = Rectangle::from_size(self.view_size);
+                    let sticky_focus_ring = focus_ring && self.active_space == ActiveSpace::Sticky;
+                    self.sticky.render(
+                        ctx.r(),
+                        XrayPos::new(geo.loc, zoom),
+                        geo,
+                        sticky_focus_ring,
+                        RenderLayer::Normal,
+                        &mut |elem| {
+                            let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                            if let Some(elem) = elem {
+                                let elem = MonitorInnerRenderElement::from(elem);
+                                push(scale_relocate(geo, elem));
+                            }
+                        },
+                    );
+                }
+                continue;
+            }
 
             for (ws, geo) in self.workspaces_with_render_geo_cull(cull) {
                 // Macro instead of closure because ws and insert hint have different elem types.

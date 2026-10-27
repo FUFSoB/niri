@@ -1,5 +1,6 @@
 use std::cmp::{max, min};
 use std::iter::{self, zip};
+use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -56,6 +57,11 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// Whether the stored view offset is relative to the active column or an absolute view
     /// position chosen by the user.
     view_offset_mode: ViewOffsetMode,
+
+    /// Whether the view was in manual mode before the ongoing DnD scroll gesture began.
+    ///
+    /// Used to go back to the manual view position if the DnD didn't end up scrolling.
+    dnd_scroll_restore_manual_view: bool,
 
     /// How manual view behaves when focus changes.
     view_focus_mode: WorkspaceViewFocusMode,
@@ -115,6 +121,15 @@ niri_render_elements! {
 struct ColumnData {
     /// Cached actual column width.
     width: f64,
+}
+
+/// Column state captured before a column mutation, see `sync_column_after_size_change()`.
+#[derive(Debug, Clone, Copy)]
+struct ColumnSizeState {
+    width: f64,
+    origin: Point<f64, Logical>,
+    was_normal: bool,
+    manual_view_pos: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -348,6 +363,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             interactive_resize: None,
             view_offset: ViewOffset::Static(0.),
             view_offset_mode: ViewOffsetMode::Auto,
+            dnd_scroll_restore_manual_view: false,
             view_focus_mode: WorkspaceViewFocusMode::Window,
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
@@ -1507,6 +1523,103 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         self.restore_manual_view_pos_if_needed(manual_view_pos);
+    }
+
+    fn column_size_state(&self, col_idx: usize) -> ColumnSizeState {
+        let column = &self.columns[col_idx];
+        ColumnSizeState {
+            width: self.data[col_idx].width,
+            origin: column.tiles_origin(),
+            was_normal: column.sizing_mode().is_normal(),
+            manual_view_pos: self.manual_view_pos_to_restore(),
+        }
+    }
+
+    /// Applies the column changes that `update_window()` applies on commit.
+    ///
+    /// Some layout elements, such as window mirrors, apply size requests synchronously and never
+    /// commit, so this must run right after mutating a column. For regular windows, the column
+    /// size doesn't change until they commit, so this does nothing.
+    fn sync_column_after_size_change(&mut self, col_idx: usize, prev: ColumnSizeState) {
+        let column = &mut self.columns[col_idx];
+        self.data[col_idx].update(column);
+
+        let offset = prev.width - self.data[col_idx].width;
+        let is_normal = column.sizing_mode().is_normal();
+        let origin_delta = prev.origin - column.tiles_origin();
+        if offset == 0. && prev.was_normal == is_normal && origin_delta == Point::new(0., 0.) {
+            return;
+        }
+
+        // Move other columns in tandem with resizing, like update_window().
+        let ongoing_resize_anim = column
+            .tiles
+            .iter()
+            .any(|tile| tile.resize_animation().is_some());
+        if offset != 0. {
+            let columns = if self.active_column_idx <= col_idx {
+                &mut self.columns[col_idx + 1..]
+            } else {
+                &mut self.columns[..=col_idx]
+            };
+            let offset = if self.active_column_idx <= col_idx {
+                offset
+            } else {
+                -offset
+            };
+            for col in columns {
+                if ongoing_resize_anim {
+                    col.animate_move_x_from_with_config(
+                        offset,
+                        self.options.animations.window_resize.anim,
+                    );
+                } else {
+                    col.offset_move_anim_current(offset);
+                }
+            }
+        }
+
+        if origin_delta != Point::new(0., 0.) {
+            for (tile, _pos) in self.columns[col_idx].tiles_mut() {
+                tile.animate_move_from(origin_delta);
+            }
+        }
+
+        // Only the active column anchors the view.
+        if col_idx == self.active_column_idx {
+            if prev.was_normal && !is_normal {
+                self.view_offset_to_restore = if self.is_manual_view_active() {
+                    None
+                } else {
+                    Some(self.view_offset.stationary())
+                };
+            }
+
+            let unfullscreen_offset = if !prev.was_normal && is_normal {
+                self.view_offset_to_restore.take()
+            } else {
+                None
+            };
+
+            if self.interactive_resize.is_none()
+                && !self.view_offset.is_gesture()
+                && !self.is_manual_view_active()
+            {
+                let config = if ongoing_resize_anim {
+                    self.options.animations.window_resize.anim
+                } else {
+                    self.options.animations.horizontal_view_movement.0
+                };
+
+                if let Some(prev_offset) = unfullscreen_offset {
+                    self.animate_view_offset_with_config(col_idx, prev_offset, config);
+                }
+
+                self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+            }
+        }
+
+        self.restore_manual_view_pos_if_needed(prev.manual_view_pos);
     }
 
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
@@ -2920,10 +3033,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let col = &mut self.columns[self.active_column_idx];
+        let col_idx = self.active_column_idx;
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
         col.toggle_width(None, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn toggle_full_width(&mut self) {
@@ -2931,10 +3047,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let col = &mut self.columns[self.active_column_idx];
+        let col_idx = self.active_column_idx;
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
         col.toggle_full_width();
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn toggle_full_width_for_window(&mut self, window: &W::Id) {
@@ -2942,12 +3061,45 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let Some(col) = self.columns.iter_mut().find(|col| col.contains(window)) else {
+        let Some(col_idx) = self.columns.iter().position(|col| col.contains(window)) else {
             return;
         };
 
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
         col.toggle_full_width();
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
+    }
+
+    /// Sets the stored width of the column containing the window, leaving its maximized and
+    /// fullscreen state alone.
+    pub fn set_window_column_width_state(
+        &mut self,
+        window: &W::Id,
+        width: ColumnWidth,
+        is_full_width: bool,
+    ) {
+        let Some(col_idx) = self.columns.iter().position(|col| col.contains(window)) else {
+            return;
+        };
+
+        let col = &self.columns[col_idx];
+        if col.width == width && col.is_full_width == is_full_width {
+            return;
+        }
+
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
+        if col.width != width {
+            col.width = width;
+            col.preset_width_idx = None;
+        }
+        col.is_full_width = is_full_width;
+        col.update_tile_sizes(true);
+
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
@@ -2955,23 +3107,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
+        let (col_idx, tile_idx) = if let Some(window) = window {
             self.columns
-                .iter_mut()
-                .find_map(|col| {
+                .iter()
+                .enumerate()
+                .find_map(|(col_idx, col)| {
                     col.tiles
                         .iter()
                         .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
+                        .map(|tile_idx| (col_idx, Some(tile_idx)))
                 })
                 .unwrap()
         } else {
-            (&mut self.columns[self.active_column_idx], None)
+            (self.active_column_idx, None)
         };
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         col.set_column_width(change, tile_idx, true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
@@ -2979,23 +3135,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
+        let (col_idx, tile_idx) = if let Some(window) = window {
             self.columns
-                .iter_mut()
-                .find_map(|col| {
+                .iter()
+                .enumerate()
+                .find_map(|(col_idx, col)| {
                     col.tiles
                         .iter()
                         .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
+                        .map(|tile_idx| (col_idx, Some(tile_idx)))
                 })
                 .unwrap()
         } else {
-            (&mut self.columns[self.active_column_idx], None)
+            (self.active_column_idx, None)
         };
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         col.set_window_height(change, tile_idx, true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
@@ -3003,23 +3163,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
+        let (col_idx, tile_idx) = if let Some(window) = window {
             self.columns
-                .iter_mut()
-                .find_map(|col| {
+                .iter()
+                .enumerate()
+                .find_map(|(col_idx, col)| {
                     col.tiles
                         .iter()
                         .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
+                        .map(|tile_idx| (col_idx, Some(tile_idx)))
                 })
                 .unwrap()
         } else {
-            (&mut self.columns[self.active_column_idx], None)
+            (self.active_column_idx, None)
         };
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         col.reset_window_height(tile_idx);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn set_window_height_state(&mut self, window: &W::Id, height: WindowHeight) {
@@ -3027,24 +3191,35 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let Some((col, tile_idx)) = self.columns.iter_mut().find_map(|col| {
+        let Some((col_idx, tile_idx)) = self.columns.iter().enumerate().find_map(|(idx, col)| {
             col.tiles
                 .iter()
                 .position(|tile| tile.window().id() == window)
-                .map(|tile_idx| (col, tile_idx))
+                .map(|tile_idx| (idx, tile_idx))
         }) else {
             return;
         };
 
-        if !matches!(height, WindowHeight::Auto { .. }) {
+        if self.columns[col_idx].data[tile_idx].height == height {
+            return;
+        }
+
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
+        // Only one window in the column can be non-auto-height. Like set_window_height(), keep
+        // the other weights if this window is already non-auto.
+        if !matches!(height, WindowHeight::Auto { .. })
+            && matches!(col.data[tile_idx].height, WindowHeight::Auto { .. })
+        {
             col.convert_heights_to_auto();
         }
 
+        // This only sets the stored height; the maximized state is managed separately.
         col.data[tile_idx].height = height;
-        col.is_pending_maximized = false;
         col.update_tile_sizes(true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
@@ -3052,23 +3227,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
+        let (col_idx, tile_idx) = if let Some(window) = window {
             self.columns
-                .iter_mut()
-                .find_map(|col| {
+                .iter()
+                .enumerate()
+                .find_map(|(col_idx, col)| {
                     col.tiles
                         .iter()
                         .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
+                        .map(|tile_idx| (col_idx, Some(tile_idx)))
                 })
                 .unwrap()
         } else {
-            (&mut self.columns[self.active_column_idx], None)
+            (self.active_column_idx, None)
         };
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         col.toggle_width(tile_idx, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
@@ -3076,23 +3255,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
+        let (col_idx, tile_idx) = if let Some(window) = window {
             self.columns
-                .iter_mut()
-                .find_map(|col| {
+                .iter()
+                .enumerate()
+                .find_map(|(col_idx, col)| {
                     col.tiles
                         .iter()
                         .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
+                        .map(|tile_idx| (col_idx, Some(tile_idx)))
                 })
                 .unwrap()
         } else {
-            (&mut self.columns[self.active_column_idx], None)
+            (self.active_column_idx, None)
         };
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         col.toggle_window_height(tile_idx, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.sync_column_after_size_change(col_idx, prev);
     }
 
     pub fn expand_column_to_available_width(&mut self) {
@@ -3112,9 +3295,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // logic here that computes the width in such a way so as to leave nearby columns fully
             // on screen while taking into account that the active column will remain centered
             // after resizing. But I'm not sure it's that useful? So let's do the simple thing.
-            let col = &mut self.columns[self.active_column_idx];
+            let col_idx = self.active_column_idx;
+            let prev = self.column_size_state(col_idx);
+            let col = &mut self.columns[col_idx];
             col.toggle_full_width();
             cancel_resize_for_column(&mut self.interactive_resize, col);
+            self.sync_column_after_size_change(col_idx, prev);
             return;
         }
 
@@ -3162,7 +3348,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let col = &mut self.columns[self.active_column_idx];
+        let col_idx = self.active_column_idx;
+        let prev = self.column_size_state(col_idx);
+        let col = &mut self.columns[col_idx];
 
         let available_width = working_w - gap - width_taken - col.extra_size().w;
         if available_width <= 0. {
@@ -3177,6 +3365,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // about to set its width to 100% of the working area. Let's do it via
             // toggle_full_width() as it lets you back out of it more intuitively.
             col.toggle_full_width();
+            self.sync_column_after_size_change(col_idx, prev);
             self.restore_manual_view_pos_if_needed(manual_view_pos);
             return;
         }
@@ -3186,6 +3375,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.preset_width_idx = None;
         col.is_full_width = false;
         col.update_tile_sizes(true);
+        self.sync_column_after_size_change(col_idx, prev);
 
         // Put the leftmost window into the view.
         if manual_view_pos.is_some() {
@@ -3229,15 +3419,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap();
         let prev_window_size = col.tiles[tile_idx].window().size();
         let prev_sizing_mode = col.tiles[tile_idx].window().sizing_mode();
+        let mut prev = self.column_size_state(col_idx);
+        prev.manual_view_pos = manual_view_pos;
+        let col = &mut self.columns[col_idx];
         col.set_fullscreen(is_fullscreen);
         let sync_resize_applied = col.tiles[tile_idx].window().size() != prev_window_size
             || col.tiles[tile_idx].window().sizing_mode() != prev_sizing_mode;
 
-        // With place_within_column, the tab indicator changes the column size immediately.
-        self.data[col_idx].update(col);
-        self.restore_manual_view_pos_if_needed(manual_view_pos);
-        if sync_resize_applied && manual_view_pos.is_none() {
-            self.animate_view_offset_to_column(None, col_idx, None);
+        if sync_resize_applied {
+            // Mirrors resize right away, so do what update_window() would do on commit.
+            self.sync_column_after_size_change(col_idx, prev);
+        } else {
+            // With place_within_column, the tab indicator changes the column size immediately.
+            self.data[col_idx].update(col);
+            self.restore_manual_view_pos_if_needed(manual_view_pos);
         }
 
         true
@@ -3274,15 +3469,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap();
         let prev_window_size = col.tiles[tile_idx].window().size();
         let prev_sizing_mode = col.tiles[tile_idx].window().sizing_mode();
+        let mut prev = self.column_size_state(col_idx);
+        prev.manual_view_pos = manual_view_pos;
+        let col = &mut self.columns[col_idx];
         col.set_maximized(maximize);
         let sync_resize_applied = col.tiles[tile_idx].window().size() != prev_window_size
             || col.tiles[tile_idx].window().sizing_mode() != prev_sizing_mode;
 
-        // With place_within_column, the tab indicator changes the column size immediately.
-        self.data[col_idx].update(col);
-        self.restore_manual_view_pos_if_needed(manual_view_pos);
-        if sync_resize_applied && manual_view_pos.is_none() {
-            self.animate_view_offset_to_column(None, col_idx, None);
+        if sync_resize_applied {
+            // Mirrors resize right away, so do what update_window() would do on commit.
+            self.sync_column_after_size_change(col_idx, prev);
+        } else {
+            // With place_within_column, the tab indicator changes the column size immediately.
+            self.data[col_idx].update(col);
+            self.restore_manual_view_pos_if_needed(manual_view_pos);
         }
 
         true
@@ -3478,6 +3678,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        self.dnd_scroll_restore_manual_view =
+            self.is_manual_view_active() && !self.columns.is_empty();
         self.convert_manual_view_to_auto();
 
         let gesture = ViewGesture {
@@ -4011,6 +4213,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn dnd_scroll_gesture_end(&mut self) {
+        let restore_manual_view = mem::take(&mut self.dnd_scroll_restore_manual_view);
+
         let ViewOffset::Gesture(gesture) = &mut self.view_offset else {
             return;
         };
@@ -4028,7 +4232,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 self.view_offset = ViewOffset::Static(gesture.delta_from_tracker);
             }
 
-            if !self.columns.is_empty() {
+            if self.columns.is_empty() {
+                return;
+            }
+
+            if restore_manual_view {
+                // The view was in manual mode before the DnD, so go back to it.
+                self.set_manual_view_pos(self.target_view_pos());
+            } else {
                 // Just in case, make sure the active window remains on screen.
                 self.animate_view_offset_to_column(None, self.active_column_idx, None);
             }
@@ -4176,8 +4387,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 return;
             }
 
-            // Animate the active window into view right away.
-            if self.columns[self.active_column_idx].contains(window) {
+            // Animate the active window into view right away. In manual view mode the view
+            // offset is an absolute position that must be left alone.
+            if !self.is_manual_view_active()
+                && self.columns[self.active_column_idx].contains(window)
+            {
                 self.animate_view_offset_to_column(None, self.active_column_idx, None);
             }
         }

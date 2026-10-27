@@ -1294,6 +1294,18 @@ impl Tty {
             return Ok(());
         }
 
+        // Virtual output names can't match existing DRM connectors, but a connector may still
+        // appear later (e.g. on a newly added device). Outputs must have unique names, so leave
+        // the connector disabled while a virtual output with the same name exists.
+        if self
+            .virtual_outputs
+            .outputs
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&connector_name))
+        {
+            bail!("a virtual output named {connector_name} already exists");
+        }
+
         let config = self
             .config
             .borrow()
@@ -2329,7 +2341,7 @@ impl Tty {
             let logical = niri
                 .global_space
                 .outputs()
-                .find(|o| o.name() == *name)
+                .find(|o| *o == output)
                 .map(logical_output);
 
             let physical_properties = output.physical_properties();
@@ -2413,10 +2425,22 @@ impl Tty {
         let mut refresh_millihz = refresh_rate.saturating_mul(1000);
         let mut should_connect = true;
 
+        // Also reserve the names of all DRM connectors, including currently disconnected ones, so
+        // that a monitor plugged in later doesn't end up with the same name as a virtual output.
+        let connector_names = self
+            .devices
+            .values()
+            .flat_map(|device| device.drm_scanner.connectors().values())
+            .map(format_connector_name)
+            .collect::<Vec<_>>();
+
         if let Some(name) = name.as_deref() {
-            if name.trim().is_empty() {
-                return Err("virtual output name cannot be empty".to_string());
-            }
+            virtual_output::check_virtual_output_name(
+                niri,
+                &self.virtual_outputs.outputs,
+                connector_names.iter().map(String::as_str),
+                name,
+            )?;
 
             let lookup_name = niri_config::OutputName {
                 connector: name.to_string(),
@@ -2437,12 +2461,6 @@ impl Tty {
                         (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
                 }
             }
-
-            if self.virtual_outputs.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
-            {
-                return Err(format!("output '{name}' already exists"));
-            }
         }
 
         let built = virtual_output::build_headless_virtual_output(
@@ -2453,11 +2471,12 @@ impl Tty {
             name,
         );
 
-        if self.virtual_outputs.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
-        {
-            return Err(format!("output '{}' already exists", built.name));
-        }
+        virtual_output::check_virtual_output_name(
+            niri,
+            &self.virtual_outputs.outputs,
+            connector_names.iter().map(String::as_str),
+            &built.name,
+        )?;
 
         self.ipc_outputs
             .lock()
@@ -2472,10 +2491,24 @@ impl Tty {
             niri.add_output(built.output, Some(built.refresh_interval), false);
         }
 
+        // Apply the output config right away. The lookup above only handles explicitly named
+        // outputs, but the generated HEADLESS-N name may have a config section too.
+        let config = self.config.clone();
+        virtual_output::apply_config_to_managed_virtual_outputs(
+            niri,
+            &mut self.virtual_outputs.outputs,
+            None,
+            &config,
+        );
+
         // Ensure IPC reflects the configured mode immediately.
         self.refresh_ipc_outputs(niri);
 
         Ok(built.name)
+    }
+
+    pub fn virtual_output(&self, name: &str) -> Option<Output> {
+        virtual_output::find_virtual_output(&self.virtual_outputs.outputs, name)
     }
 
     pub fn remove_virtual_output(&mut self, niri: &mut Niri, name: &str) -> Result<(), String> {

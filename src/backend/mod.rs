@@ -122,7 +122,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
             Backend::Winit(winit) => winit.render(niri, output),
-            Backend::Headless(headless) => headless.render(niri, output),
+            Backend::Headless(headless) => headless.render(niri, output, target_presentation_time),
         }
     }
 
@@ -280,6 +280,17 @@ impl Backend {
             Backend::Winit(_) => {
                 Err("virtual outputs are not supported on the Winit backend".to_string())
             }
+        }
+    }
+
+    /// Returns the managed virtual output with the given name (matched case-insensitively).
+    ///
+    /// Virtual outputs are tracked even while disconnected (`off`).
+    pub fn virtual_output(&self, name: &str) -> Option<Output> {
+        match self {
+            Backend::Headless(headless) => headless.virtual_output(name),
+            Backend::Tty(tty) => tty.virtual_output(name),
+            Backend::Winit(_) => None,
         }
     }
 

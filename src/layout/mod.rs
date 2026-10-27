@@ -295,8 +295,8 @@ pub trait LayoutElement {
     fn set_sticky(&mut self, sticky: bool);
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
-    fn effective_cursor_capture(&self) -> bool {
-        self.rules().cursor_capture.unwrap_or(false)
+    fn effective_cursor_capture_rule(&self) -> Option<bool> {
+        self.rules().cursor_capture
     }
     fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
         self.rules().block_out_from
@@ -435,6 +435,10 @@ pub struct Layout<W: LayoutElement> {
     /// The workspace id does not necessarily point to a valid workspace. If it doesn't, then it is
     /// simply ignored.
     last_active_workspace_id: HashMap<String, WorkspaceId>,
+    /// Sticky windows that were moved to a workspace when the last output was removed.
+    ///
+    /// They are made sticky again when an output is connected.
+    sticky_without_outputs: Vec<W::Id>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
@@ -624,7 +628,10 @@ pub(super) enum StickyRestorePosition {
 pub(super) struct StickyRestoreInfo<WindowId> {
     workspace_id: WorkspaceId,
     position: StickyRestorePosition,
-    next_to: Option<WindowId>,
+    /// Another window that shared the tiling column, if any.
+    ///
+    /// The window is restored into this window's column if it's still around.
+    column_mate: Option<WindowId>,
 }
 
 #[derive(Debug, Clone)]
@@ -643,10 +650,16 @@ pub(super) struct MirrorSourceSnapshot<WindowId> {
 }
 
 impl<WindowId> MirrorSourceSnapshot<WindowId> {
-    fn width_as_preset_size(&self) -> Option<PresetSize> {
+    /// Converts the column width into a window width preset.
+    ///
+    /// `ColumnWidth::Fixed` includes the borders while `PresetSize::Fixed` is the window width,
+    /// so `border_width` (zero when borders are off) is subtracted for fixed widths.
+    fn width_as_preset_size(&self, border_width: f64) -> Option<PresetSize> {
         self.width.map(|width| match width {
             ColumnWidth::Proportion(proportion) => PresetSize::Proportion(proportion),
-            ColumnWidth::Fixed(fixed) => PresetSize::Fixed(fixed.round() as i32),
+            ColumnWidth::Fixed(fixed) => {
+                PresetSize::Fixed((fixed - border_width * 2.).round().max(1.) as i32)
+            }
         })
     }
 }
@@ -679,13 +692,6 @@ impl LinkedMirrorStateSnapshot {
             self.placement,
             LinkedMirrorPlacementSnapshot::Floating { .. }
         )
-    }
-
-    fn tiled_is_full_width(&self) -> Option<bool> {
-        match self.placement {
-            LinkedMirrorPlacementSnapshot::Floating { .. } => None,
-            LinkedMirrorPlacementSnapshot::Tiling { is_full_width, .. } => Some(is_full_width),
-        }
     }
 }
 
@@ -1389,6 +1395,7 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces: vec![] },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            sticky_without_outputs: Vec::new(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -1419,6 +1426,7 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            sticky_without_outputs: Vec::new(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -1539,6 +1547,20 @@ impl<W: LayoutElement> Layout<W> {
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
 
+                // Make windows that were sticky before the last output was removed sticky again.
+                let sticky_ids = mem::take(&mut self.sticky_without_outputs);
+                if !sticky_ids.is_empty() {
+                    for id in &sticky_ids {
+                        let Some(ws) = monitor.workspaces.iter_mut().find(|ws| ws.has_window(id))
+                        else {
+                            continue;
+                        };
+                        let removed = ws.remove_tile(id, Transaction::new());
+                        monitor.add_sticky_tile(removed.tile, false);
+                    }
+                    monitor.clean_up_workspaces();
+                }
+
                 MonitorSet::Normal {
                     monitors: vec![monitor],
                     primary_idx: 0,
@@ -1576,9 +1598,8 @@ impl<W: LayoutElement> Layout<W> {
                         ws.update_config(self.options.clone());
                     }
 
-                    if workspaces.is_empty()
-                        && !(self.interactive_move.is_some() && sticky_tiles.is_empty())
-                    {
+                    // Sticky tiles need a workspace to live on.
+                    if workspaces.is_empty() && !sticky_tiles.is_empty() {
                         workspaces.push(Workspace::new_no_outputs(
                             self.clock.clone(),
                             self.options.clone(),
@@ -1586,6 +1607,11 @@ impl<W: LayoutElement> Layout<W> {
                     }
 
                     if !sticky_tiles.is_empty() {
+                        self.sticky_without_outputs = sticky_tiles
+                            .iter()
+                            .map(|tile| tile.window().id().clone())
+                            .collect();
+
                         let ws = &mut workspaces[0];
                         for tile in sticky_tiles {
                             let width = ColumnWidth::Fixed(tile.tile_expected_or_current_size().w);
@@ -1874,10 +1900,17 @@ impl<W: LayoutElement> Layout<W> {
         let snapshot = self.mirror_source_snapshot(source).unwrap();
         let id = window.id().clone();
 
+        let border = self
+            .options
+            .layout
+            .border
+            .merged_with(&window.rules().border);
+        let border_width = if border.off { 0. } else { border.width };
+
         self.add_window(
             window,
             target,
-            snapshot.width_as_preset_size(),
+            snapshot.width_as_preset_size(border_width),
             None,
             snapshot.is_full_width,
             snapshot.is_floating,
@@ -1885,6 +1918,10 @@ impl<W: LayoutElement> Layout<W> {
             activate,
         );
 
+        // Carry the exact column width over, the preset above may be off by rounding.
+        if let Some(width) = snapshot.width {
+            self.set_window_column_width_state(&id, width, snapshot.is_full_width);
+        }
         if let Some(height) = snapshot.height {
             self.set_window_height_state(&id, height);
         }
@@ -2346,6 +2383,12 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         mon.update_output_size();
+
+        // Keep the zoom focal point within the resized output.
+        let size = mon.view_size();
+        let focal = &mut mon.zoom_state.focal;
+        focal.x = focal.x.clamp(0., (size.w - f64::EPSILON).max(0.));
+        focal.y = focal.y.clamp(0., (size.h - f64::EPSILON).max(0.));
     }
 
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
@@ -2522,6 +2565,12 @@ impl<W: LayoutElement> Layout<W> {
 
         let mon = &monitors[*active_monitor_idx];
         Some(&mon.workspaces[mon.active_workspace_idx])
+    }
+
+    /// Like active_workspace_mut(), but doesn't move focus away from sticky windows.
+    fn active_workspace_mut_keep_focus(&mut self) -> Option<&mut Workspace<W>> {
+        let mon = self.active_monitor()?;
+        Some(&mut mon.workspaces[mon.active_workspace_idx])
     }
 
     pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace<W>> {
@@ -3121,6 +3170,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
+        // Sticky windows are on every workspace already.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
@@ -3128,6 +3185,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_column_to_workspace_down(&mut self, activate: bool) {
+        // Sticky windows are on every workspace already.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
@@ -3135,6 +3200,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_column_to_workspace(&mut self, idx: usize, activate: bool) {
+        // Sticky windows are on every workspace already.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
@@ -4206,6 +4279,14 @@ impl<W: LayoutElement> Layout<W> {
             .then(|| self.linked_mirror_sync_root_for_focus())
             .flatten();
 
+        // Like toggle_window_width(), this doesn't apply to sticky windows.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
@@ -4337,6 +4418,14 @@ impl<W: LayoutElement> Layout<W> {
             .then(|| self.linked_mirror_sync_root_for_focus())
             .flatten();
 
+        // Sticky windows have no column.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
@@ -4358,6 +4447,14 @@ impl<W: LayoutElement> Layout<W> {
         let sync_root = (!self.applying_linked_mirror_sync)
             .then(|| self.linked_mirror_sync_root_for_focus())
             .flatten();
+
+        // Like set_window_width(), this doesn't apply to sticky windows.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
 
         let Some(workspace) = self.active_workspace_mut() else {
             return;
@@ -4562,6 +4659,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn expand_column_to_available_width(&mut self) {
+        // Sticky windows have no column.
+        if self
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.sticky_is_active())
+        {
+            return;
+        }
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
@@ -4569,7 +4674,9 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_window_floating(&mut self, window: Option<&W::Id>) {
-        if !self.applying_linked_mirror_sync {
+        // Floating toggles of an interactively moved linked mirror apply to the move itself, and
+        // propagate to the real window when the move ends.
+        if !self.applying_linked_mirror_sync && !self.targets_interactively_moved_window(window) {
             let routed = if let Some(window) = window {
                 self.linked_mirror_real_target(window)
             } else {
@@ -4765,44 +4872,39 @@ impl<W: LayoutElement> Layout<W> {
             };
 
             let restore_position = restore_info.as_ref().map(|info| info.position.clone());
-            let restore_next_to = restore_info.as_ref().and_then(|info| info.next_to.clone());
+            let restore_column_mate = restore_info
+                .as_ref()
+                .and_then(|info| info.column_mate.clone());
 
             match restore_position {
                 Some(StickyRestorePosition::Tiling {
                     column_idx,
                     tile_idx,
                 }) => {
-                    let target_col_len = monitors[target_mon_idx].workspaces[target_ws_idx]
-                        .tiling_column_len(column_idx);
+                    let target_ws = &monitors[target_mon_idx].workspaces[target_ws_idx];
+                    // Only go back into a column if the window shared it with another window that
+                    // is still there; otherwise we'd stack it into an unrelated column.
+                    let mate_column = restore_column_mate
+                        .as_ref()
+                        .and_then(|mate| target_ws.tiling_column_idx_of(mate))
+                        .and_then(|idx| Some((idx, target_ws.tiling_column_len(idx)?)));
+                    let column_count = target_ws.scrolling().columns().count();
 
-                    if let Some(col_len) = target_col_len {
+                    if let Some((mate_column_idx, col_len)) = mate_column {
                         monitors[target_mon_idx].add_tile_to_column(
                             target_ws_idx,
-                            column_idx,
+                            mate_column_idx,
                             Some(tile_idx.min(col_len)),
                             removed.tile,
                             activate,
                             true,
-                        );
-                    } else if let Some(next_to) = restore_next_to.as_ref().filter(|next_to| {
-                        monitors[target_mon_idx].workspaces[target_ws_idx].has_window(next_to)
-                    }) {
-                        monitors[target_mon_idx].add_tile(
-                            removed.tile,
-                            MonitorAddWindowTarget::NextTo(next_to),
-                            activate_window,
-                            true,
-                            removed.width,
-                            removed.is_full_width,
-                            false,
-                            None,
                         );
                     } else {
                         monitors[target_mon_idx].add_tile(
                             removed.tile,
                             MonitorAddWindowTarget::Workspace {
                                 id: target_ws_id,
-                                column_idx: Some(column_idx),
+                                column_idx: Some(column_idx.min(column_count)),
                             },
                             activate_window,
                             true,
@@ -4862,7 +4964,7 @@ impl<W: LayoutElement> Layout<W> {
                 .unwrap_or(StickyRestoreInfo {
                     workspace_id: ws.id(),
                     position: StickyRestorePosition::Floating,
-                    next_to: None,
+                    column_mate: None,
                 });
 
         if !ws.is_floating(&target_id) {
@@ -4875,6 +4977,11 @@ impl<W: LayoutElement> Layout<W> {
 
         mon.add_sticky_tile(removed.tile, target_is_active);
 
+        // The window's workspace may have become empty.
+        if mon.workspace_switch.is_none() {
+            mon.clean_up_workspaces();
+        }
+
         if target_is_active {
             *active_monitor_idx = mon_idx;
         }
@@ -4885,7 +4992,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn set_window_floating(&mut self, window: Option<&W::Id>, floating: bool) {
-        if !self.applying_linked_mirror_sync {
+        if !self.applying_linked_mirror_sync && !self.targets_interactively_moved_window(window) {
             let routed = if let Some(window) = window {
                 self.linked_mirror_real_target(window)
             } else {
@@ -5163,15 +5270,6 @@ impl<W: LayoutElement> Layout<W> {
                         return;
                     };
                     removed.tile.stop_move_animations();
-                    removed
-                        .tile
-                        .window()
-                        .output_leave(&monitors[mon_idx].output);
-                    removed.tile.window().output_enter(output);
-                    removed.tile.window().set_preferred_scale_transform(
-                        output.current_scale(),
-                        output.current_transform(),
-                    );
 
                     let view_size = output_size(output);
                     let scale = output.current_scale().fractional_scale();
@@ -5286,9 +5384,10 @@ impl<W: LayoutElement> Layout<W> {
                 .unwrap();
 
             let current = &mut monitors[*active_monitor_idx];
+            let sticky_is_active = current.sticky_is_active();
             let ws = current.active_workspace();
 
-            if ws.floating_is_active() {
+            if sticky_is_active || ws.floating_is_active() {
                 self.move_to_output(None, output, None, ActivateWindow::Smart);
                 return;
             }
@@ -5897,18 +5996,21 @@ impl<W: LayoutElement> Layout<W> {
                 current_focal,
             );
 
-            let level_anim = ZoomLevelAnimation::new(
+            let mut level_anim = ZoomLevelAnimation::new(
                 mon.clock.clone(),
                 current_level,
                 target_level,
                 level_anim_config,
-            )
-            .with_cursor_tracking(
-                Some(cursor_local),
-                Some(output_size),
-                Some(*movement_mode),
-                on_edge_cursor_anchor,
             );
+            // A locked focal point must stay in place rather than follow the cursor.
+            if !locked {
+                level_anim = level_anim.with_cursor_tracking(
+                    Some(cursor_local),
+                    Some(output_size),
+                    Some(*movement_mode),
+                    on_edge_cursor_anchor,
+                );
+            }
             mon.zoom_transition.set_level_animation(level_anim);
         }
 
@@ -5946,6 +6048,9 @@ impl<W: LayoutElement> Layout<W> {
         let current_focal = mon
             .zoom_transition
             .current_focal(current_level, mon.zoom_state.focal);
+
+        // A locked focal point must stay in place rather than follow the cursor.
+        let cursor_local = cursor_local.filter(|_| !mon.zoom_state.locked);
 
         let on_edge_cursor_anchor = if let (Some(cursor), Some(size)) = (cursor_local, output_size)
         {
@@ -6142,10 +6247,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
 
                     let zoom = mon.overview_zoom();
-                    let ws_geo = mon
-                        .workspace_under(start_pos_within_output)
-                        .map(|(_, geo)| geo)
-                        .unwrap_or_else(|| Rectangle::from_size(mon.view_size()));
+                    let ws_geo = mon.sticky_render_geo(start_pos_within_output);
                     let (tile, tile_offset) = mon
                         .sticky
                         .tiles_with_render_positions()
@@ -6341,10 +6443,7 @@ impl<W: LayoutElement> Layout<W> {
                             .tiles_with_render_positions()
                             .find(|(tile, _)| tile.window().id() == window)
                         {
-                            let ws_geo = mon
-                                .workspace_under(pointer_pos_within_output)
-                                .map(|(_, geo)| geo)
-                                .unwrap_or_else(|| Rectangle::from_size(mon.view_size()));
+                            let ws_geo = mon.sticky_render_geo(pointer_pos_within_output);
                             tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
                         }
                     } else if let Some((ws, ws_geo)) = mon
@@ -6507,6 +6606,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn interactive_move_end(&mut self, window: &W::Id) {
+        let was_moving = self.targets_interactively_moved_window(Some(window));
+        self.interactive_move_end_inner(window);
+        if was_moving {
+            self.sync_linked_mirrors_after_interactive_move(window);
+        }
+    }
+
+    fn interactive_move_end_inner(&mut self, window: &W::Id) {
         if matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
             self.refresh_interactive_move_hint(None);
         }
@@ -6623,9 +6730,14 @@ impl<W: LayoutElement> Layout<W> {
                         (mon, zoom)
                     };
 
-                    let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                    let ws_geo = Self::project_insert_workspace_render_geo(mon, insert_ws, geo)
-                        .unwrap_or_else(|| Rectangle::from_size(mon.view_size()));
+                    let ws_geo = if self.overview_progress.is_some() {
+                        let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+                        Self::project_insert_workspace_render_geo(mon, insert_ws, geo)
+                            .unwrap_or_else(|| Rectangle::from_size(mon.view_size()))
+                    } else {
+                        // Outside the overview, sticky windows are at the monitor origin.
+                        Rectangle::from_size(mon.view_size())
+                    };
 
                     let tile_render_loc = move_.tile_render_location(zoom);
                     let mut tile = move_.tile;
@@ -7080,7 +7192,7 @@ impl<W: LayoutElement> Layout<W> {
         let ws = if let Some(reference) = reference {
             self.find_workspace_by_ref(reference)
         } else {
-            self.active_workspace_mut()
+            self.active_workspace_mut_keep_focus()
         };
         let Some(ws) = ws else {
             return;
@@ -7125,7 +7237,7 @@ impl<W: LayoutElement> Layout<W> {
         let ws = if let Some(reference) = reference {
             self.find_workspace_by_ref(reference)
         } else {
-            self.active_workspace_mut()
+            self.active_workspace_mut_keep_focus()
         };
         let Some(ws) = ws else {
             return;
@@ -7501,9 +7613,11 @@ impl<W: LayoutElement> Layout<W> {
                         mon.dnd_scroll_gesture_end();
                     }
 
+                    // When a sticky window is focused, workspace windows are not active.
+                    let ws_is_active = is_active && !mon.sticky_is_active();
                     for (ws_idx, ws) in mon.workspaces.iter_mut().enumerate() {
-                        let is_focused = is_active && ws_idx == mon.active_workspace_idx;
-                        ws.refresh(is_active, is_focused);
+                        let is_focused = ws_is_active && ws_idx == mon.active_workspace_idx;
+                        ws.refresh(ws_is_active, is_focused);
 
                         if let Some(is_scrolling) = ongoing_scrolling_dnd {
                             // Lock or unlock the view for scrolling interactive move.
@@ -7640,6 +7754,45 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    fn targets_interactively_moved_window(&self, window: Option<&W::Id>) -> bool {
+        self.interactive_move
+            .as_ref()
+            .and_then(InteractiveMoveState::moving)
+            .is_some_and(|move_| window.is_none_or(|window| window == move_.tile.window().id()))
+    }
+
+    /// Propagates the layout state of an interactively moved window after it is dropped.
+    ///
+    /// Linked mirrors can't be synced while they are being moved, so floating changes made during
+    /// the move are applied to the real window here, and then to the rest of its linked mirrors.
+    fn sync_linked_mirrors_after_interactive_move(&mut self, window: &W::Id) {
+        if self.applying_linked_mirror_sync {
+            return;
+        }
+
+        let Some(source) = self.linked_mirror_sync_root_for_window(window) else {
+            return;
+        };
+
+        if &source != window {
+            let floating = self
+                .linked_mirror_state_snapshot(window)
+                .map(|snapshot| snapshot.is_floating());
+            let source_floating = self
+                .linked_mirror_state_snapshot(&source)
+                .map(|snapshot| snapshot.is_floating());
+            if let (Some(floating), Some(source_floating)) = (floating, source_floating) {
+                if floating != source_floating {
+                    self.with_linked_mirror_sync_suppressed(|this| {
+                        this.set_window_floating(Some(&source), floating);
+                    });
+                }
+            }
+        }
+
+        self.sync_linked_mirrors_from_real(&source);
+    }
+
     fn linked_mirror_real_target(&self, window: &W::Id) -> Option<W::Id> {
         let window = self.window_by_id(window)?;
         (window.is_mirror() && window.is_mirror_linked())
@@ -7720,6 +7873,8 @@ impl<W: LayoutElement> Layout<W> {
         window: &W::Id,
         snapshot: LinkedMirrorStateSnapshot,
     ) {
+        // This runs on every commit of the real window, so it must only touch what differs.
+        // Otherwise, resize animations and view movement restart on every commit.
         let Some(mut current) = self.linked_mirror_state_snapshot(window) else {
             return;
         };
@@ -7740,67 +7895,97 @@ impl<W: LayoutElement> Layout<W> {
             current = updated;
         }
 
-        match snapshot.placement {
-            LinkedMirrorPlacementSnapshot::Floating { size } => {
-                self.set_window_width(Some(window), SizeChange::SetFixed(size.w));
-                self.set_window_height(Some(window), SizeChange::SetFixed(size.h));
-            }
-            LinkedMirrorPlacementSnapshot::Tiling {
-                width,
-                is_full_width,
-                height,
-            } => {
-                let width_change = match width {
-                    ColumnWidth::Fixed(fixed) => SizeChange::SetFixed(fixed.round() as i32),
-                    ColumnWidth::Proportion(proportion) => {
-                        SizeChange::SetProportion(proportion * 100.)
-                    }
-                };
-                self.set_window_width(Some(window), width_change);
-                self.set_window_height_state(window, height);
-
-                if self
-                    .linked_mirror_state_snapshot(window)
-                    .and_then(|snapshot| snapshot.tiled_is_full_width())
-                    .is_some_and(|current_full_width| current_full_width != is_full_width)
-                {
-                    self.toggle_full_width_for_window(window);
-                }
-            }
+        // Windowed and real fullscreen are exclusive, so leave real fullscreen first.
+        if current.is_pending_fullscreen && !snapshot.is_pending_fullscreen {
+            self.set_fullscreen(window, false);
         }
 
-        if snapshot.is_windowed_fullscreen {
+        match (current.placement, snapshot.placement) {
+            (
+                LinkedMirrorPlacementSnapshot::Floating { size: current_size },
+                LinkedMirrorPlacementSnapshot::Floating { size },
+            ) => {
+                if current_size.w != size.w {
+                    self.set_window_width(Some(window), SizeChange::SetFixed(size.w));
+                }
+                if current_size.h != size.h {
+                    self.set_window_height(Some(window), SizeChange::SetFixed(size.h));
+                }
+            }
+            (
+                LinkedMirrorPlacementSnapshot::Tiling {
+                    height: current_height,
+                    ..
+                },
+                LinkedMirrorPlacementSnapshot::Tiling {
+                    width,
+                    is_full_width,
+                    height,
+                },
+            ) => {
+                // Width is stored per column, so this is a no-op when sharing the source column.
+                self.set_window_column_width_state(window, width, is_full_width);
+
+                // In a shared column, only one window can have a non-auto height, so syncing the
+                // height would convert the real window's height and ping-pong.
+                let shares_column = self
+                    .linked_mirror_real_target(window)
+                    .is_some_and(|source| self.tiled_windows_share_column(window, &source));
+                if current_height != height && !shares_column {
+                    self.set_window_height_state(window, height);
+                }
+            }
+            // Can only happen if set_window_floating() didn't apply.
+            _ => (),
+        }
+
+        let Some(current) = self.linked_mirror_state_snapshot(window) else {
+            return;
+        };
+
+        if current.is_pending_maximized != snapshot.is_pending_maximized {
+            self.set_maximized(window, snapshot.is_pending_maximized);
+        }
+
+        if current.is_windowed_fullscreen != snapshot.is_windowed_fullscreen {
             self.with_windows_mut(|mapped, _| {
                 if mapped.id() == window {
-                    mapped.request_windowed_fullscreen(true);
+                    mapped.request_windowed_fullscreen(snapshot.is_windowed_fullscreen);
                 }
             });
-        } else {
-            if current.is_windowed_fullscreen {
-                self.with_windows_mut(|mapped, _| {
-                    if mapped.id() == window {
-                        mapped.request_windowed_fullscreen(false);
-                    }
-                });
-            }
+        }
 
-            if current.is_pending_fullscreen && !snapshot.is_pending_fullscreen {
-                self.set_fullscreen(window, false);
-            }
-            if current.is_pending_maximized && !snapshot.is_pending_maximized {
-                self.set_maximized(window, false);
-            }
-            if snapshot.is_pending_maximized {
-                self.set_maximized(window, true);
-            }
-            if snapshot.is_pending_fullscreen {
-                self.set_fullscreen(window, true);
-            }
+        if snapshot.is_pending_fullscreen && !current.is_pending_fullscreen {
+            self.set_fullscreen(window, true);
         }
 
         self.with_tile_mut(window, |tile| {
             tile.restore_to_floating = snapshot.restore_to_floating;
         });
+    }
+
+    fn tiled_windows_share_column(&self, a: &W::Id, b: &W::Id) -> bool {
+        self.workspaces().any(|(_, _, ws)| {
+            ws.scrolling()
+                .columns()
+                .any(|col| col.contains(a) && col.contains(b))
+        })
+    }
+
+    fn set_window_column_width_state(
+        &mut self,
+        window: &W::Id,
+        width: ColumnWidth,
+        is_full_width: bool,
+    ) {
+        if self.is_sticky_window(window) {
+            return;
+        }
+
+        let Some(workspace) = self.workspace_for_window_mut(window) else {
+            return;
+        };
+        workspace.set_window_column_width_state(window, width, is_full_width);
     }
 
     fn set_window_height_state(&mut self, window: &W::Id, height: WindowHeight) {
@@ -7909,9 +8094,10 @@ impl<W: LayoutElement> Layout<W> {
         self.monitors().any(|mon| mon.sticky_has_window(window))
     }
 
-    pub fn window_captures_cursor(&self, window: &W::Id) -> bool {
+    /// The window's explicit cursor-capture value, if any.
+    pub fn window_captures_cursor(&self, window: &W::Id) -> Option<bool> {
         self.window_by_id(window)
-            .is_some_and(|win| win.effective_cursor_capture())
+            .and_then(|win| win.effective_cursor_capture_rule())
     }
 
     pub fn is_overview_open(&self) -> bool {

@@ -434,6 +434,12 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let height = height.unwrap_or(1080);
             let refresh_rate = refresh_rate.unwrap_or(60);
 
+            if width == 0 || height == 0 {
+                return Err(String::from(
+                    "virtual output width and height must be positive",
+                ));
+            }
+
             let (tx, rx) = async_channel::bounded(1);
 
             ctx.event_loop.insert_idle(move |state| {
@@ -931,7 +937,8 @@ impl State {
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
                 || ipc_win.is_sticky != mapped.is_sticky()
-                || ipc_win.is_block_out != mapped.is_block_out();
+                || ipc_win.is_block_out != mapped.is_block_out()
+                || ipc_win.is_mirror_linked != mapped.is_mirror_linked();
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

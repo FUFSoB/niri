@@ -6,7 +6,6 @@ use std::iter::zip;
 use std::rc::Rc;
 
 use anyhow::Context;
-use arrayvec::ArrayVec;
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
 use pango::{Alignment, FontDescription};
@@ -21,7 +20,7 @@ use smithay::backend::renderer::{ExportMem, Texture as _};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
@@ -32,7 +31,6 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_texture, RenderTarget};
 use crate::utils::to_physical_precise_round;
-use crate::zoom::{zoom_wrap, ZoomWrapper};
 
 const SELECTION_BORDER: i32 = 2;
 
@@ -105,6 +103,8 @@ pub struct OutputScreenshot {
     texture: GlesTexture,
     buffer: PrimaryGpuTextureRenderElement,
     pointer: Option<PrimaryGpuTextureRenderElement>,
+    /// Location of the pointer hotspot within the pointer element.
+    pointer_hotspot: Point<i32, Physical>,
 }
 
 /// Generate Element + RenderElement delegation impls for marker newtypes that
@@ -184,9 +184,9 @@ macro_rules! impl_screenshot_newtype {
 pub struct HelpPanelElement(pub PrimaryGpuTextureRenderElement);
 
 /// Marker newtype for the screenshot pointer overlay (zoom-eligible with
-/// scale_with_zoom support).
+/// scale_with_zoom support), along with the hotspot location within the element.
 #[derive(Debug, Clone)]
-pub struct ScreenshotPointerElement(pub PrimaryGpuTextureRenderElement);
+pub struct ScreenshotPointerElement(pub PrimaryGpuTextureRenderElement, pub Point<i32, Physical>);
 
 impl_screenshot_newtype!(HelpPanelElement, ScreenshotPointerElement);
 
@@ -196,15 +196,6 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         HelpPanel = HelpPanelElement,
         Pointer = ScreenshotPointerElement,
-    }
-}
-
-// Internal render element for capture compositing. Only used in `capture()`
-// when zoom or pointer overlay requires compositing to an intermediate texture.
-niri_render_elements! {
-    CaptureRenderElement => {
-        Texture = PrimaryGpuTextureRenderElement,
-        Zoomed = ZoomWrapper<PrimaryGpuTextureRenderElement>,
     }
 }
 
@@ -788,7 +779,7 @@ impl ScreenshotUi {
         if *show_pointer {
             if let Some(pointer) = screenshot.pointer.clone() {
                 push(ScreenshotUiRenderElement::Pointer(
-                    ScreenshotPointerElement(pointer),
+                    ScreenshotPointerElement(pointer, screenshot.pointer_hotspot),
                 ));
             }
         }
@@ -798,9 +789,6 @@ impl ScreenshotUi {
     pub fn capture(
         &self,
         renderer: &mut GlesRenderer,
-        zoom_active: bool,
-        zoom_level: f64,
-        zoom_focal: Point<f64, Logical>,
     ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
         let _span = tracy_client::span!("ScreenshotUi::capture");
 
@@ -822,28 +810,12 @@ impl ScreenshotUi {
         let screenshot = &data.screenshot[0];
         let mut tex_rect = None;
 
-        if zoom_active || (*show_pointer && screenshot.pointer.is_some()) {
-            let output_scale = Scale::from(output.current_scale().fractional_scale());
-
-            let mut elements = ArrayVec::<CaptureRenderElement, 3>::new();
-            if *show_pointer {
-                if let Some(pointer) = screenshot.pointer.clone() {
-                    elements.push(CaptureRenderElement::Texture(pointer));
-                }
-            }
-            elements.push(CaptureRenderElement::Texture(screenshot.buffer.clone()));
-
-            if zoom_active {
-                let zoomed = zoom_wrap(
-                    screenshot.buffer.clone(),
-                    zoom_level,
-                    output_scale,
-                    zoom_focal,
-                );
-                elements.push(CaptureRenderElement::Zoomed(zoomed));
-            }
-
-            let elements = elements.iter().rev().map(|elem| {
+        // Composite the pointer on top if needed. Both the screenshot and the selection are
+        // unzoomed, so no zoom is involved here.
+        let pointer = screenshot.pointer.as_ref().filter(|_| *show_pointer);
+        if let Some(pointer) = pointer {
+            let elements = [pointer, &screenshot.buffer];
+            let elements = elements.into_iter().rev().map(|elem| {
                 RelocateRenderElement::from_element(elem, Point::from((0, 0)), Relocate::Relative)
             });
 
@@ -867,7 +839,7 @@ impl ScreenshotUi {
 
         let (texture, sample_rect) = tex_rect.unwrap_or_else(|| (screenshot.texture.clone(), rect));
 
-        // The size matters because we're performing the zoom transform here
+        // Convert the physical selection rect to buffer coordinates.
         let texture_size = data.size.to_f64().to_logical(data.scale);
         let buf_rect = sample_rect
             .to_f64()
@@ -1148,6 +1120,7 @@ impl OutputScreenshot {
         scale: Scale<f64>,
         texture: GlesTexture,
         pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
+        pointer_hotspot: Point<i32, Physical>,
     ) -> Self {
         let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
             TextureBuffer::from_texture(
@@ -1185,6 +1158,7 @@ impl OutputScreenshot {
             texture,
             buffer,
             pointer,
+            pointer_hotspot,
         }
     }
 }

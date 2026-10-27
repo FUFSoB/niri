@@ -22,13 +22,14 @@ use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
-use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::{ClientId, LayerConfigureProps};
 use super::*;
+use crate::input::mirror_click_grab::MirrorClickGrab;
 use crate::layout::{
     ActivateWindow, AddWindowTarget, HitType, LayoutElement as _, LayoutElementRenderElement,
     LayoutElementRenderSnapshot,
@@ -95,6 +96,34 @@ fn create_window_with_geometry(
     window.attach_rgba_buffer(rgba);
     window.set_size(size.0, size.1);
     window.set_window_geometry(geometry.0, geometry.1, geometry.2, geometry.3);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
+
+// Like create_window_with_geometry(), but with a wl_shm buffer, which (unlike single-pixel
+// buffers) is drawn as a texture, so it goes through the clipping shader and render snapshots.
+fn create_shm_window(
+    f: &mut Fixture,
+    id: ClientId,
+    title: &str,
+    size: (u16, u16),
+    geometry: Option<(i32, i32, i32, i32)>,
+    rgba: [u32; 4],
+) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_title(title);
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_rgba_buffer(rgba);
+    window.set_size(size.0, size.1);
+    if let Some((x, y, w, h)) = geometry {
+        window.set_window_geometry(x, y, w, h);
+    }
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
@@ -230,7 +259,8 @@ fn render_window_cast_pixels_for(
                 elements.push(elem)
             });
 
-            let geo = encompassing_geo(scale, elements.iter());
+            // Like the real window cast, render into the window cast bbox.
+            let geo = Rectangle::from_size(mapped.window_cast_bbox(scale).size);
             let elements = elements.iter().rev().map(|elem| {
                 RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
             });
@@ -275,7 +305,8 @@ fn render_cropped_window_cast_pixels_for(
                 elements.push(elem)
             });
 
-            let geo = encompassing_geo(scale, elements.iter());
+            // Like the real window cast, render into the window cast bbox.
+            let geo = Rectangle::from_size(mapped.window_cast_bbox(scale).size);
             let cropped = elements
                 .into_iter()
                 .filter_map(|elem| CropRenderElement::from_element(elem, scale, geo))
@@ -334,7 +365,13 @@ fn render_window_output_pixels_for(
                 &mut |elem| elements.push(elem),
             );
 
-            let geo = encompassing_geo(scale, elements.iter());
+            // Like screenshot_window(), mirrors use their own area since their contents are
+            // clipped to it.
+            let geo = if mapped.is_mirror() {
+                Rectangle::from_size(mapped.size()).to_physical_precise_round(scale)
+            } else {
+                encompassing_geo(scale, elements.iter())
+            };
             let elements = elements.iter().rev().map(|elem| {
                 RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
             });
@@ -357,7 +394,7 @@ fn render_snapshot_texture_pixels(
     renderer: &mut GlesRenderer,
     snapshot: &LayoutElementRenderSnapshot,
     scale: Scale<f64>,
-) -> (Size<i32, Physical>, Vec<u8>) {
+) -> (smithay::utils::Rectangle<i32, Physical>, Vec<u8>) {
     let (texture, geo) = {
         let mut ctx = RenderCtx {
             renderer,
@@ -387,7 +424,92 @@ fn render_snapshot_texture_pixels(
     )
     .unwrap();
 
-    (geo.size, pixels)
+    (geo, pixels)
+}
+
+// Creates a window whose left half is red and right half is green, so that orientation and
+// cropping are visible.
+fn create_red_green_shm_window(f: &mut Fixture, id: ClientId, size: (u16, u16)) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_title("source");
+    window.commit();
+    f.roundtrip(id);
+
+    let (w, h) = (i32::from(size.0), i32::from(size.1));
+    let pixels: Vec<_> = (0..w * h)
+        .map(|i| if i % w < w / 2 { RED } else { GREEN })
+        .collect();
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(w, h, &pixels);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
+
+// Asserts that the snapshot texture matches the live window cast in the area it covers.
+fn assert_snapshot_matches_window_cast(
+    f: &mut Fixture,
+    id: MappedId,
+) -> (
+    Size<i32, Physical>,
+    smithay::utils::Rectangle<i32, Physical>,
+) {
+    let output = f.niri_output(1);
+    let (live_size, live_pixels) = render_window_cast_pixels_for(f, &output, id);
+
+    let state = f.niri_state();
+    let (backend, niri) = (&mut state.backend, &mut state.niri);
+    let (snapshot_geo, snapshot_pixels) = backend
+        .with_primary_renderer(|renderer| {
+            let mapped = niri
+                .layout
+                .windows_for_output_mut(&output)
+                .find(|mapped| mapped.id() == id)
+                .unwrap();
+
+            mapped.store_animation_snapshot(renderer);
+            let snapshot = mapped.take_animation_snapshot().unwrap();
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            render_snapshot_texture_pixels(renderer, &snapshot, scale)
+        })
+        .unwrap();
+
+    // The snapshot texture only covers the contents, not the transparent letterboxing.
+    assert!(smithay::utils::Rectangle::from_size(live_size).contains_rect(snapshot_geo));
+    for y in 0..snapshot_geo.size.h {
+        for x in 0..snapshot_geo.size.w {
+            assert_eq!(
+                sample_pixel(snapshot_geo.size, &snapshot_pixels, x, y),
+                sample_pixel(
+                    live_size,
+                    &live_pixels,
+                    snapshot_geo.loc.x + x,
+                    snapshot_geo.loc.y + y
+                ),
+                "mismatch at {x}, {y}",
+            );
+        }
+    }
+
+    (live_size, snapshot_geo)
+}
+
+/// Makes the client resize to its last configure, like a real client would.
+fn ack_last_configure_and_commit(
+    f: &mut Fixture,
+    id: ClientId,
+    surface: &WlSurface,
+    rgba: [u32; 4],
+) {
+    f.double_roundtrip(id);
+    let window = f.client(id).window(surface);
+    let (w, h) = window.configures_received.last().unwrap().1.size;
+    window.attach_rgba_buffer(rgba);
+    window.set_size(w as u16, h as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
 }
 
 fn create_window_mirror(f: &mut Fixture) -> MappedId {
@@ -413,6 +535,17 @@ fn create_window_mirror_for(f: &mut Fixture, source_id: MappedId) -> MappedId {
         ActivateWindow::Smart,
     );
     mirror_id
+}
+
+// New tiled mirrors take their column's size, so tests that need a specific mirror size float it.
+fn float_mirror_with_size(f: &mut Fixture, id: MappedId, w: i32, h: i32) {
+    f.niri().layout.toggle_window_floating(Some(&id));
+    f.niri()
+        .layout
+        .set_window_width(Some(&id), SizeChange::SetFixed(w));
+    f.niri()
+        .layout
+        .set_window_height(Some(&id), SizeChange::SetFixed(h));
 }
 
 fn mirror_mapped_by_id(
@@ -584,6 +717,7 @@ fn mirror_window_renders_source_content() {
     create_window(&mut f, id, "source", (40, 20), GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 40, 20);
     let output = f.niri_output(1);
     let (size, pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
 
@@ -685,6 +819,7 @@ fn mirror_equal_to_window_geometry_renders_1_to_1_on_output() {
     create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 96, 56);
     let output = f.niri_output(1);
 
     let mapped = f
@@ -728,6 +863,7 @@ fn mirror_equal_size_matches_source_surface_geometry_at_fractional_scale() {
 
     let source_id = f.niri().layout.windows().next().unwrap().1.id();
     let mirror_id = create_window_mirror_for(&mut f, source_id);
+    float_mirror_with_size(&mut f, mirror_id, 39, 19);
     let state = f.niri_state();
     let (backend, niri) = (&mut state.backend, &mut state.niri);
     backend
@@ -1096,7 +1232,9 @@ fn transformed_mirror_anchor_preserves_source_point_when_zoomed() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
 
-    let anchor = Point::from((15., 10.));
+    // Rotated by 90 degrees, the whole source height fits across the mirror, so only the
+    // vertical mirror axis can pan; offset the anchor along it.
+    let anchor = Point::from((10., 15.));
     let source_point = Point::from((30., 10.));
     f.niri().layout.with_windows_mut(|mapped, _| {
         if mapped.id() == mirror_id {
@@ -1335,10 +1473,11 @@ fn focus_follows_mouse_switches_from_zoomed_mirror_to_source_window() {
     assert_eq!(old_focus.window.map(|(id, _)| id), Some(mirror_id));
     assert_eq!(new_focus.window.map(|(id, _)| id), Some(source_id));
 
+    // Focus-follows-mouse runs before the pointer moves to the new location.
     let pointer = f.niri().seat.get_pointer().unwrap();
-    pointer.set_location(new_point);
+    pointer.set_location(old_point);
     f.niri().pointer_contents = old_focus.clone();
-    f.niri().handle_focus_follows_mouse(&old_focus, &new_focus);
+    f.niri().handle_focus_follows_mouse(&new_focus);
 
     assert_eq!(
         f.niri().layout.focus().map(|mapped| mapped.id()),
@@ -1501,7 +1640,7 @@ fn mirror_link_resizes_with_real_and_linked_siblings() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), GREEN);
+    let surface = create_window(&mut f, id, "source", (40, 20), GREEN);
 
     let source_id = f.niri().layout.windows().next().unwrap().1.id();
     f.niri().layout.toggle_window_floating(Some(&source_id));
@@ -1517,6 +1656,8 @@ fn mirror_link_resizes_with_real_and_linked_siblings() {
     f.niri()
         .layout
         .set_window_height(Some(&source_id), SizeChange::SetFixed(60));
+    // The real window resizes, and the linked mirrors follow, once it commits.
+    ack_last_configure_and_commit(&mut f, id, &surface, GREEN);
 
     assert_eq!(
         mirror_mapped_by_id(&mut f, source_id).1,
@@ -1537,6 +1678,7 @@ fn mirror_link_resizes_with_real_and_linked_siblings() {
     f.niri()
         .layout
         .set_window_height(Some(&mirror1_id), SizeChange::SetFixed(30));
+    ack_last_configure_and_commit(&mut f, id, &surface, GREEN);
 
     assert_eq!(
         mirror_mapped_by_id(&mut f, source_id).1,
@@ -1558,12 +1700,13 @@ fn unlinked_mirror_inherits_tiled_height_from_source() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), GREEN);
+    let surface = create_window(&mut f, id, "source", (40, 20), GREEN);
 
     let source_id = f.niri().layout.windows().next().unwrap().1.id();
     f.niri()
         .layout
         .set_window_height(Some(&source_id), SizeChange::SetFixed(48));
+    ack_last_configure_and_commit(&mut f, id, &surface, GREEN);
 
     let source_height = mirror_mapped_by_id(&mut f, source_id).1.h;
     assert_eq!(source_height, 48);
@@ -1580,7 +1723,7 @@ fn mirror_linked_group_does_not_mutate_unlinked_siblings() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), GREEN);
+    let surface = create_window(&mut f, id, "source", (40, 20), GREEN);
 
     let source_id = f.niri().layout.windows().next().unwrap().1.id();
     f.niri().layout.toggle_window_floating(Some(&source_id));
@@ -1596,6 +1739,7 @@ fn mirror_linked_group_does_not_mutate_unlinked_siblings() {
     f.niri()
         .layout
         .set_window_height(Some(&source_id), SizeChange::SetFixed(48));
+    ack_last_configure_and_commit(&mut f, id, &surface, GREEN);
 
     assert_eq!(
         mirror_mapped_by_id(&mut f, source_id).1,
@@ -1741,7 +1885,9 @@ fn mirror_view_anchor_preserves_source_point_when_panned() {
     f.niri().layout.with_windows_mut(|mapped, _| {
         if mapped.id() == mirror_id {
             mapped.set_mirror_view_from_anchor(2., Point::from((10., 10.)), source_point);
-            mapped.set_mirror_view_from_anchor(2., Point::from((6., 10.)), source_point);
+            // The view is already panned to the right edge, so pan back left (panning further
+            // right would be clamped and couldn't keep the anchor).
+            mapped.set_mirror_view_from_anchor(2., Point::from((14., 10.)), source_point);
         }
     });
 
@@ -1753,7 +1899,7 @@ fn mirror_view_anchor_preserves_source_point_when_panned() {
         .map(|(_, mapped)| mapped)
         .unwrap();
     assert_eq!(
-        mapped.mirror_point_to_source(Point::from((6., 10.))),
+        mapped.mirror_point_to_source(Point::from((14., 10.))),
         Some(source_point),
     );
 }
@@ -1955,7 +2101,7 @@ fn floating_mirror_keeps_viewport_corner_radius_when_downscaled() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (80, 80), GREEN);
+    create_shm_window(&mut f, id, "source", (80, 80), None, GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.toggle_window_floating(Some(&mirror_id));
@@ -1965,6 +2111,8 @@ fn floating_mirror_keeps_viewport_corner_radius_when_downscaled() {
     f.niri()
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(40));
+    // The window's floating flag and the rules depending on it update on the next refresh.
+    f.niri_state().refresh_and_flush_clients();
 
     let output = f.niri_output(1);
     let (size, pixels) = render_window_output_pixels_for(&mut f, &output, mirror_id);
@@ -1981,7 +2129,7 @@ fn oversized_mirror_with_window_geometry_keeps_padding_transparent() {
         return;
     };
     let id = f.add_client();
-    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+    create_shm_window(&mut f, id, "source", (100, 60), Some((2, 2, 96, 56)), GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.toggle_window_floating(Some(&mirror_id));
@@ -2014,6 +2162,8 @@ fn oversized_mirror_with_window_geometry_keeps_padding_transparent() {
 fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
     let mut config = Config::default();
     config.layout.border.off = false;
+    // The startup hotkey overlay would dim the output render.
+    config.hotkey_overlay.skip_at_startup = true;
     config.window_rules.push(WindowRule {
         matches: vec![WindowMatch {
             title: Some(RegexEq::from_str("^source$").unwrap()),
@@ -2030,7 +2180,7 @@ fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
     }
     f.add_output(1, (200, 150));
     let id = f.add_client();
-    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+    create_shm_window(&mut f, id, "source", (100, 60), Some((2, 2, 96, 56)), GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.activate_window(&mirror_id);
@@ -2041,6 +2191,8 @@ fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
     f.niri()
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(80));
+
+    f.niri_complete_animations();
 
     let output = f.niri_output(1);
     let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::Output);
@@ -2070,10 +2222,13 @@ fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
         (window_render_loc, content_rect)
     };
 
+    // This renders the whole output, so transparent padding shows the backdrop, like an empty
+    // corner of the output does.
+    let backdrop = sample_pixel(size, &pixels, size.w - 1, size.h - 1);
     let center_x = window_render_loc.x + 120 / 2;
     assert_eq!(
         sample_pixel(size, &pixels, center_x, content_rect.loc.y - 1),
-        [0, 0, 0, 0]
+        backdrop
     );
     assert_eq!(
         sample_pixel(size, &pixels, center_x, content_rect.loc.y),
@@ -2095,7 +2250,7 @@ fn oversized_focused_mirror_keeps_padding_transparent_with_border_background() {
             center_x,
             content_rect.loc.y + content_rect.size.h
         ),
-        [0, 0, 0, 0]
+        backdrop
     );
 }
 
@@ -2195,7 +2350,7 @@ fn mirror_animation_snapshot_scales_contents_into_mirror() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), GREEN);
+    create_shm_window(&mut f, id, "source", (40, 20), None, GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.toggle_window_floating(Some(&mirror_id));
@@ -2234,9 +2389,10 @@ fn mirror_animation_snapshot_uses_window_geometry_not_buffer_extents() {
         return;
     };
     let id = f.add_client();
-    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+    create_shm_window(&mut f, id, "source", (100, 60), Some((2, 2, 96, 56)), GREEN);
 
     let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 96, 56);
     let output = f.niri_output(1);
     let state = f.niri_state();
     let (backend, niri) = (&mut state.backend, &mut state.niri);
@@ -2265,42 +2421,253 @@ fn mirror_animation_snapshot_preserves_rotation() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), GREEN);
+    create_red_green_shm_window(&mut f, id, (40, 20));
 
     let mirror_id = create_window_mirror(&mut f);
-    f.niri().layout.toggle_window_floating(Some(&mirror_id));
-    f.niri()
-        .layout
-        .set_window_width(Some(&mirror_id), SizeChange::SetFixed(40));
-    f.niri()
-        .layout
-        .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
+    float_mirror_with_size(&mut f, mirror_id, 40, 20);
     f.niri().layout.activate_window(&mirror_id);
     f.niri_state()
         .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
 
-    let output = f.niri_output(1);
-    let (live_size, live_pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
+    let (_, snapshot_geo) = assert_snapshot_matches_window_cast(&mut f, mirror_id);
+    // Rotated contents are letterboxed sideways.
+    assert_eq!(
+        snapshot_geo,
+        smithay::utils::Rectangle::new(Point::from((15, 0)), Size::from((10, 20)))
+    );
+}
+
+#[test]
+fn mirror_animation_snapshot_crops_rotated_zoomed_contents() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_red_green_shm_window(&mut f, id, (40, 20));
+
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 20, 20);
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+
+    let (live_size, snapshot_geo) = assert_snapshot_matches_window_cast(&mut f, mirror_id);
+    assert_eq!(
+        snapshot_geo,
+        smithay::utils::Rectangle::from_size(live_size)
+    );
+}
+
+#[test]
+fn csd_mirror_surface_scales_around_window_geometry() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window_with_geometry(&mut f, id, "source", (100, 60), (2, 2, 96, 56), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 192, 112);
 
     let state = f.niri_state();
     let (backend, niri) = (&mut state.backend, &mut state.niri);
-    let (snapshot_size, snapshot_pixels) = backend
+    backend
         .with_primary_renderer(|renderer| {
-            let mapped = niri
+            let scale = Scale::from(1.);
+            let mut ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+            let mirror = niri
                 .layout
-                .windows_for_output_mut(&output)
-                .find(|mapped| mapped.id() == mirror_id)
+                .windows()
+                .find(|(_, mapped)| mapped.id() == mirror_id)
+                .map(|(_, mapped)| mapped)
                 .unwrap();
+            assert_eq!(
+                mirror.mirror_content_transform(),
+                (Point::from((0., 0.)), 2.)
+            );
 
-            mapped.store_animation_snapshot(renderer);
-            let snapshot = mapped.take_animation_snapshot().unwrap();
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            render_snapshot_texture_pixels(renderer, &snapshot, scale)
+            let mut elements = Vec::new();
+            mirror.render_normal(ctx.r(), Point::from((0., 0.)), scale, 1., &mut |elem| {
+                elements.push(elem)
+            });
+
+            // The buffer starts 2 logical pixels before the window geometry, which is 4 pixels
+            // at 2x.
+            assert_eq!(
+                first_surface_geometry(&elements, scale),
+                smithay::utils::Rectangle::new(Point::from((-4, -4)), Size::from((200, 120))),
+            );
         })
         .unwrap();
+}
 
-    assert_eq!(snapshot_size, live_size);
-    assert_eq!(snapshot_pixels, live_pixels);
+#[test]
+fn mirror_click_installs_mirror_click_grab() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 20, 20);
+    f.niri().layout.activate_window(&mirror_id);
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+
+    let (pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let client = f.client(id);
+    let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
+    let pointer = manager.create_virtual_pointer(None, &client.qh, ());
+    pointer.motion_absolute(0, (pos.x + 10) as u32, (pos.y + 10) as u32, 100, 100);
+    pointer.frame();
+    pointer.button(
+        1,
+        0x110,
+        wayland_client::protocol::wl_pointer::ButtonState::Pressed,
+    );
+    pointer.frame();
+    f.roundtrip(id);
+
+    let niri_pointer = f.niri().seat.get_pointer().unwrap();
+    assert_eq!(
+        f.niri().pointer_contents.window.map(|(id, _)| id),
+        Some(mirror_id)
+    );
+    assert_eq!(
+        niri_pointer.with_grab(|_, grab| grab.as_any().is::<MirrorClickGrab>()),
+        Some(true)
+    );
+
+    pointer.button(
+        2,
+        0x110,
+        wayland_client::protocol::wl_pointer::ButtonState::Released,
+    );
+    pointer.frame();
+    f.roundtrip(id);
+}
+
+#[test]
+fn csd_grab_started_inside_mirror_targets_mirror() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 20, 20);
+
+    let (source_pos, _) = tile_geometry_for(&mut f, source_id);
+    let (mirror_pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let source_surface = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.id() == source_id)
+        .map(|(_, mapped)| mapped.toplevel().wl_surface().clone())
+        .unwrap();
+
+    let target = |f: &mut Fixture, pos: Point<i32, Logical>| {
+        let point = Point::from((pos.x as f64 + 10., pos.y as f64 + 10.));
+        f.niri_state()
+            .csd_grab_target(&source_surface, point)
+            .map(|(mapped, _)| mapped.id())
+    };
+    assert_eq!(target(&mut f, mirror_pos), Some(mirror_id));
+    assert_eq!(target(&mut f, source_pos), Some(source_id));
+}
+
+#[test]
+fn panning_mirror_view_keeps_other_axis() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 20, 20);
+    f.niri().layout.activate_window(&mirror_id);
+    // At 4x zoom, 10x10 of the 40x20 source is visible, so both axes can pan.
+    f.niri_state()
+        .do_action(Action::SetWindowMirrorZoom("4.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorCenterY(PositionChange::SetProportion(25.)),
+        false,
+    );
+
+    let center_source_point = |f: &mut Fixture| {
+        f.niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id() == mirror_id)
+            .and_then(|(_, mapped)| mapped.mirror_point_to_source(Point::from((10., 10.))))
+            .unwrap()
+    };
+    let before = center_source_point(&mut f);
+    assert_eq!(before.y, 5.);
+
+    f.niri_state()
+        .do_action(Action::MoveWindowMirrorViewRight, false);
+    let after = center_source_point(&mut f);
+    assert!(after.x > before.x);
+    assert_eq!(after.y, before.y);
+
+    f.niri_state()
+        .do_action(Action::MoveWindowMirrorViewDown, false);
+    let after_down = center_source_point(&mut f);
+    assert!(after_down.y > after.y);
+    assert_eq!(after_down.x, after.x);
+}
+
+#[test]
+fn focus_follows_mouse_ignores_window_moved_under_stationary_pointer() {
+    let mut config = Config::default();
+    config.input.focus_follows_mouse = Some(FocusFollowsMouse {
+        max_scroll_amount: None,
+    });
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+    create_window(&mut f, id, "source", (40, 20), GREEN);
+
+    let source_id = f.niri().layout.windows().next().unwrap().1.id();
+    let mirror_id = create_window_mirror(&mut f);
+    float_mirror_with_size(&mut f, mirror_id, 20, 20);
+    f.niri().layout.activate_window(&source_id);
+
+    let (source_pos, source_size) = tile_geometry_for(&mut f, source_id);
+    let (mirror_pos, _) = tile_geometry_for(&mut f, mirror_id);
+    let source_point = Point::from((source_pos.x as f64 + 1., source_pos.y as f64 + 1.));
+    let mirror_point = Point::from((mirror_pos.x as f64 + 10., mirror_pos.y as f64 + 10.));
+    let old_focus = f.niri().contents_under(source_point);
+    let new_focus = f.niri().contents_under(mirror_point);
+    assert_eq!(old_focus.window.map(|(id, _)| id), Some(source_id));
+    assert_eq!(new_focus.window.map(|(id, _)| id), Some(mirror_id));
+    assert!(source_size.w > 0);
+
+    // The mirror ended up under the pointer without the pointer moving (e.g. during an
+    // animation), so the stored pointer contents are stale.
+    let pointer = f.niri().seat.get_pointer().unwrap();
+    pointer.set_location(mirror_point);
+    f.niri().pointer_contents = old_focus;
+    f.niri().handle_focus_follows_mouse(&new_focus);
+
+    assert_eq!(
+        f.niri().layout.focus().map(|mapped| mapped.id()),
+        Some(source_id)
+    );
 }
 
 #[test]
@@ -2476,27 +2843,40 @@ fn hidden_fullscreen_born_mirror_uses_default_floating_placement() {
         return;
     };
     let id = f.add_client();
-    create_window(&mut f, id, "source", (40, 20), RED);
+    let surface = create_window(&mut f, id, "source", (40, 20), RED);
 
     let source_id = f.niri().layout.windows().next().unwrap().1.id();
     f.niri().layout.set_fullscreen(&source_id, true);
+    ack_last_configure_and_commit(&mut f, id, &surface, RED);
 
     let mirror_id = create_window_mirror(&mut f);
+    f.niri().layout.activate_window(&source_id);
+    f.niri_complete_animations();
 
+    // The mirror is in its own fullscreen column, next to the source and off-screen.
     let ws = f.niri().layout.active_workspace().unwrap();
-    let (_, _, visible) = ws
+    let view_size = ws.view_size();
+    let (tile, pos, _) = ws
         .tiles_with_render_positions()
         .find(|(tile, _, _)| tile.window().id() == mirror_id)
         .unwrap();
-    assert!(!visible);
+    let tile_rect = smithay::utils::Rectangle::new(pos, tile.tile_size());
+    assert!(!tile_rect.overlaps(smithay::utils::Rectangle::from_size(view_size)));
 
     f.niri().layout.toggle_window_floating(Some(&mirror_id));
+    f.niri_complete_animations();
 
-    let working_area = f.niri().layout.active_workspace().unwrap().working_area();
-    let (pos, size) = tile_geometry_for(&mut f, mirror_id);
-    let expected = center_preferring_top_left_in_area(working_area, size.to_f64()).to_i32_round();
+    // The floating space is hidden behind the fullscreen source, so look the tile up directly.
+    let ws = f.niri().layout.active_workspace().unwrap();
+    let working_area = ws.working_area();
+    let (tile, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == mirror_id)
+        .unwrap();
+    let size = tile.animated_tile_size();
+    let expected = center_preferring_top_left_in_area(working_area, size).to_i32_round::<i32>();
 
-    assert_eq!(pos, expected);
+    assert_eq!(pos.to_i32_round::<i32>(), expected);
 }
 
 #[test]
@@ -2660,6 +3040,8 @@ fn replicated_event_stream_block_out_state(f: &mut Fixture) -> niri_ipc::BlockOu
 fn blocked_layer_reveals_background_in_screen_capture() {
     let mut config = Config::default();
     config.layout.gaps = 0.;
+    // The startup hotkey overlay would otherwise dim the whole output.
+    config.hotkey_overlay.skip_at_startup = true;
     config.layer_rules.push(LayerRule {
         matches: vec![LayerMatch {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
@@ -2673,6 +3055,8 @@ fn blocked_layer_reveals_background_in_screen_capture() {
         return;
     };
     let id = f.add_client();
+    // wl_output names arrive after the registry bind, which needs another roundtrip.
+    f.roundtrip(id);
     let output = f.client(id).output("headless-1");
 
     create_layer(
@@ -2884,10 +3268,107 @@ fn toggle_block_out_window_disables_and_restores_configured_rule() {
     );
 }
 
+fn config_with_title_block_out(title: &str, block_out_from: BlockOutFrom) -> Config {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str(title).unwrap()),
+            ..Default::default()
+        }],
+        block_out_from: Some(block_out_from),
+        ..Default::default()
+    });
+    config
+}
+
+fn set_window_title(f: &mut Fixture, id: ClientId, surface: &WlSurface, title: &str) {
+    let window = f.client(id).window(surface);
+    window.set_title(title);
+    window.commit();
+    f.double_roundtrip(id);
+}
+
+#[test]
+fn toggle_block_out_window_override_survives_rule_starting_to_match() {
+    let config = config_with_title_block_out("^secret$", BlockOutFrom::ScreenCapture);
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    let surface = create_window(&mut f, id, "plain", (40, 30), GREEN);
+    let window = f.niri().layout.focus().unwrap().id();
+    assert!(!window_is_block_out(&mut f, window));
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(window_is_block_out(&mut f, window));
+
+    // The rule starting to match must not flip the toggled window back to unblocked.
+    set_window_title(&mut f, id, &surface, "secret");
+    assert!(window_is_block_out(&mut f, window));
+
+    // Toggling off sticks even while the rule matches.
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindow, false);
+    assert!(!window_is_block_out(&mut f, window));
+
+    set_window_title(&mut f, id, &surface, "plain");
+    assert!(!window_is_block_out(&mut f, window));
+    set_window_title(&mut f, id, &surface, "secret");
+    assert!(!window_is_block_out(&mut f, window));
+}
+
+#[test]
+fn toggle_block_out_window_applies_to_source_and_mirrors() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    let id = f.add_client();
+
+    create_window(&mut f, id, "plain", (40, 30), GREEN);
+    let source = f.niri().layout.focus().unwrap().id();
+    let mirror = create_window_mirror_for(&mut f, source);
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindowById(mirror.get()), false);
+    assert!(window_is_block_out(&mut f, source));
+    assert!(window_is_block_out(&mut f, mirror));
+
+    f.niri_state()
+        .do_action(Action::ToggleBlockOutWindowById(source.get()), false);
+    assert!(!window_is_block_out(&mut f, source));
+    assert!(!window_is_block_out(&mut f, mirror));
+}
+
+#[test]
+fn mirror_rules_follow_source_title_change() {
+    let config = config_with_title_block_out("^secret$", BlockOutFrom::Screencast);
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let id = f.add_client();
+
+    let surface = create_window(&mut f, id, "plain", (40, 30), GREEN);
+    let source = f.niri().layout.focus().unwrap().id();
+    let mirror = create_window_mirror_for(&mut f, source);
+    assert!(!window_is_block_out(&mut f, mirror));
+
+    set_window_title(&mut f, id, &surface, "secret");
+    assert!(window_is_block_out(&mut f, source));
+    assert!(window_is_block_out(&mut f, mirror));
+
+    set_window_title(&mut f, id, &surface, "plain");
+    assert!(!window_is_block_out(&mut f, source));
+    assert!(!window_is_block_out(&mut f, mirror));
+}
+
 #[test]
 fn toggle_block_out_globally_disables_layer_block_out() {
     let mut config = Config::default();
     config.layout.gaps = 0.;
+    // The startup hotkey overlay would otherwise dim the whole output.
+    config.hotkey_overlay.skip_at_startup = true;
     config.layer_rules.push(LayerRule {
         matches: vec![LayerMatch {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
@@ -2901,6 +3382,8 @@ fn toggle_block_out_globally_disables_layer_block_out() {
         return;
     };
     let id = f.add_client();
+    // wl_output names arrive after the registry bind, which needs another roundtrip.
+    f.roundtrip(id);
     let output = f.client(id).output("headless-1");
 
     create_layer(
@@ -3079,6 +3562,8 @@ fn block_out_state_reports_layer_scope_and_global_toggle() {
         return;
     };
     let id = f.add_client();
+    // wl_output names arrive after the registry bind, which needs another roundtrip.
+    f.roundtrip(id);
     let output = f.client(id).output("headless-1");
 
     create_layer(
@@ -3217,6 +3702,8 @@ fn event_stream_block_out_tracks_layer_only_snapshot_updates() {
         return;
     };
     let id = f.add_client();
+    // wl_output names arrive after the registry bind, which needs another roundtrip.
+    f.roundtrip(id);
     let output = f.client(id).output("headless-1");
 
     create_layer(

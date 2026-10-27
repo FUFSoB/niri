@@ -140,6 +140,46 @@ pub(super) fn build_headless_virtual_output(
     }
 }
 
+/// Checks that a new virtual output can be named `name`.
+///
+/// Output names are matched case-insensitively (like in the output config and `niri msg output`),
+/// so the name must not match any managed virtual output, any output currently in the compositor,
+/// or any of `reserved_names` (e.g. DRM connector names that may get connected later).
+pub(super) fn check_virtual_output_name<'a>(
+    niri: &Niri,
+    outputs: &HashMap<String, (Output, OutputId)>,
+    mut reserved_names: impl Iterator<Item = &'a str>,
+    name: &str,
+) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("virtual output name cannot be empty".to_string());
+    }
+
+    let taken = outputs.keys().any(|n| n.eq_ignore_ascii_case(name))
+        || niri
+            .global_space
+            .outputs()
+            .any(|o| o.name().eq_ignore_ascii_case(name))
+        || reserved_names.any(|n| n.eq_ignore_ascii_case(name));
+    if taken {
+        return Err(format!("output '{name}' already exists"));
+    }
+
+    Ok(())
+}
+
+/// Returns the managed virtual output matching `name` case-insensitively, like other output
+/// commands.
+pub(super) fn find_virtual_output(
+    outputs: &HashMap<String, (Output, OutputId)>,
+    name: &str,
+) -> Option<Output> {
+    outputs
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, (output, _))| output.clone())
+}
+
 pub(super) fn remove_virtual_output_from_map(
     niri: &mut Niri,
     ipc_outputs: &Arc<Mutex<IpcOutputMap>>,
@@ -147,15 +187,16 @@ pub(super) fn remove_virtual_output_from_map(
     name: &str,
     kind: &str,
 ) -> Result<(), String> {
-    let (output, output_id) = outputs
-        .remove(name)
-        .ok_or_else(|| format!("{kind} '{name}' not found"))?;
+    let output =
+        find_virtual_output(outputs, name).ok_or_else(|| format!("{kind} '{name}' not found"))?;
+    let (output, output_id) = outputs.remove(&output.name()).unwrap();
     let is_connected = niri.output_exists(&output);
 
     ipc_outputs.lock().unwrap().remove(&output_id);
     if is_connected {
         niri.remove_output(&output);
     }
+    niri.ipc_outputs_changed = true;
 
     Ok(())
 }
@@ -171,7 +212,7 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
 
     // Apply config to all managed virtual outputs, even if currently disconnected (off).
     // This allows `off`/`on` to work without losing internal state or IPC entries.
-    for (output_name, (output, output_id)) in outputs.iter_mut() {
+    for (output, output_id) in outputs.values_mut() {
         let name = output.user_data().get::<OutputName>().unwrap();
         let output_config = config.outputs.find(name);
 
@@ -213,10 +254,9 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
             }
         }
 
-        let was_connected = niri
-            .global_space
-            .outputs()
-            .any(|o| o.name() == *output_name);
+        // Compare by identity rather than by name: a disconnected virtual output must not be
+        // mistaken for another output with the same name.
+        let was_connected = niri.output_exists(output);
 
         // Handle off/on by removing/adding the output from/to the space.
         match (is_off, was_connected) {
@@ -237,10 +277,7 @@ pub(super) fn apply_config_to_managed_virtual_outputs(
             _ => {}
         }
 
-        let is_connected = niri
-            .global_space
-            .outputs()
-            .any(|o| o.name() == *output_name);
+        let is_connected = niri.output_exists(output);
 
         if mode_changed && !is_off && is_connected {
             if let Some(new_mode) = output.current_mode() {

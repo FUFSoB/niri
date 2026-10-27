@@ -8,6 +8,7 @@ use niri_ipc::PositionChange;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element as _, Kind, NamespacedElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::Texture as _;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -86,6 +87,12 @@ pub struct Mapped {
     /// Pending sizing mode for mirror entries.
     mirror_pending_sizing_mode: SizingMode,
 
+    /// Whether this mirror entry is in windowed (fake) fullscreen.
+    ///
+    /// Like for real windows, this is separate from the sizing mode: a windowed-fullscreen mirror
+    /// is sized as Normal or Maximized by the layout. Mirrors apply it immediately.
+    mirror_windowed_fullscreen: bool,
+
     /// View state for mirror entries.
     mirror_view: MirrorViewState,
 
@@ -149,8 +156,11 @@ pub struct Mapped {
     /// Whether this window should invert its configured cursor capture state.
     invert_cursor_capture_window_rule: bool,
 
-    /// Whether this window should invert its configured block-out state.
-    invert_block_out_window_rule: bool,
+    /// Runtime block-out override set by toggle-block-out-window.
+    ///
+    /// When set, it replaces the block-out-from window rule value, so that later rule changes
+    /// can't flip a toggled window back.
+    block_out_override: Option<Option<BlockOutFrom>>,
 
     /// Buffer to draw instead of the window when it should be blocked out.
     block_out_buffer: RefCell<SolidColorBuffer>,
@@ -478,6 +488,7 @@ impl Mapped {
             mirror_normal_size: Size::from((1, 1)),
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
+            mirror_windowed_fullscreen: false,
             mirror_view: MirrorViewState::default(),
             credentials,
             pre_commit_hook: Some(hook),
@@ -496,7 +507,7 @@ impl Mapped {
             is_screen_cast_target: false,
             ignore_opacity_window_rule: false,
             invert_cursor_capture_window_rule: false,
-            invert_block_out_window_rule: false,
+            block_out_override: None,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: config.blur,
             animate_next_configure: false,
@@ -543,6 +554,7 @@ impl Mapped {
             },
             mirror_sizing_mode: SizingMode::Normal,
             mirror_pending_sizing_mode: SizingMode::Normal,
+            mirror_windowed_fullscreen: false,
             mirror_view: source.mirror_view,
             credentials: source.credentials.clone(),
             pre_commit_hook: None,
@@ -561,7 +573,7 @@ impl Mapped {
             is_screen_cast_target: false,
             ignore_opacity_window_rule: source.ignore_opacity_window_rule,
             invert_cursor_capture_window_rule: source.invert_cursor_capture_window_rule,
-            invert_block_out_window_rule: source.invert_block_out_window_rule,
+            block_out_override: source.block_out_override,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.])),
             blur_config: source.blur_config,
             animate_next_configure: false,
@@ -850,16 +862,10 @@ impl Mapped {
         let content_loc = location + transform.content_rect.loc;
         let visible_loc = location + transform.visible_rect.loc;
         let content_origin = content_loc.to_physical_precise_round(scale);
-        let surface_origin = (content_loc
-            + Self::mirror_transform_vector(
-                transform.element_transform,
-                Point::from((
-                    -transform.source_geometry.loc.x,
-                    -transform.source_geometry.loc.y,
-                )),
-            )
-            .upscale(transform.scale))
-        .to_physical_precise_round(scale);
+        // Surface elements are positioned unscaled and untransformed relative to content_origin;
+        // the Transformed and Scaled wrappers then rotate and scale that offset around it.
+        let surface_origin =
+            (content_loc - transform.source_geometry.loc).to_physical_precise_round(scale);
 
         MirrorRenderLayout {
             transform,
@@ -1103,11 +1109,16 @@ impl Mapped {
         }
 
         let transform = self.mirror_transform();
+        // Currently displayed centre in transformed source coordinates.
+        let current_center: Point<f64, Logical> = Point::from((
+            (self.mirror_size.w as f64 / 2. - transform.content_rect.loc.x) / transform.scale,
+            (self.mirror_size.h as f64 / 2. - transform.content_rect.loc.y) / transform.scale,
+        ));
         let (transformed_size, visible_size, current, delta) = if x_axis {
             (
                 transform.transformed_source_size.w,
                 transform.visible_rect.size.w / transform.scale,
-                (self.mirror_size.w as f64 / 2. - transform.content_rect.loc.x) / transform.scale,
+                current_center.x,
                 Point::from((
                     transform.visible_rect.size.w / transform.scale * delta_fraction,
                     0.,
@@ -1117,7 +1128,7 @@ impl Mapped {
             (
                 transform.transformed_source_size.h,
                 transform.visible_rect.size.h / transform.scale,
-                (self.mirror_size.h as f64 / 2. - transform.content_rect.loc.y) / transform.scale,
+                current_center.y,
                 Point::from((
                     0.,
                     transform.visible_rect.size.h / transform.scale * delta_fraction,
@@ -1145,10 +1156,11 @@ impl Mapped {
         } else {
             transformed_size - visible_size / 2.
         };
+        // Keep the other axis where it currently is.
         let mut center = if x_axis {
-            Point::from((current, transform.transformed_source_size.h / 2.))
+            Point::from((current, current_center.y))
         } else {
-            Point::from((transform.transformed_source_size.w / 2., current))
+            Point::from((current_center.x, current))
         };
         center += delta;
         if x_axis {
@@ -1238,12 +1250,18 @@ impl Mapped {
     }
 
     pub fn effective_cursor_capture(&self) -> bool {
-        let cursor_capture = self.rules.cursor_capture.unwrap_or(false);
+        self.effective_cursor_capture_rule().unwrap_or(false)
+    }
+
+    /// The cursor-capture value after the runtime toggle, or `None` if neither the window rules
+    /// nor the toggle set it (in which case the standard pointer confinement applies).
+    pub fn effective_cursor_capture_rule(&self) -> Option<bool> {
+        let cursor_capture = self.rules.cursor_capture;
         if !self.invert_cursor_capture_window_rule {
             return cursor_capture;
         }
 
-        !cursor_capture
+        Some(!cursor_capture.unwrap_or(false))
     }
 
     pub fn toggle_cursor_capture_window_rule(&mut self) {
@@ -1251,23 +1269,21 @@ impl Mapped {
     }
 
     pub fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
-        let block_out_from = self.rules.block_out_from;
-        if !self.invert_block_out_window_rule {
-            return block_out_from;
-        }
-
-        match block_out_from {
-            Some(_) => None,
-            None => Some(BlockOutFrom::Screencast),
-        }
+        self.block_out_override.unwrap_or(self.rules.block_out_from)
     }
 
     pub fn is_block_out(&self) -> bool {
         self.effective_block_out_from().is_some()
     }
 
-    pub fn toggle_block_out_window_rule(&mut self) {
-        self.invert_block_out_window_rule = !self.invert_block_out_window_rule;
+    /// Overrides the block-out state of this window regardless of its block-out-from rule.
+    ///
+    /// When the requested state matches what the rule already gives, the override is cleared so
+    /// the window follows its rules again.
+    pub fn set_block_out_window_override(&mut self, block_out: bool) {
+        let rule = self.rules.block_out_from;
+        let value = block_out.then(|| rule.unwrap_or(BlockOutFrom::Screencast));
+        self.block_out_override = (value != rule).then_some(value);
     }
 
     pub fn set_is_focused(&mut self, is_focused: bool) {
@@ -1326,12 +1342,20 @@ impl Mapped {
                 let rect = transform.source_rect_to_mirror_rect(rect);
                 baked.location = rect.loc;
                 baked.dst = Some(rect.size.to_i32_round());
-                baked
-                    .buffer
-                    .set_texture_transform(compose_texture_transforms(
-                        baked.buffer.texture_transform(),
-                        transform.element_transform,
-                    ));
+
+                // src is in the texture's logical (post-transform) space, so it has to be
+                // converted through buffer coordinates when the texture transform changes.
+                let old_transform = baked.buffer.texture_transform();
+                let new_transform =
+                    compose_texture_transforms(old_transform, transform.element_transform);
+                let texture_scale = baked.buffer.texture_scale();
+                let src = baked.src.map(|src| {
+                    src.to_buffer(texture_scale, old_transform, &baked.buffer.logical_size())
+                });
+                baked.buffer.set_texture_transform(new_transform);
+                let buffer_size = baked.buffer.texture().size().to_f64();
+                baked.src =
+                    src.map(|src| src.to_logical(texture_scale, new_transform, &buffer_size));
             }
             contents.retain_mut(|baked| crop_baked_texture_to_rect(baked, transform.visible_rect));
         } else {
@@ -1560,6 +1584,10 @@ impl Mapped {
     }
 
     pub fn is_windowed_fullscreen(&self) -> bool {
+        if self.is_mirror {
+            return self.mirror_windowed_fullscreen;
+        }
+
         self.is_windowed_fullscreen
     }
 
@@ -1723,6 +1751,18 @@ impl LayoutElement for Mapped {
                 .source_geometry
                 .size
                 .to_physical_precise_round(scale);
+            // Pop-ups are clipped to the mirror viewport like the mirrored window itself. This
+            // also keeps them consistent with input, which mirror_point_to_source() only maps
+            // inside the viewport.
+            let clip_geo = Rectangle::new(
+                location + transform.visible_rect.loc,
+                transform.visible_rect.size,
+            );
+            let clip_radius = self
+                .geometry_corner_radius()
+                .fit_to(clip_geo.size.w as f32, clip_geo.size.h as f32);
+            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+            let needs_transform_shader = transform.element_transform != Transform::Normal;
             let root = self.toplevel().wl_surface();
 
             for (popup, offset) in PopupManager::popups_for_surface(root) {
@@ -1734,12 +1774,10 @@ impl LayoutElement for Mapped {
 
                 let surface = popup.wl_surface();
                 let popup_geo = popup.geometry();
-                let surface_loc = (content_loc - transform.source_geometry.loc
-                    + (offset - popup_geo.loc).to_f64())
-                .to_physical_precise_round(scale);
-                let transform_shader = (transform.element_transform != Transform::Normal)
-                    .then(|| ClippedSurfaceRenderElement::shader(ctx.renderer).cloned())
-                    .flatten();
+                // Pop-up offsets are relative to the window geometry, which content_loc is the
+                // (pre-scale, pre-transform) origin of.
+                let surface_off = (offset - popup_geo.loc).to_f64();
+                let surface_loc = (content_loc + surface_off).to_physical_precise_round(scale);
 
                 push_elements_from_surface_tree(
                     ctx.renderer,
@@ -1760,16 +1798,25 @@ impl LayoutElement for Mapped {
                             content_origin,
                             Scale::from(transform.scale),
                         );
-                        if transform.element_transform != Transform::Normal {
-                            if let Some(shader) = transform_shader.clone() {
-                                let geometry = elem.geometry(scale).to_f64().to_logical(scale);
+                        let clip = ClippedSurfaceRenderElement::will_clip(
+                            &elem,
+                            scale,
+                            clip_geo,
+                            clip_radius,
+                        );
+                        if needs_transform_shader || clip {
+                            if let Some(shader) = clip_shader.clone() {
+                                let (geometry, radius) = if clip {
+                                    (clip_geo, clip_radius)
+                                } else {
+                                    (
+                                        elem.geometry(scale).to_f64().to_logical(scale),
+                                        CornerRadius::default(),
+                                    )
+                                };
                                 push(
                                     ClippedSurfaceRenderElement::new(
-                                        elem,
-                                        scale,
-                                        geometry,
-                                        shader,
-                                        CornerRadius::default(),
+                                        elem, scale, geometry, shader, radius,
                                     )
                                     .into(),
                                 );
@@ -1782,25 +1829,28 @@ impl LayoutElement for Mapped {
                 );
 
                 let geometry = transform.source_rect_to_mirror_rect(Rectangle::new(
-                    offset.to_f64() - transform.source_geometry.loc,
+                    offset.to_f64(),
                     popup_geo.size.to_f64(),
                 ));
                 let geometry = Rectangle::new(location + geometry.loc, geometry.size);
-                let surface_off = popup_geo.loc.upscale(-1).to_f64();
+                let Some(clipped_geometry) = geometry.intersection(clip_geo) else {
+                    continue;
+                };
                 let surface_anim_scale = Scale::from(transform.scale);
                 let mut effect = popup_rules.background_effect;
                 // Default xray to false for pop-ups since they're always on top of something.
                 if effect.xray.is_none() {
                     effect.xray = Some(false);
                 }
-                let xray_pos = xray_pos.offset(geometry.loc - location);
+                let xray_pos = xray_pos.offset(clipped_geometry.loc - location);
                 background_effect::render_for_tile(
                     ctx.as_gles(),
                     None,
-                    geometry,
+                    clipped_geometry,
                     content_loc,
                     scale.x,
-                    false,
+                    // Keep surface-requested effects inside the viewport too.
+                    clipped_geometry != geometry,
                     surface,
                     surface_off,
                     surface_anim_scale,
@@ -1958,6 +2008,10 @@ impl LayoutElement for Mapped {
             self.mirror_size = size;
             self.mirror_sizing_mode = mode;
             self.mirror_pending_sizing_mode = mode;
+            // Going into real fullscreen resets windowed fullscreen.
+            if mode == SizingMode::Fullscreen {
+                self.mirror_windowed_fullscreen = false;
+            }
             let _ = (animate, transaction);
             return;
         }
@@ -2473,8 +2527,8 @@ impl LayoutElement for Mapped {
         self.ignore_opacity_window_rule
     }
 
-    fn effective_cursor_capture(&self) -> bool {
-        Mapped::effective_cursor_capture(self)
+    fn effective_cursor_capture_rule(&self) -> Option<bool> {
+        Mapped::effective_cursor_capture_rule(self)
     }
 
     fn effective_block_out_from(&self) -> Option<BlockOutFrom> {
@@ -2583,7 +2637,7 @@ impl LayoutElement for Mapped {
 
     fn is_windowed_fullscreen(&self) -> bool {
         if self.is_mirror {
-            return self.mirror_sizing_mode.is_fullscreen();
+            return self.mirror_windowed_fullscreen;
         }
 
         self.is_windowed_fullscreen
@@ -2591,7 +2645,7 @@ impl LayoutElement for Mapped {
 
     fn is_pending_windowed_fullscreen(&self) -> bool {
         if self.is_mirror {
-            return self.mirror_pending_sizing_mode.is_fullscreen();
+            return self.mirror_windowed_fullscreen;
         }
 
         self.is_pending_windowed_fullscreen
@@ -2599,13 +2653,9 @@ impl LayoutElement for Mapped {
 
     fn request_windowed_fullscreen(&mut self, value: bool) {
         if self.is_mirror {
-            let mode = if value {
-                SizingMode::Fullscreen
-            } else {
-                SizingMode::Normal
-            };
-            self.mirror_sizing_mode = mode;
-            self.mirror_pending_sizing_mode = mode;
+            // The layout sizes windowed-fullscreen mirrors in their Normal/Maximized mode, same as
+            // real windows, so this doesn't touch the sizing mode.
+            self.mirror_windowed_fullscreen = value;
             return;
         }
 

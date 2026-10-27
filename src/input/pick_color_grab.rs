@@ -14,6 +14,7 @@ use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 
 use crate::niri::State;
 use crate::render_helpers::{render_and_download, RenderCtx, RenderTarget};
+use crate::utils::output_size;
 use crate::zoom::zoom_display_cursor_logical;
 
 pub struct PickColorGrab {
@@ -40,12 +41,9 @@ impl PickColorGrab {
         // When zoom is active, the cursor is visually clamped to the zoom viewport.
         // Compute the display position on-the-fly from viewport math.
         let pos_within_output = if data.niri.layout.zoom_is_active_for_output(&output) {
-            let mode_size = output.current_mode().map(|m| m.size).unwrap_or_default();
-            let scale = output.current_scale().fractional_scale();
-            let output_size = mode_size.to_f64().to_logical(scale);
             zoom_display_cursor_logical(
                 pos_within_output,
-                output_size,
+                output_size(&output),
                 data.niri.layout.zoom_level_for_output(&output),
                 data.niri.layout.zoom_focal_for_output(&output),
             )

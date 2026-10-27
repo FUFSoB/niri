@@ -14,6 +14,7 @@ use crate::niri::PointerRenderElements;
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
+use crate::utils::output_size;
 
 // Define a type alias for the common zoom wrapper: Relocate(Rescale(T))
 pub type ZoomWrapper<T> = RelocateRenderElement<RescaleRenderElement<T>>;
@@ -80,9 +81,11 @@ pub struct OutputZoomState {
 impl OutputZoomState {
     /// Create a new zoom state centered on the given output.
     pub fn new_for_output(output: &Output) -> Self {
-        let mode_size = output.current_mode().map_or((0, 0).into(), |m| m.size);
-        let scale = output.current_scale().fractional_scale();
-        let logical_size = mode_size.to_f64().to_logical(scale);
+        let logical_size = if output.current_mode().is_some() {
+            output_size(output)
+        } else {
+            Size::default()
+        };
         Self {
             level: 1.0,
             focal: Point::from((logical_size.w / 2.0, logical_size.h / 2.0)),
@@ -287,6 +290,34 @@ pub fn zoom_display_cursor_logical(
     ))
 }
 
+/// Maps an output-local logical point to where it is displayed on the zoomed screen.
+pub fn zoom_point_to_screen(
+    point: Point<f64, Logical>,
+    zoom_level: f64,
+    zoom_focal: Point<f64, Logical>,
+) -> Point<f64, Logical> {
+    if zoom_level <= 1.0 {
+        return point;
+    }
+
+    (point - zoom_focal).upscale(zoom_level) + zoom_focal
+}
+
+/// Maps an output-local point on the zoomed screen back to logical (unzoomed) coordinates.
+///
+/// This is the inverse of [`zoom_point_to_screen`].
+pub fn zoom_point_from_screen(
+    point: Point<f64, Logical>,
+    zoom_level: f64,
+    zoom_focal: Point<f64, Logical>,
+) -> Point<f64, Logical> {
+    if zoom_level <= 1.0 {
+        return point;
+    }
+
+    (point - zoom_focal).downscale(zoom_level) + zoom_focal
+}
+
 pub(crate) fn compute_on_edge_cursor_anchor(
     cursor_local: Point<f64, Logical>,
     zoom_level: f64,
@@ -393,6 +424,35 @@ mod tests {
 
         assert!((focal.x - focal2.x).abs() < 1.0);
         assert!((focal.y - focal2.y).abs() < 1.0);
+    }
+
+    #[test]
+    fn zoom_point_screen_roundtrip() {
+        let focal = Point::from((300.0, 200.0));
+        let zoom = 2.5;
+
+        // The focal point stays in place.
+        assert_eq!(zoom_point_to_screen(focal, zoom, focal), focal);
+        assert_eq!(zoom_point_from_screen(focal, zoom, focal), focal);
+
+        let screen = Point::from((1000.0, 50.0));
+        let logical = zoom_point_from_screen(screen, zoom, focal);
+        assert_eq!(logical, Point::from((580.0, 140.0)));
+        assert_eq!(zoom_point_to_screen(logical, zoom, focal), screen);
+
+        // Screen corners map to the zoomed viewport corners.
+        let size = Size::from((1920.0, 1080.0));
+        let viewport = apply_zoom_viewport(Rectangle::from_size(size), focal, zoom);
+        let top_left = zoom_point_from_screen(Point::from((0.0, 0.0)), zoom, focal);
+        assert!((top_left.x - viewport.loc.x).abs() < 1e-9);
+        assert!((top_left.y - viewport.loc.y).abs() < 1e-9);
+        let bottom_right = zoom_point_from_screen(size.to_point(), zoom, focal);
+        assert!((bottom_right.x - (viewport.loc.x + viewport.size.w)).abs() < 1e-9);
+        assert!((bottom_right.y - (viewport.loc.y + viewport.size.h)).abs() < 1e-9);
+
+        // No-op without zoom.
+        assert_eq!(zoom_point_from_screen(screen, 1.0, focal), screen);
+        assert_eq!(zoom_point_to_screen(screen, 1.0, focal), screen);
     }
 
     #[test]

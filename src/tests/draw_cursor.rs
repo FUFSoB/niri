@@ -20,6 +20,7 @@ use smithay::wayland::compositor::with_states;
 
 use super::client::{LayerConfigureProps, SyncData};
 use super::*;
+use crate::cursor::RenderCursor;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::LayoutElement;
 use crate::niri::{PointerVisibility, WindowScreenshotRenderElement};
@@ -379,6 +380,8 @@ fn set_cursor_image(f: &mut Fixture, image: CursorImageStatus) {
 
 fn create_top_layer(f: &mut Fixture, size: (u16, u16)) {
     let id = f.add_client();
+    // wl_output names arrive after the registry bind, which needs another roundtrip.
+    f.roundtrip(id);
     let output = f.client(id).output("headless-1");
     let layer = f
         .client(id)
@@ -898,6 +901,75 @@ fn draw_cursor_always_hidden_stays_hidden_on_screencast_during_workspace_switch(
     let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Screencast, true);
 
     assert_eq!(with_pointer, without_pointer);
+}
+
+#[test]
+fn draw_cursor_always_hidden_hides_screencast_when_switching_onto_hidden_window() {
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        matches: vec![WindowMatch {
+            title: Some(RegexEq::from_str("^hidden$").unwrap()),
+            ..Default::default()
+        }],
+        draw_cursor: Some(DrawCursor::AlwaysHidden),
+        ..Default::default()
+    });
+
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let visible = create_window(&mut f, "visible", (40, 30));
+    let hidden = create_window(&mut f, "hidden", (40, 30));
+    f.niri().layout.move_to_workspace_down(true);
+    f.niri().layout.activate_window(&visible);
+    f.niri_complete_animations();
+
+    move_cursor_to_window(&mut f, visible);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+
+    let output = f.niri_output(1);
+    start_workspace_switch(&mut f, &output);
+
+    // The frozen pointer window is the visible one, but the pointer is already over the hidden
+    // window on the destination workspace.
+    let pointer_owner = f.niri().pointer_contents.window.map(|(id, _)| id);
+    assert_eq!(pointer_owner, Some(visible));
+    let cursor = cursor_pos(&mut f);
+    let live_window_under_cursor = f.niri().contents_under(cursor).window.map(|(id, _)| id);
+    assert_eq!(live_window_under_cursor, Some(hidden));
+
+    let without_pointer = render_output_pixels(&mut f, &output, RenderTarget::Screencast, false);
+    let with_pointer = render_output_pixels(&mut f, &output, RenderTarget::Screencast, true);
+    assert_eq!(with_pointer, without_pointer);
+}
+
+#[test]
+fn image_copy_cursor_capture_respects_cursor_window_rules() {
+    let Some(mut f) = set_up(config_with_draw_cursor(DrawCursor::HiddenOnCapture)) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::default_named());
+
+    assert!(matches!(
+        f.niri().render_cursor_for_capture_target(1),
+        RenderCursor::Hidden
+    ));
+
+    let Some(mut f) = set_up(config_with_force_cursor_shape(ForceCursorShape::Shape(
+        CursorIcon::Crosshair,
+    ))) else {
+        return;
+    };
+    let window = create_window(&mut f, "test", (40, 30));
+    move_cursor_to_window(&mut f, window);
+    set_cursor_image(&mut f, CursorImageStatus::Hidden);
+
+    assert!(matches!(
+        f.niri().render_cursor_for_capture_target(1),
+        RenderCursor::Named { .. }
+    ));
 }
 
 #[test]

@@ -46,7 +46,7 @@ layer-rule {
 
 You can also toggle block-out at runtime:
 
-- `niri msg action toggle-block-out-window` flips block-out for one window relative to its configured rule.
+- `niri msg action toggle-block-out-window` flips block-out for one window (and its mirrors); the override stays until you toggle it back.
 - `niri msg action toggle-block-out` disables or re-enables all block-out rendering globally.
 - `niri msg block-out-state` shows whether block-out is globally enabled and which windows or layer-shell surfaces are currently blocked out.
 

@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use niri_config::animations::{Kind, SpringParams};
+use niri_config::ZoomMovementMode;
 use smithay::utils::Point;
 
+use super::*;
 use crate::animation::Clock;
 use crate::layout::{ZoomFocalAnimation, ZoomLevelAnimation, ZoomLevelProgress};
 use crate::zoom::OutputZoomState;
@@ -100,4 +102,95 @@ fn zoom_focal_animation_is_done() {
 
     // Should not be done at start
     assert!(!anim.is_done());
+}
+
+fn zoomed_layout(mode: ZoomMovementMode) -> (Layout<TestWindow>, Output) {
+    let mut layout = check_ops([Op::AddOutput(1)]);
+    let output = layout.outputs().next().unwrap().clone();
+
+    layout.set_zoom_level(&output, 2.0, Point::from((200., 150.)), &mode, false);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    assert_eq!(layout.zoom_level_for_output(&output), 2.0);
+
+    (layout, output)
+}
+
+#[test]
+fn locked_focal_survives_set_zoom_level() {
+    for mode in [
+        ZoomMovementMode::CursorFollow,
+        ZoomMovementMode::Centered,
+        ZoomMovementMode::OnEdge,
+    ] {
+        let (mut layout, output) = zoomed_layout(mode);
+        assert!(!layout.toggle_zoom_lock(&output));
+        let focal = layout.zoom_focal_for_output(&output);
+
+        // Change the zoom level with the cursor far away from the focal point.
+        layout.set_zoom_level(&output, 3.0, Point::from((1200., 700.)), &mode, true);
+        check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+        assert_eq!(layout.zoom_level_for_output(&output), 3.0, "{mode:?}");
+        assert_eq!(layout.zoom_focal_for_output(&output), focal, "{mode:?}");
+    }
+}
+
+#[test]
+fn locked_focal_survives_zoom_gesture() {
+    for mode in [
+        ZoomMovementMode::CursorFollow,
+        ZoomMovementMode::Centered,
+        ZoomMovementMode::OnEdge,
+    ] {
+        let (mut layout, output) = zoomed_layout(mode);
+        assert!(!layout.toggle_zoom_lock(&output));
+        let focal = layout.zoom_focal_for_output(&output);
+
+        layout.zoom_gesture_begin(
+            &output,
+            Some(Point::from((1200., 700.))),
+            Some(Size::from((1280., 720.))),
+            Some(mode),
+        );
+        layout.zoom_gesture_update(&output, 1., 1., Duration::from_millis(0));
+        layout.zoom_gesture_update(&output, 1.5, 1., Duration::from_millis(10));
+        layout.zoom_gesture_update(&output, 2., 1., Duration::from_millis(20));
+        assert_eq!(layout.zoom_gesture_end(&output, false), Some(true));
+        check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+        assert!(layout.zoom_level_for_output(&output) > 2.0, "{mode:?}");
+        assert_eq!(layout.zoom_focal_for_output(&output), focal, "{mode:?}");
+        assert!(!layout.zoom_state_for_output(&output).unwrap().transitioning);
+    }
+}
+
+#[test]
+fn zoom_focal_clamped_on_output_resize() {
+    let (mut layout, output) = zoomed_layout(ZoomMovementMode::CursorFollow);
+    layout.set_zoom_level(
+        &output,
+        2.0,
+        Point::from((1200., 700.)),
+        &ZoomMovementMode::CursorFollow,
+        false,
+    );
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    assert_eq!(
+        layout.zoom_focal_for_output(&output),
+        Point::from((1200., 700.))
+    );
+
+    output.change_current_state(
+        Some(Mode {
+            size: Size::from((800, 600)),
+            refresh: 60000,
+        }),
+        None,
+        None,
+        None,
+    );
+    layout.update_output_size(&output);
+
+    let focal = layout.zoom_focal_for_output(&output);
+    assert!(focal.x <= 800. && focal.y <= 600., "{focal:?}");
 }

@@ -19,7 +19,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
-use smithay::utils::{Logical, Rectangle, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
     HookId, SurfaceAttributes,
@@ -145,7 +145,7 @@ impl XdgShellHandler for State {
             return;
         };
 
-        let Some((mapped, output)) = self.niri.layout.find_window_and_output(wl_surface) else {
+        let Some((mapped, output)) = self.csd_grab_target(wl_surface, start_data.location()) else {
             return;
         };
 
@@ -238,7 +238,7 @@ impl XdgShellHandler for State {
             return;
         };
 
-        let Some((mapped, _)) = self.niri.layout.find_window_and_output(wl_surface) else {
+        let Some((mapped, _)) = self.csd_grab_target(wl_surface, start_data.location()) else {
             return;
         };
 
@@ -1082,6 +1082,31 @@ impl XdgForeignHandler for State {
 }
 
 impl State {
+    /// Finds the window that a client-initiated (CSD) move or resize should act on.
+    ///
+    /// Requests come from the source window's surface, but when the grab started inside one of
+    /// its mirrors, they should act on that mirror rather than on the source.
+    pub(crate) fn csd_grab_target(
+        &self,
+        wl_surface: &WlSurface,
+        location: Point<f64, Logical>,
+    ) -> Option<(&Mapped, Option<&Output>)> {
+        let (mapped, output) = self.niri.layout.find_window_and_output(wl_surface)?;
+
+        if let Some((id, _)) = self.niri.contents_under(location).window {
+            let mirror = self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, m)| m.id() == id && m.is_mirror() && m.source_id() == mapped.id());
+            if let Some((mon, mirror)) = mirror {
+                return Some((mirror, mon.map(|mon| mon.output())));
+            }
+        }
+
+        Some((mapped, output))
+    }
+
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
@@ -1444,10 +1469,27 @@ impl State {
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
-            if mapped.recompute_window_rules(window_rules, self.niri.is_at_startup) {
-                drop(config);
-                let output = output.cloned();
-                let window = mapped.id();
+            let is_at_startup = self.niri.is_at_startup;
+            let source_id = mapped.source_id();
+            let mut changed = Vec::new();
+            if mapped.recompute_window_rules(window_rules, is_at_startup) {
+                changed.push((mapped.id(), output.cloned()));
+            }
+
+            // Mirrors share the toplevel (so its title and app ID) but aren't found by surface
+            // above. Recompute their rules too, otherwise e.g. a block-out-from rule matching the
+            // new title wouldn't apply to them.
+            self.niri.layout.with_windows_mut(|mapped, output| {
+                if mapped.is_mirror()
+                    && mapped.source_id() == source_id
+                    && mapped.recompute_window_rules(window_rules, is_at_startup)
+                {
+                    changed.push((mapped.id(), output.cloned()));
+                }
+            });
+            drop(config);
+
+            for (window, output) in changed {
                 self.niri.layout.update_window(&window, None);
 
                 if let Some(output) = output {

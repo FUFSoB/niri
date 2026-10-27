@@ -33,6 +33,10 @@ pub struct MirrorViewGrab {
     // Updated from absolute or relative motion, then applied in frame().
     new_location: Point<f64, Logical>,
     event_timestamp: Option<Duration>,
+    // Whether absolute motion arrived since the last frame. Relative motion is only used to move
+    // new_location when it comes alone (e.g. locked pointer), since otherwise the absolute motion
+    // already includes the same delta.
+    got_absolute_motion: bool,
 }
 
 impl MirrorViewGrab {
@@ -47,6 +51,7 @@ impl MirrorViewGrab {
         Self {
             new_location: start_data.location,
             event_timestamp: None,
+            got_absolute_motion: false,
             start_data,
             window,
             mode,
@@ -108,6 +113,7 @@ impl PointerGrab<State> for MirrorViewGrab {
         handle.motion(data, None, event);
 
         self.new_location = event.location;
+        self.got_absolute_motion = true;
         self.event_timestamp = Some(Duration::from_micros(event.time.micros()));
     }
 
@@ -121,8 +127,10 @@ impl PointerGrab<State> for MirrorViewGrab {
         // While the grab is active, no client has pointer focus.
         handle.relative_motion(data, None, event);
 
-        self.new_location += event.delta;
-        self.event_timestamp = Some(Duration::from_micros(event.time.micros()));
+        if !self.got_absolute_motion {
+            self.new_location += event.delta;
+            self.event_timestamp = Some(Duration::from_micros(event.time.micros()));
+        }
     }
 
     fn button(
@@ -149,6 +157,7 @@ impl PointerGrab<State> for MirrorViewGrab {
 
     fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
         handle.frame(data);
+        self.got_absolute_motion = false;
 
         if !self.on_frame(data) {
             handle.unset_grab(

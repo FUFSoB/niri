@@ -562,7 +562,7 @@ impl Niri {
     }
 
     pub fn refresh_mapped_cast_targets(&mut self) {
-        let (window_targets, workspace_targets) = collect_active_cast_targets(
+        let (window_targets, active_window_targets, workspace_targets) = collect_cast_targets(
             self.casting
                 .casts
                 .iter()
@@ -577,8 +577,10 @@ impl Niri {
         });
 
         self.layout.with_windows_mut(|mapped, _| {
-            let is_window_target = window_targets.contains(&mapped.id().get());
-            let is_screen_target = is_window_target || screen_targets.contains(&mapped.id());
+            let id = mapped.id().get();
+            let is_window_target = window_targets.contains(&id);
+            let is_screen_target =
+                active_window_targets.contains(&id) || screen_targets.contains(&mapped.id());
 
             mapped.set_is_window_cast_target(is_window_target);
             mapped.set_is_screen_cast_target(is_screen_target);
@@ -763,7 +765,11 @@ impl Niri {
 
                 let mut elements = Vec::new();
                 let mut pointer_pos = Point::default();
-                if self.should_render_pointer_for_target(RenderTarget::Screencast, None) {
+                // While locked, render_workspace_for_screen_cast() shows the lock screen instead
+                // of the workspace, so the workspace pointer position is meaningless.
+                if !self.is_locked()
+                    && self.should_render_pointer_for_target(RenderTarget::Screencast, None)
+                {
                     if let Some(pos) = self.workspace_cast_pointer_pos(output, workspace.id()) {
                         pointer_pos = pos;
                         self.render_pointer(
@@ -783,8 +789,9 @@ impl Niri {
                     block_out_enabled: self.block_out_enabled,
                     xray: None,
                 };
+                // Workspace casts show the workspace itself, so they don't get the output zoom
+                // (and neither does the pointer above).
                 self.render_workspace_for_screen_cast(ctx, output, workspace, &mut |elem| {
-                    let elem = self.zoomed_element(elem, output, RenderTarget::Screencast);
                     elements.push(elem.into())
                 });
 
@@ -824,13 +831,21 @@ impl Niri {
                     // Only render when the pointer is within the output. Otherwise, it will
                     // happily appear anywhere outside the output video source in OBS.
                     if output_geo.contains(pointer_loc) {
-                        pointer_pos = pointer_loc - output_geo.loc;
+                        // Zoom the pointer the same way as on screen.
+                        pointer_pos = self.cursor_screen_pos_within_output(output, pointer_loc);
                         self.render_pointer(
                             renderer,
                             output,
                             RenderTarget::Screencast,
                             None,
-                            &mut |elem| elements.push(elem.into()),
+                            &mut |elem| {
+                                let elem = self.zoomed_element::<GlesRenderer>(
+                                    elem.into(),
+                                    output,
+                                    RenderTarget::Screencast,
+                                );
+                                elements.push(elem.into())
+                            },
                         );
                     }
                 }
@@ -1056,29 +1071,38 @@ impl Niri {
     }
 }
 
-fn collect_active_cast_targets<'a>(
+/// Window targets of all casts (regardless of `is_active`, like upstream, so that the
+/// `is-window-cast-target` window rule doesn't flip while a cast is paused), plus window and
+/// workspace targets of active casts only (used to force-render cast contents).
+fn collect_cast_targets<'a>(
     casts: impl IntoIterator<Item = (bool, &'a CastTarget)>,
-) -> (HashSet<u64>, HashSet<WorkspaceId>) {
+) -> (HashSet<u64>, HashSet<u64>, HashSet<WorkspaceId>) {
     let mut window_targets = HashSet::new();
-    let mut workspace_targets = HashSet::new();
+    let mut active_window_targets = HashSet::new();
+    let mut active_workspace_targets = HashSet::new();
 
     for (is_active, target) in casts {
-        if !is_active {
-            continue;
-        }
-
         match target {
             CastTarget::Window { id } => {
                 window_targets.insert(*id);
+                if is_active {
+                    active_window_targets.insert(*id);
+                }
             }
             CastTarget::Workspace { id, .. } => {
-                workspace_targets.insert(*id);
+                if is_active {
+                    active_workspace_targets.insert(*id);
+                }
             }
             CastTarget::Nothing | CastTarget::Output { .. } => (),
         }
     }
 
-    (window_targets, workspace_targets)
+    (
+        window_targets,
+        active_window_targets,
+        active_workspace_targets,
+    )
 }
 
 #[cfg(test)]
@@ -1104,8 +1128,8 @@ mod tests {
     }
 
     #[test]
-    fn inactive_casts_do_not_mark_targets() {
-        let (window_targets, workspace_targets) = collect_active_cast_targets([
+    fn inactive_casts_mark_window_rule_targets_only() {
+        let (window_targets, active_window_targets, workspace_targets) = collect_cast_targets([
             (false, &CastTarget::Window { id: 7 }),
             (
                 false,
@@ -1116,13 +1140,15 @@ mod tests {
             ),
         ]);
 
-        assert!(window_targets.is_empty());
+        // Paused casts still count for the is-window-cast-target window rule.
+        assert_eq!(window_targets, HashSet::from([7]));
+        assert!(active_window_targets.is_empty());
         assert!(workspace_targets.is_empty());
     }
 
     #[test]
     fn active_casts_mark_window_and_workspace_targets() {
-        let (window_targets, workspace_targets) = collect_active_cast_targets([
+        let (window_targets, active_window_targets, workspace_targets) = collect_cast_targets([
             (true, &CastTarget::Window { id: 7 }),
             (
                 true,
@@ -1135,7 +1161,8 @@ mod tests {
             (true, &CastTarget::Nothing),
         ]);
 
-        assert_eq!(window_targets, HashSet::from([7]));
+        assert_eq!(window_targets, HashSet::from([7, 99]));
+        assert_eq!(active_window_targets, HashSet::from([7]));
         assert_eq!(workspace_targets, HashSet::from([WorkspaceId::specific(3)]));
     }
 
