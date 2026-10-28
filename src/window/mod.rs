@@ -1,7 +1,9 @@
 use std::cmp::{max, min};
 
 use niri_config::utils::MergeWith as _;
-use niri_config::window_rule::{DrawCursor, ForceCursorShape, Match, OnXdgActivate, WindowRule};
+use niri_config::window_rule::{
+    DrawCursor, ForceCursorShape, Match, OnXdgActivate, VrrRule, WindowRule,
+};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
     ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
@@ -132,7 +134,7 @@ pub struct ResolvedWindowRules {
     pub cursor_capture: Option<bool>,
 
     /// Whether to enable VRR on this window's primary output if it is on-demand.
-    pub variable_refresh_rate: Option<bool>,
+    pub variable_refresh_rate: Option<VrrRule>,
 
     /// Multiplier for all scroll events sent to this window.
     pub scroll_factor: Option<f64>,

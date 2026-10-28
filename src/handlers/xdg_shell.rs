@@ -1336,15 +1336,20 @@ impl State {
     }
 
     fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window) {
+        let ime = matches!(popup, PopupKind::InputMethod(_));
+
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
-        let Some(window) = self.niri.find_mapped_id_by_window(window) else {
+        let Some(id) = self.niri.find_mapped_id_by_window(window) else {
             return;
         };
-        let mut target = self.niri.layout.popup_target_rect(&window);
+        let mut target = self.niri.layout.popup_target_rect(&id, ime);
         target.loc -= get_popup_toplevel_coords(popup).to_f64();
 
-        self.position_popup_within_rect(popup, target, true);
+        let geo_off = window.geometry().loc.to_f64();
+
+        // Don't add padding for IME popups; better to give them more space.
+        self.position_popup_within_rect(popup, geo_off, target, !ime);
     }
 
     pub fn unconstrain_layer_shell_popup(
@@ -1378,13 +1383,17 @@ impl State {
         target.loc -= layer_geo.loc;
         target.loc -= get_popup_toplevel_coords(popup);
 
+        // Layer surfaces don't have geometry.
+        let geo_off = Point::new(0., 0.);
+
         // Don't add padding to layer-shell popups. It's not really needed, and it's unexpected.
-        self.position_popup_within_rect(popup, target.to_f64(), false);
+        self.position_popup_within_rect(popup, geo_off, target.to_f64(), false);
     }
 
     fn position_popup_within_rect(
         &self,
         popup: &PopupKind,
+        geo_off: Point<f64, Logical>,
         target: Rectangle<f64, Logical>,
         padding: bool,
     ) {
@@ -1401,6 +1410,11 @@ impl State {
                 });
             }
             PopupKind::InputMethod(popup) => {
+                // IME popups are positioned in surface-local coordinates, but target is in
+                // geometry-relative coordinates.
+                let mut target = target;
+                target.loc += geo_off;
+
                 let text_input_rectangle = popup.text_input_rectangle();
                 let mut bbox =
                     utils::bbox_from_surface_tree(popup.wl_surface(), text_input_rectangle.loc)
@@ -1412,7 +1426,7 @@ impl State {
                     bbox.loc.x -= overflow_x;
                 }
 
-                // Ensure that the popup starts within the window.
+                // Ensure that the popup starts within the target rect.
                 bbox.loc.x = f64::max(bbox.loc.x, target.loc.x);
 
                 // Try to position IME popup below the text input rectangle.
