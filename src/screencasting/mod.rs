@@ -199,7 +199,7 @@ impl State {
                 }
                 return;
             }
-            CastTarget::Window { id } => *id,
+            CastTarget::Window { id } => MappedId::specific(*id),
         };
 
         // Lack of partial borrowing strikes again...
@@ -208,9 +208,9 @@ impl State {
         let mut stop = false;
         // Use a loop {} so we can break instead of early-return.
         #[allow(clippy::never_loop)]
+        #[allow(clippy::while_let_loop)]
         loop {
-            let mut windows = self.niri.layout.windows();
-            let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == id) else {
+            let Some((mapped, _)) = self.niri.find_mapped_output_by_id(id) else {
                 break;
             };
 
@@ -274,13 +274,16 @@ impl State {
                     }
                 }
 
-                let main_start = elements.len();
-                mapped.render_for_screen_cast(
+                let ctx = RenderCtx {
                     renderer,
-                    scale,
-                    self.niri.block_out_enabled,
-                    &mut |elem| elements.push(CastRenderElement::from(elem)),
-                );
+                    target: RenderTarget::Screencast,
+                    block_out_enabled: self.niri.block_out_enabled,
+                    xray: None,
+                };
+                let main_start = elements.len();
+                mapped.render_for_screen_cast(ctx, scale, &mut |elem| {
+                    elements.push(CastRenderElement::from(elem))
+                });
 
                 let cursor_data =
                     CursorData::compute(&elements, main_start, pointer_location, scale);
@@ -561,13 +564,18 @@ impl Niri {
         });
     }
 
-    pub fn refresh_mapped_cast_targets(&mut self) {
-        let (window_targets, active_window_targets, workspace_targets) = collect_cast_targets(
+    /// Refreshes window and screen cast target flags of mapped windows.
+    ///
+    /// `image_copy_targets` are windows targeted by ext-image-copy casts, which count as window
+    /// cast targets too.
+    pub fn refresh_mapped_cast_targets(&mut self, image_copy_targets: &HashSet<MappedId>) {
+        let (mut window_targets, active_window_targets, workspace_targets) = collect_cast_targets(
             self.casting
                 .casts
                 .iter()
                 .map(|cast| (cast.is_active(), &cast.target)),
         );
+        window_targets.extend(image_copy_targets.iter().map(|id| id.get()));
 
         let mut screen_targets = HashSet::new();
         self.layout.with_windows(|mapped, _, workspace_id, _| {
@@ -961,8 +969,14 @@ impl Niri {
                 }
             }
 
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                block_out_enabled: self.block_out_enabled,
+                xray: None,
+            };
             let main_start = elements.len();
-            mapped.render_for_screen_cast(renderer, scale, self.block_out_enabled, &mut |elem| {
+            mapped.render_for_screen_cast(ctx, scale, &mut |elem| {
                 elements.push(CastRenderElement::from(elem))
             });
 

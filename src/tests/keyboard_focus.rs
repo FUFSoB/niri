@@ -65,7 +65,7 @@ fn flush_lost_keyboard_state_releases_forwarded_modifiers() {
     assert!(keyboard.modifier_state().logo);
     assert!(keyboard.pressed_keys().contains(&keycode));
 
-    f.niri_state().flush_lost_keyboard_state();
+    f.niri_state().flush_lost_keyboard_state(InputTime::now());
 
     let keyboard = f.niri().seat.get_keyboard().unwrap();
     assert!(!keyboard.modifier_state().logo);
@@ -85,7 +85,7 @@ fn flush_lost_keyboard_state_clears_suppressed_keys() {
     assert!(keyboard.pressed_keys().contains(&keycode));
     assert!(f.niri().suppressed_keys.contains(&keycode));
 
-    f.niri_state().flush_lost_keyboard_state();
+    f.niri_state().flush_lost_keyboard_state(InputTime::now());
 
     let keyboard = f.niri().seat.get_keyboard().unwrap();
     assert!(!keyboard.modifier_state().logo);
@@ -106,11 +106,12 @@ fn flush_lost_keyboard_state_cancels_mru() {
             filter: None,
         },
         false,
+        InputTime::now(),
     );
 
     assert!(f.niri().window_mru_ui.is_open());
 
-    f.niri_state().flush_lost_keyboard_state();
+    f.niri_state().flush_lost_keyboard_state(InputTime::now());
 
     assert!(!f.niri().window_mru_ui.is_open());
 }

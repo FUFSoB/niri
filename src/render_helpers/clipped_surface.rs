@@ -114,7 +114,7 @@ impl<R: NiriRenderer, E: ClippedSurfaceInner<R>> ClippedSurfaceRenderElement<R, 
         let sample_transform = Self::shader_transform_matrix(self.inner.sample_transform());
 
         let y_invert = if buffer_y_inverted(inner.buffer()).unwrap_or(false) {
-            Mat3::from_scale(Vec2::new(1., -1.))
+            Mat3::from_translation(Vec2::new(0., 1.)) * Mat3::from_scale(Vec2::new(1., -1.))
         } else {
             Mat3::IDENTITY
         };

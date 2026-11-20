@@ -4,13 +4,14 @@ use niri_config::input::FocusFollowsMouse;
 use niri_config::layer_rule::{LayerRule, Match as LayerMatch};
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
-use niri_config::{Action, BlockOutFrom, Config, CornerRadius};
+use niri_config::{Action, BlockOutFrom, BlockOutKind, BlockOutTarget, Config, CornerRadius};
 use niri_ipc::state::EventStreamStatePart as _;
 use niri_ipc::{
     BlockOutFrom as IpcBlockOutFrom, Layer as IpcLayer, PositionChange, SizeChange,
     Transform as IpcTransform,
 };
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::input::InputTime;
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement,
 };
@@ -210,9 +211,13 @@ fn render_window_cast_pixels(f: &mut Fixture, output: &Output) -> (Size<i32, Phy
             let mapped = niri.layout.windows_for_output(&output).next().unwrap();
 
             let mut elements = Vec::new();
-            mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
-                elements.push(elem)
-            });
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+            mapped.render_for_screen_cast(ctx, scale, &mut |elem| elements.push(elem));
 
             let geo = encompassing_geo(scale, elements.iter());
             let elements = elements.iter().rev().map(|elem| {
@@ -255,9 +260,13 @@ fn render_window_cast_pixels_for(
                 .unwrap();
 
             let mut elements = Vec::new();
-            mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
-                elements.push(elem)
-            });
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+            mapped.render_for_screen_cast(ctx, scale, &mut |elem| elements.push(elem));
 
             // Like the real window cast, render into the window cast bbox.
             let geo = Rectangle::from_size(mapped.window_cast_bbox(scale).size);
@@ -301,9 +310,13 @@ fn render_cropped_window_cast_pixels_for(
                 .unwrap();
 
             let mut elements = Vec::new();
-            mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
-                elements.push(elem)
-            });
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+            mapped.render_for_screen_cast(ctx, scale, &mut |elem| elements.push(elem));
 
             // Like the real window cast, render into the window cast bbox.
             let geo = Rectangle::from_size(mapped.window_cast_bbox(scale).size);
@@ -1063,11 +1076,15 @@ fn mirror_zoom_actions_crop_to_requested_region() {
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
 
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let mapped = f
@@ -1105,8 +1122,11 @@ fn mirror_directional_pan_actions_move_by_visible_fraction() {
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
 
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
 
     let center = Point::from((10., 10.));
     let before = f
@@ -1118,7 +1138,7 @@ fn mirror_directional_pan_actions_move_by_visible_fraction() {
         .unwrap();
 
     f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewRight, false);
+        .do_action(Action::MoveWindowMirrorViewRight, false, InputTime::now());
 
     let after = f
         .niri()
@@ -1151,6 +1171,7 @@ fn flipped_mirror_point_maps_to_source_opposite_edge() {
     f.niri_state().do_action(
         Action::SetWindowMirrorTransform(IpcTransform::Flipped),
         false,
+        InputTime::now(),
     );
 
     let mapped = f
@@ -1187,10 +1208,16 @@ fn rotated_mirror_directional_pan_is_screen_relative() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
 
     let center = Point::from((5., 10.));
     let before = f
@@ -1202,7 +1229,7 @@ fn rotated_mirror_directional_pan_is_screen_relative() {
         .unwrap();
 
     f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewRight, false);
+        .do_action(Action::MoveWindowMirrorViewRight, false, InputTime::now());
 
     let after = f
         .niri()
@@ -1271,11 +1298,15 @@ fn zoomed_mirror_hover_uses_source_surface_coords() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let source_surface = f
@@ -1305,11 +1336,15 @@ fn zoomed_mirror_does_not_take_input_outside_window_bounds() {
 
     let mirror_id = create_window_mirror(&mut f);
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let (pos, size) = tile_geometry_for(&mut f, mirror_id);
@@ -1377,11 +1412,15 @@ fn zoomed_mirror_hover_keeps_source_surface_origin_at_left_edge() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let source_surface = f
@@ -1413,6 +1452,7 @@ fn zoomed_mirror_hover_keeps_source_surface_origin_at_left_edge() {
 fn focus_follows_mouse_switches_from_zoomed_mirror_to_source_window() {
     let mut config = Config::default();
     config.input.focus_follows_mouse = Some(FocusFollowsMouse {
+        outputs_only: None,
         max_scroll_amount: None,
     });
 
@@ -1438,11 +1478,15 @@ fn focus_follows_mouse_switches_from_zoomed_mirror_to_source_window() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let (source_pos, source_size) = tile_geometry_for(&mut f, source_id);
@@ -1502,14 +1546,21 @@ fn mirror_created_from_mirror_inherits_view_state() {
         .layout
         .set_window_height(Some(&mirror1_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror1_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
 
     let mirror2_id = create_window_mirror_for(&mut f, mirror1_id);
 
@@ -1800,8 +1851,11 @@ fn mirror_linked_group_does_not_sync_transform() {
     assert!(f.niri().layout.toggle_window_mirror_link(&mirror2_id));
 
     f.niri().layout.activate_window(&mirror1_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
 
     let mirror1_transform = f
         .niri()
@@ -1838,11 +1892,15 @@ fn mirror_view_tracks_source_resize_proportionally() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterX(PositionChange::SetProportion(75.)),
         false,
+        InputTime::now(),
     );
 
     let window = f.client(id).window(&source);
@@ -1987,8 +2045,11 @@ fn rotated_mirror_window_cast_letterboxes_sideways() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
 
     let output = f.niri_output(1);
     let (size, pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
@@ -2022,12 +2083,18 @@ fn rotated_zoomed_panned_mirror_window_cast_stays_clipped_to_viewport() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
-    f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewDown, false);
+        .do_action(Action::MoveWindowMirrorViewDown, false, InputTime::now());
 
     let output = f.niri_output(1);
     let (size, pixels) = render_window_cast_pixels_for(&mut f, &output, mirror_id);
@@ -2057,12 +2124,18 @@ fn cropped_rotated_zoomed_panned_mirror_keeps_full_viewport() {
         .layout
         .set_window_height(Some(&mirror_id), SizeChange::SetFixed(20));
     f.niri().layout.activate_window(&mirror_id);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_180),
+        false,
+        InputTime::now(),
+    );
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_180), false);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
-    f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewDown, false);
+        .do_action(Action::MoveWindowMirrorViewDown, false, InputTime::now());
 
     let output = f.niri_output(1);
     let (size, pixels) = render_cropped_window_cast_pixels_for(&mut f, &output, mirror_id);
@@ -2426,8 +2499,11 @@ fn mirror_animation_snapshot_preserves_rotation() {
     let mirror_id = create_window_mirror(&mut f);
     float_mirror_with_size(&mut f, mirror_id, 40, 20);
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
 
     let (_, snapshot_geo) = assert_snapshot_matches_window_cast(&mut f, mirror_id);
     // Rotated contents are letterboxed sideways.
@@ -2448,10 +2524,16 @@ fn mirror_animation_snapshot_crops_rotated_zoomed_contents() {
     let mirror_id = create_window_mirror(&mut f);
     float_mirror_with_size(&mut f, mirror_id, 20, 20);
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorTransform(IpcTransform::_90), false);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorTransform(IpcTransform::_90),
+        false,
+        InputTime::now(),
+    );
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
 
     let (live_size, snapshot_geo) = assert_snapshot_matches_window_cast(&mut f, mirror_id);
     assert_eq!(
@@ -2519,8 +2601,11 @@ fn mirror_click_installs_mirror_click_grab() {
     let mirror_id = create_window_mirror(&mut f);
     float_mirror_with_size(&mut f, mirror_id, 20, 20);
     f.niri().layout.activate_window(&mirror_id);
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("2.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("2.0".into()),
+        false,
+        InputTime::now(),
+    );
 
     let (pos, _) = tile_geometry_for(&mut f, mirror_id);
     let client = f.client(id);
@@ -2599,11 +2684,15 @@ fn panning_mirror_view_keeps_other_axis() {
     float_mirror_with_size(&mut f, mirror_id, 20, 20);
     f.niri().layout.activate_window(&mirror_id);
     // At 4x zoom, 10x10 of the 40x20 source is visible, so both axes can pan.
-    f.niri_state()
-        .do_action(Action::SetWindowMirrorZoom("4.0".into()), false);
+    f.niri_state().do_action(
+        Action::SetWindowMirrorZoom("4.0".into()),
+        false,
+        InputTime::now(),
+    );
     f.niri_state().do_action(
         Action::SetWindowMirrorCenterY(PositionChange::SetProportion(25.)),
         false,
+        InputTime::now(),
     );
 
     let center_source_point = |f: &mut Fixture| {
@@ -2618,13 +2707,13 @@ fn panning_mirror_view_keeps_other_axis() {
     assert_eq!(before.y, 5.);
 
     f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewRight, false);
+        .do_action(Action::MoveWindowMirrorViewRight, false, InputTime::now());
     let after = center_source_point(&mut f);
     assert!(after.x > before.x);
     assert_eq!(after.y, before.y);
 
     f.niri_state()
-        .do_action(Action::MoveWindowMirrorViewDown, false);
+        .do_action(Action::MoveWindowMirrorViewDown, false, InputTime::now());
     let after_down = center_source_point(&mut f);
     assert!(after_down.y > after.y);
     assert_eq!(after_down.x, after.x);
@@ -2634,6 +2723,7 @@ fn panning_mirror_view_keeps_other_axis() {
 fn focus_follows_mouse_ignores_window_moved_under_stationary_pointer() {
     let mut config = Config::default();
     config.input.focus_follows_mouse = Some(FocusFollowsMouse {
+        outputs_only: None,
         max_scroll_amount: None,
     });
     let Some(mut f) = set_up(config) else {
@@ -3047,7 +3137,10 @@ fn blocked_layer_reveals_background_in_screen_capture() {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3104,7 +3197,10 @@ fn blocked_window_cast_is_fully_transparent() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3133,7 +3229,10 @@ fn blocked_mirror_window_cast_is_fully_transparent() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3177,7 +3276,7 @@ fn toggle_block_out_window_enables_and_disables_ruleless_window() {
     assert!(!focused_window_is_block_out(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(focused_window_is_block_out(&mut f));
 
     let output = f.niri_output(1);
@@ -3188,7 +3287,7 @@ fn toggle_block_out_window_enables_and_disables_ruleless_window() {
     );
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(!focused_window_is_block_out(&mut f));
 
     let (size, pixels) = render_window_cast_pixels(&mut f, &output);
@@ -3219,7 +3318,7 @@ fn toggle_block_out_window_targets_focused_sticky_window() {
     assert!(!window_is_block_out(&mut f, tiling));
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
 
     assert!(window_is_block_out(&mut f, sticky));
     assert!(!window_is_block_out(&mut f, tiling));
@@ -3233,7 +3332,10 @@ fn toggle_block_out_window_disables_and_restores_configured_rule() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3247,7 +3349,7 @@ fn toggle_block_out_window_disables_and_restores_configured_rule() {
     assert!(focused_window_is_block_out(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(!focused_window_is_block_out(&mut f));
 
     let output = f.niri_output(1);
@@ -3258,7 +3360,7 @@ fn toggle_block_out_window_disables_and_restores_configured_rule() {
     );
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(focused_window_is_block_out(&mut f));
 
     let (size, pixels) = render_window_cast_pixels(&mut f, &output);
@@ -3290,7 +3392,13 @@ fn set_window_title(f: &mut Fixture, id: ClientId, surface: &WlSurface, title: &
 
 #[test]
 fn toggle_block_out_window_override_survives_rule_starting_to_match() {
-    let config = config_with_title_block_out("^secret$", BlockOutFrom::ScreenCapture);
+    let config = config_with_title_block_out(
+        "^secret$",
+        BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        },
+    );
     let Some(mut f) = set_up(config) else {
         return;
     };
@@ -3301,7 +3409,7 @@ fn toggle_block_out_window_override_survives_rule_starting_to_match() {
     assert!(!window_is_block_out(&mut f, window));
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(window_is_block_out(&mut f, window));
 
     // The rule starting to match must not flip the toggled window back to unblocked.
@@ -3310,7 +3418,7 @@ fn toggle_block_out_window_override_survives_rule_starting_to_match() {
 
     // Toggling off sticks even while the rule matches.
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
     assert!(!window_is_block_out(&mut f, window));
 
     set_window_title(&mut f, id, &surface, "plain");
@@ -3330,20 +3438,32 @@ fn toggle_block_out_window_applies_to_source_and_mirrors() {
     let source = f.niri().layout.focus().unwrap().id();
     let mirror = create_window_mirror_for(&mut f, source);
 
-    f.niri_state()
-        .do_action(Action::ToggleBlockOutWindowById(mirror.get()), false);
+    f.niri_state().do_action(
+        Action::ToggleBlockOutWindowById(mirror.get()),
+        false,
+        InputTime::now(),
+    );
     assert!(window_is_block_out(&mut f, source));
     assert!(window_is_block_out(&mut f, mirror));
 
-    f.niri_state()
-        .do_action(Action::ToggleBlockOutWindowById(source.get()), false);
+    f.niri_state().do_action(
+        Action::ToggleBlockOutWindowById(source.get()),
+        false,
+        InputTime::now(),
+    );
     assert!(!window_is_block_out(&mut f, source));
     assert!(!window_is_block_out(&mut f, mirror));
 }
 
 #[test]
 fn mirror_rules_follow_source_title_change() {
-    let config = config_with_title_block_out("^secret$", BlockOutFrom::Screencast);
+    let config = config_with_title_block_out(
+        "^secret$",
+        BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        },
+    );
     let Some(mut f) = set_up(config) else {
         return;
     };
@@ -3374,7 +3494,10 @@ fn toggle_block_out_globally_disables_layer_block_out() {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3420,12 +3543,14 @@ fn toggle_block_out_globally_disables_layer_block_out() {
     let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
     assert_eq!(sample_pixel(size, &pixels, 10, 10), [255, 0, 0, 255]);
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
     assert_eq!(sample_pixel(size, &pixels, 10, 10), [0, 255, 0, 255]);
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let (size, pixels) = render_output_pixels(&mut f, &output, RenderTarget::ScreenCapture);
     assert_eq!(sample_pixel(size, &pixels, 10, 10), [255, 0, 0, 255]);
@@ -3439,7 +3564,10 @@ fn toggle_block_out_globally_disables_window_rendering_but_not_window_state() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3460,7 +3588,8 @@ fn toggle_block_out_globally_disables_window_rendering_but_not_window_state() {
         [0, 0, 0, 0]
     );
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
     assert!(focused_window_is_block_out(&mut f));
 
     let (size, pixels) = render_window_cast_pixels(&mut f, &output);
@@ -3469,7 +3598,8 @@ fn toggle_block_out_globally_disables_window_rendering_but_not_window_state() {
         [0, 255, 0, 255]
     );
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
     assert!(focused_window_is_block_out(&mut f));
 
     let (size, pixels) = render_window_cast_pixels(&mut f, &output);
@@ -3487,7 +3617,10 @@ fn block_out_state_reports_window_scope_and_global_toggle() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3509,7 +3642,8 @@ fn block_out_state_reports_window_scope_and_global_toggle() {
         IpcBlockOutFrom::ScreenCapture
     );
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let state = block_out_state(&mut f);
     assert!(!state.is_enabled);
@@ -3533,14 +3667,14 @@ fn block_out_state_reports_runtime_window_toggle_scope() {
     assert!(state.windows.is_empty());
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
 
     let state = block_out_state(&mut f);
     assert_eq!(state.windows.len(), 1);
     assert_eq!(state.windows[0].block_out_from, IpcBlockOutFrom::Screencast);
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
 
     let state = block_out_state(&mut f);
     assert!(state.windows.is_empty());
@@ -3554,7 +3688,10 @@ fn block_out_state_reports_layer_scope_and_global_toggle() {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3590,7 +3727,8 @@ fn block_out_state_reports_layer_scope_and_global_toggle() {
     assert_eq!(state.layers[0].layer, IpcLayer::Top);
     assert_eq!(state.layers[0].block_out_from, IpcBlockOutFrom::Screencast);
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let state = block_out_state(&mut f);
     assert!(!state.is_enabled);
@@ -3606,7 +3744,10 @@ fn event_stream_block_out_replicates_initial_snapshot() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::ScreenCapture),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::ScreenCapture,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3640,14 +3781,14 @@ fn event_stream_block_out_tracks_runtime_window_toggle() {
     assert!(state.windows.is_empty());
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
 
     let state = event_stream_block_out_state(&mut f);
     assert_eq!(state.windows.len(), 1);
     assert_eq!(state.windows[0].block_out_from, IpcBlockOutFrom::Screencast);
 
     f.niri_state()
-        .do_action(Action::ToggleBlockOutWindow, false);
+        .do_action(Action::ToggleBlockOutWindow, false, InputTime::now());
 
     let state = event_stream_block_out_state(&mut f);
     assert!(state.windows.is_empty());
@@ -3661,7 +3802,10 @@ fn event_stream_block_out_tracks_global_enable_toggle() {
             title: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3675,12 +3819,14 @@ fn event_stream_block_out_tracks_global_enable_toggle() {
     let state = event_stream_block_out_state(&mut f);
     assert!(state.is_enabled);
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let state = event_stream_block_out_state(&mut f);
     assert!(!state.is_enabled);
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let state = event_stream_block_out_state(&mut f);
     assert!(state.is_enabled);
@@ -3694,7 +3840,10 @@ fn event_stream_block_out_tracks_layer_only_snapshot_updates() {
             namespace: Some(RegexEq::from_str("^blocked$").unwrap()),
             ..Default::default()
         }],
-        block_out_from: Some(BlockOutFrom::Screencast),
+        block_out_from: Some(BlockOutFrom {
+            target: BlockOutTarget::Screencast,
+            kind: BlockOutKind::Fill,
+        }),
         ..Default::default()
     });
 
@@ -3727,7 +3876,8 @@ fn event_stream_block_out_tracks_layer_only_snapshot_updates() {
     assert_eq!(state.layers.len(), 1);
     assert_eq!(state.layers[0].namespace, "blocked");
 
-    f.niri_state().do_action(Action::ToggleBlockOut, false);
+    f.niri_state()
+        .do_action(Action::ToggleBlockOut, false, InputTime::now());
 
     let state = event_stream_block_out_state(&mut f);
     assert!(!state.is_enabled);

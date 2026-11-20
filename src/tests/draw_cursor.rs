@@ -7,6 +7,7 @@ use niri_config::utils::RegexEq;
 use niri_config::window_rule::{DrawCursor, ForceCursorShape, Match as WindowMatch, WindowRule};
 use niri_config::{Action, Config};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::input::InputTime;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
@@ -98,8 +99,11 @@ fn move_cursor_to_point(f: &mut Fixture, point: Point<f64, Logical>) {
 }
 
 fn zoom_output(f: &mut Fixture, level: &str) {
-    f.niri_state()
-        .do_action(Action::SetZoomLevel(level.into(), None), false);
+    f.niri_state().do_action(
+        Action::SetZoomLevel(level.into(), None),
+        false,
+        InputTime::now(),
+    );
     f.niri_complete_animations();
 }
 
@@ -201,7 +205,13 @@ fn render_window_screencast_pixels(
                 }
             }
 
-            mapped.render_for_screen_cast(renderer, scale, niri.block_out_enabled, &mut |elem| {
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                block_out_enabled: niri.block_out_enabled,
+                xray: None,
+            };
+            mapped.render_for_screen_cast(ctx, scale, &mut |elem| {
                 elements.push(CastRenderElement::from(elem))
             });
 

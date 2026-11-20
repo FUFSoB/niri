@@ -5,6 +5,7 @@ use std::time::Duration;
 use niri_config::animations::{Curve, EasingParams, Kind};
 use niri_config::{Action, Config, MruDirection};
 use niri_ipc::SizeChange;
+use smithay::backend::input::InputTime;
 use smithay::utils::Point;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -140,6 +141,7 @@ fn mru_close_on_mirror_removes_only_the_mirror() {
             filter: None,
         },
         false,
+        InputTime::now(),
     );
     assert!(f.niri().window_mru_ui.is_open());
     for _ in 0..4 {
@@ -153,12 +155,13 @@ fn mru_close_on_mirror_removes_only_the_mirror() {
                 filter: None,
             },
             false,
+            InputTime::now(),
         );
     }
     assert_eq!(f.niri().window_mru_ui.current_window_id(), Some(mirror_id));
 
     f.niri_state()
-        .do_action(Action::MruCloseCurrentWindow, false);
+        .do_action(Action::MruCloseCurrentWindow, false, InputTime::now());
     f.double_roundtrip(id);
 
     let ids: Vec<_> = f.niri().layout.windows().map(|(_, m)| m.id()).collect();

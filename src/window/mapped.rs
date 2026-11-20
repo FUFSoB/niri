@@ -3,7 +3,10 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::time::Duration;
 
-use niri_config::{BlockOutFrom, Color, Config, CornerRadius, GradientInterpolation, WindowRule};
+use niri_config::{
+    BlockOutFrom, BlockOutKind, BlockOutTarget, Color, Config, CornerRadius, GradientInterpolation,
+    WindowRule,
+};
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element as _, Kind, NamespacedElement};
@@ -16,7 +19,7 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Serial, Size, Transform};
 use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId, SurfaceData};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::{
@@ -47,7 +50,7 @@ use crate::render_helpers::surface::{
 };
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::XrayPos;
-use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
+use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx};
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -274,6 +277,10 @@ impl MappedId {
 
     pub fn get(self) -> u64 {
         self.0
+    }
+
+    pub fn specific(id: u64) -> Self {
+        Self(id)
     }
 
     /// Converts the ID to a string that can be used as an identifier in
@@ -884,6 +891,10 @@ impl Mapped {
         alpha: f32,
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
+        if ctx.should_hide(self.effective_block_out_from()) {
+            return;
+        }
+
         let blocked_out = ctx.should_block_out(self.effective_block_out_from());
         let namespace = self.element_namespace().unwrap();
         let mut buffer = self.block_out_buffer.borrow_mut();
@@ -1282,7 +1293,12 @@ impl Mapped {
     /// the window follows its rules again.
     pub fn set_block_out_window_override(&mut self, block_out: bool) {
         let rule = self.rules.block_out_from;
-        let value = block_out.then(|| rule.unwrap_or(BlockOutFrom::Screencast));
+        let value = block_out.then(|| {
+            rule.unwrap_or(BlockOutFrom {
+                target: BlockOutTarget::Screencast,
+                kind: BlockOutKind::default(),
+            })
+        });
         self.block_out_override = (value != rule).then_some(value);
     }
 
@@ -1431,14 +1447,13 @@ impl Mapped {
 
     pub fn render_for_screen_cast<R: NiriRenderer>(
         &self,
-        renderer: &mut R,
+        ctx: RenderCtx<R>,
         scale: Scale<f64>,
-        block_out_enabled: bool,
         push: &mut dyn FnMut(WindowCastRenderElements<R>),
     ) {
         let bbox = self.window_cast_bbox(scale);
 
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
+        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         let radius = self.geometry_corner_radius();
         let window_size = self
             .size()
@@ -1482,19 +1497,9 @@ impl Mapped {
             WindowCastRenderElements::from(elem)
         };
 
-        self.render(
-            RenderCtx {
-                renderer,
-                target: RenderTarget::Screencast,
-                block_out_enabled,
-                xray: None,
-            },
-            location,
-            scale,
-            1.,
-            XrayPos::default(),
-            &mut |elem| push(use_border(elem)),
-        );
+        self.render(ctx, location, scale, 1., XrayPos::default(), &mut |elem| {
+            push(use_border(elem))
+        });
     }
 
     pub fn window_cast_bbox(&self, scale: Scale<f64>) -> Rectangle<i32, smithay::utils::Physical> {
@@ -1604,6 +1609,11 @@ impl Mapped {
     pub fn is_urgent(&self) -> bool {
         self.is_urgent
     }
+
+    /// Returns the physical bbox needed to fit a screenshot of this window.
+    pub fn capture_bbox(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.window_cast_bbox(scale)
+    }
 }
 
 impl Drop for Mapped {
@@ -1704,6 +1714,10 @@ impl LayoutElement for Mapped {
     ) {
         if self.is_mirror {
             self.render_mirror_normal(ctx, location, self.mirror_size.to_f64(), scale, alpha, push);
+            return;
+        }
+
+        if ctx.should_hide(self.effective_block_out_from()) {
             return;
         }
 

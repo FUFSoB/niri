@@ -3,6 +3,7 @@ use std::str::FromStr;
 use niri_config::utils::RegexEq;
 use niri_config::window_rule::{Match as WindowMatch, WindowRule};
 use niri_config::{Action, Config};
+use smithay::backend::input::InputTime;
 
 use super::client::ClientId;
 use super::*;
@@ -51,11 +52,11 @@ fn toggle_window_cursor_capture_enables_and_disables_ruleless_window() {
     assert!(!focused_window_captures_cursor(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleWindowCursorCapture, false);
+        .do_action(Action::ToggleWindowCursorCapture, false, InputTime::now());
     assert!(focused_window_captures_cursor(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleWindowCursorCapture, false);
+        .do_action(Action::ToggleWindowCursorCapture, false, InputTime::now());
     assert!(!focused_window_captures_cursor(&mut f));
 }
 
@@ -79,11 +80,11 @@ fn toggle_window_cursor_capture_disables_and_restores_configured_rule() {
     assert!(focused_window_captures_cursor(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleWindowCursorCapture, false);
+        .do_action(Action::ToggleWindowCursorCapture, false, InputTime::now());
     assert!(!focused_window_captures_cursor(&mut f));
 
     f.niri_state()
-        .do_action(Action::ToggleWindowCursorCapture, false);
+        .do_action(Action::ToggleWindowCursorCapture, false, InputTime::now());
     assert!(focused_window_captures_cursor(&mut f));
 }
 
@@ -106,7 +107,7 @@ fn toggle_window_cursor_capture_targets_focused_sticky_window() {
     assert!(!window_captures_cursor(&mut f, tiling));
 
     f.niri_state()
-        .do_action(Action::ToggleWindowCursorCapture, false);
+        .do_action(Action::ToggleWindowCursorCapture, false, InputTime::now());
 
     assert!(window_captures_cursor(&mut f, sticky));
     assert!(!window_captures_cursor(&mut f, tiling));

@@ -116,8 +116,8 @@
             # Both crates come from the same pinned Smithay repo revision, so
             # they share the same fetchgit fixed-output hash.
             outputHashes = {
-              "smithay-0.7.0" = "sha256-s5PFS0TQd+5ueI9AKRFloa3e5jir1GtwH+dckZ6e7yA=";
-              "smithay-drm-extras-0.1.0" = "sha256-s5PFS0TQd+5ueI9AKRFloa3e5jir1GtwH+dckZ6e7yA=";
+              "smithay-0.7.0" = "sha256-YD7P5iZAr+0XdeURhq6DkRkFws6Dpn0zSU5Y9qvsyZQ=";
+              "smithay-drm-extras-0.1.0" = "sha256-YD7P5iZAr+0XdeURhq6DkRkFws6Dpn0zSU5Y9qvsyZQ=";
             };
           };
 

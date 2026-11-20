@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use niri_config::Action;
+use smithay::backend::input::InputTime;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point};
 
@@ -37,11 +38,14 @@ fn cursor_pos(f: &mut Fixture) -> Point<f64, Logical> {
 
 /// Zooms the output under the cursor to the given level and locks the focal point.
 fn zoom_and_lock(f: &mut Fixture, level: &str) {
-    f.niri_state()
-        .do_action(Action::SetZoomLevel(level.into(), None), false);
+    f.niri_state().do_action(
+        Action::SetZoomLevel(level.into(), None),
+        false,
+        InputTime::now(),
+    );
     f.niri_complete_animations();
     f.niri_state()
-        .do_action(Action::ToggleZoomLock(None), false);
+        .do_action(Action::ToggleZoomLock(None), false, InputTime::now());
     f.niri_complete_animations();
 }
 
@@ -98,8 +102,11 @@ fn move_cursor_pans_unlocked_zoom() {
     let loc = output_loc(&mut f, &output);
 
     f.niri_state().move_cursor(loc + Point::from((300., 400.)));
-    f.niri_state()
-        .do_action(Action::SetZoomLevel("2".into(), None), false);
+    f.niri_state().do_action(
+        Action::SetZoomLevel("2".into(), None),
+        false,
+        InputTime::now(),
+    );
     f.niri_complete_animations();
 
     // Warping outside the viewport pans the view to show the new location.
